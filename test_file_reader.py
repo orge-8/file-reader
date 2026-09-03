@@ -51,6 +51,39 @@ async def _test_modules() -> None:
     assert all(0 < len(x) <= 10 for x in chunks), f"块大小超限: {[len(x) for x in chunks]}"
     print(f"[PASS] 分块器: {len(chunks)} 块，均 ≤10 字符")
 
+    # 1a. 短碎片合并（v1.0.18 C1）：相邻短段合并到接近 chunk_size，块数显著下降
+    # 模拟 docx 逐段输出：每段 8 字 + 换行，40 段 = 320 字，chunk_size=50
+    frag_doc = "\n".join(f"第{i}段内容测试" for i in range(40))
+    merged = RecursiveCharacterChunker(50, 10, merge=True)
+    merged_chunks = merged.chunk(frag_doc)
+    legacy = RecursiveCharacterChunker(50, 10, merge=False)
+    legacy_chunks = legacy.chunk(frag_doc)
+    assert all(0 < len(x) <= 50 for x in merged_chunks), f"合并后块长超限: {[len(x) for x in merged_chunks]}"
+    assert len(merged_chunks) < len(legacy_chunks) / 2, (
+        f"合并应显著减少块数: merged={len(merged_chunks)} legacy={len(legacy_chunks)}"
+    )
+    # 合并路径也要有 overlap（相邻块共享尾部/头部内容）
+    if len(merged_chunks) > 1:
+        overlap_hit = any(
+            merged_chunks[i][-10:] and merged_chunks[i][-10:] in merged_chunks[i + 1][: len(merged_chunks[i][-10:]) + 10]
+            for i in range(len(merged_chunks) - 1)
+        )
+        assert overlap_hit, "合并路径相邻块应存在 overlap 前缀"
+    # merge=False 与旧逻辑一致（逐碎片成块）
+    old_style = RecursiveCharacterChunker(50, 10)
+    old_style.merge = False
+    assert old_style.chunk(frag_doc) == legacy_chunks, "merge=False 应与旧行为完全一致"
+    print(f"[PASS] 分块合并: {len(legacy_chunks)} 块 → {len(merged_chunks)} 块，均 ≤50 字，overlap 生效，关闭开关回退旧行为")
+
+    # 1a2. FileEntry.total_chars：source_chars 优先，旧数据回退拼接长度
+    from vector_store import FileEntry as _FE0
+
+    e_new = _FE0(file_name="a.txt", chunks=["x" * 10, "y" * 10], source_chars=150)
+    assert e_new.total_chars() == 150, "有 source_chars 应直接用原文长度（不被 overlap 膨胀误导）"
+    e_old = _FE0(file_name="b.txt", chunks=["x" * 10, "y" * 10])
+    assert e_old.total_chars() == 20, "无 source_chars 应回退拼接长度（向后兼容）"
+    print("[PASS] FileEntry.total_chars: source_chars 优先，旧数据回退拼接长度")
+
     # 2. 类型表
     assert get_extension("report.PDF") == "pdf"
     assert get_extension(".env") == "env"
@@ -83,6 +116,39 @@ async def _test_modules() -> None:
     top_text = results[0]["text"]
     assert ("苹果" in top_text or "香蕉" in top_text), f"检索应命中水果相关: {top_text}"
     print(f"[PASS] 余弦检索: top1='{top_text[:20]}...' score={results[0]['score']:.3f}")
+
+    # 4b. 矩阵化检索（v1.0.18 C5）：结果与逐条路径一致 + 置脏重建 + 开关回退
+    try:
+        import numpy as _np5
+    except ImportError:
+        _np5 = None
+    if _np5 is not None:
+        vs_m = VectorStore(_fake_embed, chunk_size=20, chunk_overlap=4, retrieve_top_k=2, retrieve_use_matrix=True)
+        await vs_m.add_file("notes.txt", doc)
+        await vs_m.add_file("extra.txt", "汽车是一种交通工具，需要汽油。飞机在天上飞，需要跑道。")
+        r_seq = vs_m.retrieve(qvec, top_k=3)  # 先走逐条（此时矩阵路径未开启结果一致）
+        vs_m.retrieve_use_matrix = True
+        r_mat = vs_m.retrieve(qvec, top_k=3)
+        assert [(x["file_name"], x["chunk_index"], round(x["score"], 4)) for x in r_mat] == [
+            (x["file_name"], x["chunk_index"], round(x["score"], 4)) for x in r_seq
+        ], f"矩阵检索结果应与逐条一致:\n矩阵={r_mat}\n逐条={r_seq}"
+        assert vs_m._mat_cache is not None and len(vs_m._mat_index) == sum(
+            len(e.vectors) for e in vs_m.files.values()
+        ), "矩阵缓存与索引表应覆盖全库向量"
+        # 置脏：新入库文件后矩阵指纹变化，检索结果应包含新文件
+        await vs_m.add_file("third.txt", "苹果酱是用苹果做的甜品，含有水果香气。")
+        r_new = vs_m.retrieve(qvec, top_k=5)
+        assert any(x["file_name"] == "third.txt" for x in r_new), "置脏重建后应检索到新入库文件"
+        # 清理置脏：清理后矩阵不应再返回被删文件的块
+        removed_m = vs_m.cleanup_expired(retention_seconds=0, max_rounds=999)
+        assert removed_m, "时间过期应清理文件"
+        r_after = vs_m.retrieve(qvec, top_k=5)
+        assert all(x["file_name"] not in removed_m for x in r_after), "清理后不应返回已删文件的块"
+        # 开关关闭回退逐条路径（结果仍正确）
+        vs_m.retrieve_use_matrix = False
+        r_off = vs_m.retrieve(qvec, top_k=3)
+        assert all(x["file_name"] not in removed_m for x in r_off), "回退路径结果应正常"
+        print(f"[PASS] 矩阵化检索: 与逐条一致（top1 score={r_mat[0]['score']:.3f}），入库/清理置脏重建，开关回退生效")
 
     # 5. 轮数清理
     entry.rounds = 10
@@ -381,7 +447,7 @@ async def _test_plugin_hooks() -> None:
     assert hint["url"].startswith("https://tjc-download.ftn.qq.com/"), hint
     print("[PASS] 群聊降级形态解析（文件名不被 URL 吞掉）")
 
-    # 1h. embedding 自动重试（v1.0.10）：前 2 次抛超时，第 3 次成功——最终应返回结果
+    # 1h. embedding 自动重试（v1.0.10；v1.0.18 改为 2 次尝试=1 失败+1 成功，退避简化）
     # 真机 14:05 日志：embedding 服务瞬时拥塞 cap.call 30s 超时，需重试免疫。
     # 注意：1e 里曾用实例属性覆盖 plugin._embed（绕过重试逻辑），必须先删掉实例属性，
     # 让 _embed 回到类方法（内部走 self.ctx.llm.embed → 可被 1h 拦截）。
@@ -393,7 +459,7 @@ async def _test_plugin_hooks() -> None:
 
     async def _flaky_embed(*args, **kwargs):
         call_count["n"] += 1
-        if call_count["n"] <= 2:
+        if call_count["n"] <= 1:
             raise TimeoutError("[E_TIMEOUT] 请求 cap.call 超时 (30000ms)")
         texts = kwargs.get("texts") or ([kwargs["text"]] if kwargs.get("text") else args)
         return _fake_embed(texts or [])
@@ -402,11 +468,11 @@ async def _test_plugin_hooks() -> None:
 
     result = await plugin._embed(["测试重试"])
     assert isinstance(result, dict) and "results" in result, f"重试后应成功: {result}"
-    assert call_count["n"] == 3, f"应调用 3 次（2 失败 + 1 成功），实际 {call_count['n']}"
+    assert call_count["n"] == 2, f"应调用 2 次（1 失败 + 1 成功），实际 {call_count['n']}"
     assert plugin._embedding_ok, "成功后 _embedding_ok 应回到 True"
-    print(f"[PASS] embedding 自动重试（2 次超时后第 3 次成功，共调用 {call_count['n']} 次）")
+    print(f"[PASS] embedding 自动重试（1 次超时后第 2 次成功，共调用 {call_count['n']} 次）")
 
-    # 1h2. 重试耗尽：3 次全失败应返回 {} 且 _embedding_ok=False
+    # 1h2. 重试耗尽：2 次全失败应返回 {} 且 _embedding_ok=False
     call_count["n"] = 0
 
     async def _dead_embed(*args, **kwargs):
@@ -416,9 +482,9 @@ async def _test_plugin_hooks() -> None:
     plugin.ctx.llm.embed = _dead_embed
     result = await plugin._embed(["测试耗尽"])
     assert result == {}, f"重试耗尽应返回空: {result}"
-    assert call_count["n"] == 3, f"应共调用 3 次后放弃，实际 {call_count['n']}"
+    assert call_count["n"] == 2, f"应共调用 2 次后放弃，实际 {call_count['n']}"
     assert not plugin._embedding_ok, "失败后 _embedding_ok 应为 False"
-    print("[PASS] embedding 重试耗尽（3 次全失败返回空，状态置为异常）")
+    print("[PASS] embedding 重试耗尽（2 次全失败返回空，状态置为异常）")
     plugin.ctx.llm.embed = _orig_llm_embed  # 恢复原始方法
 
     # 1i. 后台重试队列（v1.0.11）：embedding 失败时文件入队 + 准确回执，后台重试后成功入库
@@ -544,6 +610,7 @@ async def _test_plugin_hooks() -> None:
 
     plugin.ctx.llm.embed = _batch_recording_embed
     plugin.config.reader.embed_batch_size = 4
+    plugin.config.reader.embed_concurrency = 1  # 1j 用串行断言批顺序；并发行为在 1j3 验证
     big_texts = [f"拆批测试文本第{i}号" for i in range(10)]  # 10 条 → 4+4+2 三批
     result = await plugin._embed(big_texts)
     assert batch_sizes == [4, 4, 2], f"应拆成 4+4+2 三批，实际 {batch_sizes}"
@@ -556,12 +623,12 @@ async def _test_plugin_hooks() -> None:
     # 1j2. 拆批中某批失败 → 整单返回空（不拼残缺向量）
     batch_sizes.clear()
     plugin.config.reader.embed_batch_size = 3
-    batch_seq = {"n": 0}
+    plugin.config.reader.embed_concurrency = 1  # 与 1j 同为串行路径
 
     async def _batch_partial_fail(*args, **kwargs):
         texts = kwargs.get("texts") or ([kwargs["text"]] if kwargs.get("text") else args[0] if args else [])
-        # _embed_once 内部会对同一批重试 2 次（共 3 次调用）；
-        # 按"批"而非"调用次数"计数：第 2 批的 3 次调用全部失败
+        # _embed_once 内部会对同一批重试（共 2 次调用）；
+        # 按"批"而非"调用次数"计数：第 2 批的调用全部失败
         if len(texts) <= 3 and batch_seq["n"] >= 1:
             raise TimeoutError("[E_TIMEOUT] 第 2 批超时")
         batch_seq["n"] += 1
@@ -569,10 +636,70 @@ async def _test_plugin_hooks() -> None:
 
     plugin.ctx.llm.embed = _batch_partial_fail
     result = await plugin._embed(["a", "b", "c", "d", "e", "f"])  # 2 批，第 2 批失败
-    # 第 2 批失败会触发 _embed_once 内部重试（共 3 次调用全失败），最终整单返回空
+    # 第 2 批失败会触发 _embed_once 内部重试（2 次调用全失败），最终整单返回空
     assert result == {}, f"某批失败应整单返回空: {type(result)}"
-    print("[PASS] 拆批部分失败整单返回空（不拼残缺向量，第 2 批 3 次重试全失败）")
+    print("[PASS] 拆批部分失败整单返回空（不拼残缺向量，第 2 批重试全失败）")
     plugin.config.reader.embed_batch_size = 16
+    plugin.ctx.llm.embed = _orig_llm_embed
+
+    # 1j3. 并发拆批（v1.0.18 C2）：embed_concurrency=2 时多批并行且按原批序拼回
+    if "_embed" in plugin.__dict__:
+        del plugin.__dict__["_embed"]
+    conc_calls: list[tuple[float, int]] = []  # (开始时刻, 批大小)
+
+    async def _slow_batch_embed(*args, **kwargs):
+        texts = kwargs.get("texts") or ([kwargs["text"]] if kwargs.get("text") else args[0] if args else [])
+        conc_calls.append((asyncio.get_event_loop().time(), len(texts)))
+        await asyncio.sleep(0.15)  # 模拟 RPC 延迟，给并发交错留空间
+        return _fake_embed(texts)
+
+    plugin.ctx.llm.embed = _slow_batch_embed
+    plugin.config.reader.embed_batch_size = 4
+    plugin.config.reader.embed_concurrency = 2
+    t0 = asyncio.get_event_loop().time()
+    result = await plugin._embed([f"并发测试{i}" for i in range(12)])  # 3 批，并发 2
+    elapsed = asyncio.get_event_loop().time() - t0
+    assert sorted(x[1] for x in conc_calls) == [4, 4, 4], f"应拆成三批 4 条: {conc_calls}"
+    # 串行 3 批 × 0.15s = 0.45s；并发 2 → 理论 ~0.3s，给余量判 < 0.42s
+    assert elapsed < 0.42, f"并发 2 应回缩耗时（实测 {elapsed:.2f}s，串行约 0.45s）"
+    merged = result["results"] if isinstance(result, dict) and "results" in result else result
+    assert len(merged) == 12, f"并发后应拼回 12 条向量: {type(result)}"
+    # 向量与文本对齐验证：results 每项含 embedding 键（fake 形态），条目数与请求一致
+    assert all(isinstance(v, dict) and "embedding" in v for v in merged), "并发拼接应保持 results 条目结构"
+    print(f"[PASS] 并发拆批（3 批并发 2，{elapsed:.2f}s < 串行 0.45s，12 条向量按批序拼回）")
+
+    # 1j4. 并发批失败：任一批失败整单返回空
+    conc_calls.clear()
+
+    async def _conc_partial_fail(*args, **kwargs):
+        texts = kwargs.get("texts") or ([kwargs["text"]] if kwargs.get("text") else args[0] if args else [])
+        if len(texts) <= 4 and "并发失败" in (texts[0] or ""):
+            raise TimeoutError("[E_TIMEOUT] 并发批超时")
+        return _fake_embed(texts)
+
+    plugin.ctx.llm.embed = _conc_partial_fail
+    result = await plugin._embed(["并发失败a", "b", "c", "d", "e", "f", "g", "h"])  # 2 批，首批失败
+    assert result == {}, f"并发批失败应整单返回空: {type(result)}"
+    print("[PASS] 并发批失败整单返回空（防残缺向量）")
+
+    # 1j5. 查询 embedding 超时分层（v1.0.18 C2）：query_mode 单次调用 + wait_for，不重试
+    q_calls = {"n": 0}
+
+    async def _slow_query_embed(*args, **kwargs):
+        q_calls["n"] += 1
+        await asyncio.sleep(5.0)  # 远超 1s 超时
+        return _fake_embed(["x"])
+
+    plugin.ctx.llm.embed = _slow_query_embed
+    plugin.config.reader.query_embed_timeout = 1.0
+    tq0 = asyncio.get_event_loop().time()
+    qvec = await plugin._embed_query("这句查询会超时")
+    q_elapsed = asyncio.get_event_loop().time() - tq0
+    assert qvec is None, f"超时应返回 None（上层降级概要）: {type(qvec)}"
+    assert q_elapsed < 2.0, f"超时应立即放弃（实测 {q_elapsed:.2f}s）"
+    assert q_calls["n"] == 1, f"查询路径不重试，应只调 1 次，实际 {q_calls['n']}"
+    print(f"[PASS] 查询 embedding 超时分层（{q_elapsed:.2f}s 放弃、不重试，降级概要兜底）")
+    plugin.config.reader.query_embed_timeout = 8.0
     plugin.ctx.llm.embed = _orig_llm_embed
 
     # 2. 直调注入 hook（覆盖配置访问路径）
@@ -701,11 +828,12 @@ async def _test_plugin_hooks() -> None:
     assert "还没有已入库的文件" in res_empty.get("content", ""), f"空库应如实报告: {res_empty}"
     print("[PASS] search_file 会话兜底（空/错 session_id 自动定位最近入库会话，空库如实报告）")
 
-    # ─── 2b. 大文件 LLM 概要（v1.0.17） ───
+    # ─── 2b. 大文件 LLM 概要（v1.0.17；v1.0.18 C4 后同步行为需显式开 summary_await_on_inject） ───
     # FakeHost 的 llm.generate 未模拟能力返回 {"success": True}（无 response 字段），
     # 概要用例需要可控 fake：直接替换 plugin.ctx.llm.generate
     plugin._store._sessions.pop(("summary-session", "summary-session"), None)
     plugin.config.reader.direct_inject_max_chars = 6000
+    plugin.config.reader.summary_await_on_inject = True  # 2b 组保 v1.0.17 同步行为（C4 默认 false）
     vs_sum = plugin._store.get_or_create(
         "summary-session", "summary-session", plugin._embed,
         plugin.config.reader.chunk_size, plugin.config.reader.chunk_overlap,
@@ -768,6 +896,7 @@ async def _test_plugin_hooks() -> None:
     # 2b2. generate 失败 → 静默降级：summary 为空、检索注入不受影响
     #     注意：FakeHost 拿不到真向量，检索要有结果必须给 entry 填充 fake 向量——
     #     用 _fake_embed 对「分块后的文本」生成向量并按块对齐填充。
+    plugin._inject_memo.clear()  # 场景切换：清掉 2b 主用例的注入缓存（文件未变、问题相同会命中 memo）
     vs_sum.files["长评测.txt"].summary = ""
     _chunker = RecursiveCharacterChunker(
         plugin.config.reader.chunk_size, plugin.config.reader.chunk_overlap
@@ -800,6 +929,7 @@ async def _test_plugin_hooks() -> None:
     print("[PASS] 概要生成失败静默降级（检索注入不受影响）")
 
     # 2b3. 查询 embedding 失败但有概要 → 概要兜底注入
+    plugin._inject_memo.clear()  # 场景切换：清掉 2b2 的注入缓存
     vs_sum.files["长评测.txt"].summary = "本文评测了多款产品，分为三个部分。"
     _dead_query_embed_calls = {"n": 0}
 
@@ -843,6 +973,220 @@ async def _test_plugin_hooks() -> None:
     assert len(gen_calls) == 0, f"小文件直注路径不应生成概要: {len(gen_calls)}"
     assert vs_tiny.files["便签.txt"].summary == "", "小文件不应有概要"
     print("[PASS] 阈值内小文件不生成概要（直注路径零 LLM 概要调用）")
+
+    # ─── 2b5/2b6/2b7. 概要异步化（v1.0.18 C4，默认 summary_await_on_inject=false） ───
+    # 先排空 2a2 遗留的后台概要任务（阈值调成 10 时营养笔记也变「大文件」，
+    # 其后台任务持有 generate 引用，若拖到 2b5 的慢 generate 期间执行会污染计数）
+    for _ in range(10):
+        await asyncio.sleep(0)
+    await asyncio.sleep(0.05)
+    plugin._summary_pending.clear()
+    plugin._summary_failed_ts.clear()
+    plugin._inject_memo.clear()
+    plugin._store._sessions.pop(("async-sum-session", "async-sum-session"), None)
+    plugin.config.reader.summary_await_on_inject = False
+    plugin.config.reader.summary_retry_interval = 600.0
+    plugin._summary_failed_ts.clear()
+    vs_asum = plugin._store.get_or_create(
+        "async-sum-session", "async-sum-session", plugin._embed,
+        plugin.config.reader.chunk_size, plugin.config.reader.chunk_overlap,
+        plugin.config.reader.retrieve_top_k,
+    )
+    asum_doc = "这是一份异步概要测试文档。" * 900  # >6000 字走检索路径
+    vs_asum.files["异步文档.txt"] = _FE2(
+        file_name="异步文档.txt", chunks=[asum_doc], vectors=[_fake_embed([asum_doc])["results"][0]["embedding"]]
+    )
+    asum_gen_calls: list[dict] = []
+
+    async def _slow_generate(**kwargs):
+        # 慢生成：模拟 llm.generate 卡 3s；异步模式下 hook 不应等它
+        await asyncio.sleep(3.0)
+        asum_gen_calls.append(dict(kwargs))
+        return {"success": True, "response": "异步概要正文。", "model": "fake"}
+
+    plugin.ctx.llm.generate = _slow_generate
+    asum_items = [
+        {
+            "item_type": "UserMessageItem",
+            "meta": {"item_id": "u1", "logical_turn_id": None, "timestamp": "t"},
+            "parts": [{"type": "text", "text": "异步文档讲了什么？"}],
+        }
+    ]
+    # 2b5. 异步模式：注入不被慢概要阻塞，且本次注入不含概要（下次提问自然带上）
+    t0 = time.perf_counter()
+    r_asum = await plugin.inject_file_context(
+        session_id="async-sum-session", items=list(asum_items), item_schema_version=1, task_name="replyer"
+    )
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 2.0, f"异步模式下注入不应等概要生成（卡了 {elapsed:.2f}s）"
+    assert "modified_kwargs" in r_asum, f"异步模式注入应正常返回: {r_asum}"
+    asum_text = " ".join(
+        p.get("text", "") for it in r_asum["modified_kwargs"]["items"] if isinstance(it, dict)
+        for p in (it.get("parts") or []) if isinstance(p, dict)
+    )
+    assert "异步概要正文" not in asum_text, "慢概要未完成时本次注入不应含概要"
+    # 等后台任务完成后概要应已生成（in-flight 任务仍在跑，只是不阻塞注入）
+    await asyncio.sleep(3.2)
+    assert vs_asum.files["异步文档.txt"].summary == "异步概要正文。", (
+        f"后台概要任务应完成: {vs_asum.files['异步文档.txt'].summary!r}"
+    )
+    assert len(asum_gen_calls) == 1, f"后台应恰好生成一次概要: {len(asum_gen_calls)}"
+    print(f"[PASS] 概要异步化（注入 {elapsed:.2f}s 不阻塞慢概要，后台完成后下次提问可见）")
+
+    # 2b6. in-flight 去重：概要已在后台生成中时，再次注入不重复起任务
+    vs_asum.files["异步文档.txt"].summary = ""
+    plugin._inject_memo.clear()
+    plugin._summary_failed_ts.clear()
+    asum_gen_calls.clear()
+    plugin.ctx.llm.generate = _slow_generate
+    await plugin.inject_file_context(
+        session_id="async-sum-session", items=list(asum_items), item_schema_version=1, task_name="replyer"
+    )
+    await plugin.inject_file_context(
+        session_id="async-sum-session", items=list(asum_items), item_schema_version=1, task_name="replyer"
+    )
+    await asyncio.sleep(3.2)
+    assert len(asum_gen_calls) == 1, f"in-flight 去重应只生成一次: {len(asum_gen_calls)}"
+    print("[PASS] 概要 in-flight 去重（后台生成中再触发注入不重复起任务）")
+
+    # 2b7. 失败冷却：生成失败后冷却期内不再撞 llm.generate
+    plugin._inject_memo.clear()
+    plugin._summary_failed_ts.clear()
+    vs_asum.files["异步文档.txt"].summary = ""  # 清掉 2b6 生成的概要，才能再次触发生成
+    asum_gen_calls.clear()
+
+    async def _fail_generate_slow(**kwargs):
+        await asyncio.sleep(0.1)
+        asum_gen_calls.append(dict(kwargs))
+        return {"success": False, "response": "", "model": "fake"}
+
+    plugin.ctx.llm.generate = _fail_generate_slow
+    await plugin.inject_file_context(
+        session_id="async-sum-session", items=list(asum_items), item_schema_version=1, task_name="replyer"
+    )
+    await asyncio.sleep(0.3)
+    assert len(asum_gen_calls) == 1, f"失败应恰好调用一次: {len(asum_gen_calls)}"
+    assert "异步文档.txt" in plugin._summary_failed_ts, "失败应记录冷却时间戳"
+    # 冷却期内再触发注入 → 不再调用 generate
+    # 注意：step1 检索成功会写注入 memo（TTL 90s），不清掉的话 step2/step3 会被
+    # memo 直接挡住（走不到 _ensure_summary），测的就不是冷却逻辑了
+    plugin._inject_memo.clear()
+    await plugin.inject_file_context(
+        session_id="async-sum-session", items=list(asum_items), item_schema_version=1, task_name="replyer"
+    )
+    await asyncio.sleep(0.3)
+    assert len(asum_gen_calls) == 1, f"冷却期内不应重试概要: {len(asum_gen_calls)}"
+    # 清冷却 → 恢复重试
+    plugin._summary_failed_ts.clear()
+    plugin._inject_memo.clear()  # 同上，避免 memo 挡住本次触发
+    plugin._summary_pending.clear()
+    await plugin.inject_file_context(
+        session_id="async-sum-session", items=list(asum_items), item_schema_version=1, task_name="replyer"
+    )
+    await asyncio.sleep(0.3)
+    assert len(asum_gen_calls) == 2, f"冷却清除后应重新尝试: {len(asum_gen_calls)}"
+    print("[PASS] 概要失败冷却（600s 内不重试，清除冷却后恢复）")
+
+    # 恢复 2b 组的同步配置 + 清理异步概要会话
+    plugin.config.reader.summary_await_on_inject = True
+    plugin.config.reader.summary_retry_interval = 600.0
+    plugin._summary_failed_ts.clear()
+    plugin._inject_memo.clear()
+    plugin._store._sessions.pop(("async-sum-session", "async-sum-session"), None)
+
+    # ─── 2c. 注入去重缓存 / 轮数去重（v1.0.18 C3） ───
+    plugin._inject_memo.clear()
+    plugin._store._sessions.pop(("memo-session", "memo-session"), None)
+    vs_memo = plugin._store.get_or_create(
+        "memo-session", "memo-session", plugin._embed,
+        plugin.config.reader.chunk_size, plugin.config.reader.chunk_overlap,
+        plugin.config.reader.retrieve_top_k,
+    )
+    memo_doc = "这是备忘录正文，共一段。备忘录记录了今日待办事项。" * 300  # 7500 字 > 6000 阈值走检索路径
+    entry_memo = _FE2(file_name="备忘录.txt", chunks=[memo_doc], vectors=[_fake_embed([memo_doc])["results"][0]["embedding"]])
+    vs_memo.files["备忘录.txt"] = entry_memo
+    memo_embed_calls = {"n": 0}
+
+    async def _memo_counting_embed(*args, **kwargs):
+        memo_embed_calls["n"] += 1
+        return _fake_embed((kwargs.get("texts") or args[0]) if args or kwargs.get("texts") else [])
+
+    plugin.ctx.llm.embed = _memo_counting_embed
+    memo_items = [
+        {
+            "item_type": "UserMessageItem",
+            "meta": {"item_id": "u1", "logical_turn_id": None, "timestamp": "t"},
+            "parts": [{"type": "text", "text": "备忘录里有什么待办？"}],
+        }
+    ]
+    r1 = await plugin.inject_file_context(
+        session_id="memo-session", items=list(memo_items), item_schema_version=1, task_name="replyer"
+    )
+    assert "modified_kwargs" in r1, f"首次注入应正常: {r1}"
+    n_first = memo_embed_calls["n"]
+    assert n_first >= 1, "首次注入应调用查询 embedding"
+
+    # 2c1. 同会话同问题二次触发（模拟 hook attempt / Planner+回复双触发）→ memo 命中零 embed
+    r2 = await plugin.inject_file_context(
+        session_id="memo-session", items=list(memo_items), item_schema_version=1, task_name="replyer"
+    )
+    assert memo_embed_calls["n"] == n_first, f"memo 命中应零 embedding: {memo_embed_calls['n']} vs {n_first}"
+    assert "modified_kwargs" in r2, "memo 命中仍应注入内容"
+    memo_text_1 = "".join(
+        p.get("text", "") for it in r1["modified_kwargs"]["items"] if isinstance(it, dict)
+        for p in (it.get("parts") or []) if isinstance(p, dict)
+    )
+    memo_text_2 = "".join(
+        p.get("text", "") for it in r2["modified_kwargs"]["items"] if isinstance(it, dict)
+        for p in (it.get("parts") or []) if isinstance(p, dict)
+    )
+    assert memo_text_1 == memo_text_2, "memo 命中应返回相同注入文本"
+    print(f"[PASS] 注入去重缓存（二次同问题零 embedding，embed 调用稳定在 {memo_embed_calls['n']} 次）")
+
+    # 2c2. 文件变动失效缓存：入库同会话新文件后再问同问题 → 重新检索
+    plugin._memo_invalidate_session("memo-session")
+    r3 = await plugin.inject_file_context(
+        session_id="memo-session", items=list(memo_items), item_schema_version=1, task_name="replyer"
+    )
+    assert memo_embed_calls["n"] > n_first, "失效后应重新调用查询 embedding"
+    print("[PASS] memo 失效（文件变动后重新检索）")
+
+    # 2c3. 轮数去重：同问题重复触发，rounds 不再增加（首次注入时已 +1，120s 窗口内整轮只计一次）
+    rounds_before = entry_memo.rounds
+    await plugin.inject_file_context(
+        session_id="memo-session", items=list(memo_items), item_schema_version=1, task_name="replyer"
+    )
+    await plugin.inject_file_context(
+        session_id="memo-session", items=list(memo_items), item_schema_version=1, task_name="replyer"
+    )
+    assert entry_memo.rounds == rounds_before, (
+        f"同问题多次触发 rounds 不应重复增加: {rounds_before} → {entry_memo.rounds}"
+    )
+    print("[PASS] 轮数去重（hook/tool/attempt 共享 120s 窗口，5 轮配额不再减半）")
+
+    # 2c4. search_file 输出带幂等标记：hook 检测到标记即跳过重复注入
+    plugin._inject_memo.clear()
+    tool_out = await plugin.search_file(query="备忘录里有什么待办？", session_id="memo-session")
+    assert plugin.config.reader.injection_marker in tool_out.get("content", ""), (
+        f"工具输出应含幂等标记: {tool_out['content'][:100]}"
+    )
+    # 工具返回的内容拼进 items 后，hook 应检测 marker 并跳过
+    tool_items = list(memo_items) + [
+        {
+            "item_type": "ToolResultItem",
+            "meta": {"item_id": "t1", "logical_turn_id": None, "timestamp": "t"},
+            "parts": [{"type": "text", "text": tool_out["content"]}],
+        }
+    ]
+    r4 = await plugin.inject_file_context(
+        session_id="memo-session", items=tool_items, item_schema_version=1, task_name="replyer"
+    )
+    assert r4 == {"action": "continue"}, f"工具已返回全文/片段，hook 不应重复注入: {r4}"
+    print("[PASS] search_file 带幂等标记（hook 检测到标记跳过重复注入）")
+
+    # 清理 memo 会话
+    plugin._inject_memo.clear()
+    plugin._store._sessions.pop(("memo-session", "memo-session"), None)
 
     # 恢复环境
     plugin.ctx.llm.embed = _orig_llm_embed_2_restore

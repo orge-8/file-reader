@@ -30,6 +30,13 @@ class FileEntry:
     upload_time: float = field(default_factory=time.time)
     rounds: int = 0
     summary: str = ""  # 大文件 LLM 概要（v1.0.17）；空 = 未生成或生成失败
+    # 原始解析文本长度（v1.0.18）：分块合并带 overlap 后 join(chunks) 会膨胀约 20%，
+    # 直注/概要阈值判定必须用原文长度；0 = 旧数据无该字段，回退 sum(len(chunks))
+    source_chars: int = 0
+
+    def total_chars(self) -> int:
+        """原文长度：优先 source_chars，旧数据回退分块拼接长度。"""
+        return self.source_chars if self.source_chars > 0 else len("".join(self.chunks))
 
 
 def _cosine(a: List[float], b: List[float]) -> float:
@@ -60,14 +67,21 @@ class VectorStore:
         chunk_size: int = 512,
         chunk_overlap: int = 100,
         retrieve_top_k: int = 5,
+        chunk_merge: bool = True,
+        retrieve_use_matrix: bool = False,
     ) -> None:
         # 延迟导入 chunker，避免与 plugin.py 的 sys.path 处理耦合
         from chunker import RecursiveCharacterChunker
 
         self._embed_fn = embed_fn
-        self._chunker = RecursiveCharacterChunker(chunk_size, chunk_overlap)
+        self._chunker = RecursiveCharacterChunker(chunk_size, chunk_overlap, merge=chunk_merge)
         self.retrieve_top_k = retrieve_top_k
+        self.retrieve_use_matrix = retrieve_use_matrix  # v1.0.18 C5：矩阵化检索开关
         self._files: dict[str, FileEntry] = {}
+        # 矩阵缓存（C5）：L2 归一化后的全库向量矩阵 + (file_name, chunk_index, text) 索引表
+        self._mat_cache: Any = None
+        self._mat_index: List[tuple[str, int, str]] = []
+        self._mat_fp: Optional[tuple] = None
 
     @property
     def files(self) -> dict[str, FileEntry]:
@@ -91,8 +105,10 @@ class VectorStore:
 
         vectors = await self._embed(chunks)
 
-        entry = FileEntry(file_name=file_name, chunks=chunks, vectors=vectors)
+        # v1.0.18：记录原文长度（overlap 合并会让 join(chunks) 膨胀，阈值判定要用原文长度）
+        entry = FileEntry(file_name=file_name, chunks=chunks, vectors=vectors, source_chars=len(content))
         self._files[file_name] = entry
+        self._mat_cache = None  # 置脏：下次检索重建矩阵
         return entry
 
     async def _embed(self, texts: List[str]) -> List[List[float]]:
@@ -135,9 +151,73 @@ class VectorStore:
                 raise RuntimeError(f"embedding 返回条数 {len(vectors)} 与请求 {len(texts)} 不一致")
         return vectors
 
+    def _matrix_fingerprint(self) -> tuple:
+        """库内容指纹：文件名集合 + 各文件块数。变化即重建矩阵。"""
+        return tuple((fname, len(e.vectors)) for fname, e in self._files.items())
+
+    def _build_matrix(self) -> None:
+        """重建 L2 归一化矩阵 + 索引表。仅 numpy 可用时生效。"""
+        if np is None:
+            return
+        rows: List[Any] = []
+        index: List[tuple[str, int, str]] = []
+        for fname, entry in self._files.items():
+            for i, vec in enumerate(entry.vectors):
+                if not vec:
+                    continue
+                rows.append(vec)
+                index.append((fname, i, entry.chunks[i]))
+        if not rows:
+            self._mat_cache = None
+            self._mat_index = []
+            self._mat_fp = self._matrix_fingerprint()
+            return
+        mat = np.asarray(rows, dtype="float32")
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0  # 零向量归一化后仍为零，相似度 0
+        self._mat_cache = mat / norms
+        self._mat_index = index
+        self._mat_fp = self._matrix_fingerprint()
+
+    def _retrieve_matrix(self, query_vector: List[float], k: int) -> Optional[List[dict]]:
+        """矩阵化检索：一次 matmul 算全库相似度。库为空或无 numpy 返回 None（回退逐条）。"""
+        if np is None or not self._files:
+            return None
+        fp = self._matrix_fingerprint()
+        if self._mat_cache is None or fp != self._mat_fp:
+            self._build_matrix()
+        if self._mat_cache is None or not self._mat_index:
+            return [] if self._mat_index == [] and self._mat_cache is None else None
+        q = np.asarray(query_vector, dtype="float32")
+        qn = float(np.linalg.norm(q))
+        if qn == 0:
+            return []
+        scores = self._mat_cache @ (q / qn)
+        order = np.argsort(scores)[::-1][:k]
+        return [
+            {
+                "file_name": self._mat_index[i][0],
+                "text": self._mat_index[i][2],
+                "score": float(scores[i]),
+                "chunk_index": self._mat_index[i][1],
+            }
+            for i in order
+        ]
+
     def retrieve(self, query_vector: List[float], top_k: Optional[int] = None) -> List[dict]:
-        """返回 Top-K 相关块：[{file_name, text, score, chunk_index}, ...]"""
+        """返回 Top-K 相关块：[{file_name, text, score, chunk_index}, ...]
+
+        v1.0.18 C5：retrieve_use_matrix 开启且 numpy 可用时走矩阵化路径
+        （L2 归一化矩阵缓存 + 点积一次算全库），失败自动回退逐条余弦。
+        """
         k = top_k or self.retrieve_top_k
+        if self.retrieve_use_matrix:
+            try:
+                results = self._retrieve_matrix(query_vector, k)
+                if results is not None:
+                    return results
+            except Exception:  # noqa: BLE001  矩阵路径异常一律回退逐条
+                pass
         scored: List[dict] = []
         for fname, entry in self._files.items():
             for i, vec in enumerate(entry.vectors):
@@ -163,6 +243,8 @@ class VectorStore:
             if expired_time or expired_rounds:
                 del self._files[fname]
                 removed.append(fname)
+        if removed:
+            self._mat_cache = None  # 置脏：下次检索重建矩阵
         return removed
 
     def increment_rounds(self, file_name: Optional[str] = None) -> None:
@@ -192,10 +274,19 @@ class SessionStore:
         chunk_size: int,
         chunk_overlap: int,
         retrieve_top_k: int,
+        chunk_merge: bool = True,
+        retrieve_use_matrix: bool = False,
     ) -> VectorStore:
         k = self.key(session_id, conversation_id)
         if k not in self._sessions:
-            self._sessions[k] = VectorStore(embed_fn, chunk_size, chunk_overlap, retrieve_top_k)
+            self._sessions[k] = VectorStore(
+                embed_fn,
+                chunk_size,
+                chunk_overlap,
+                retrieve_top_k,
+                chunk_merge=chunk_merge,
+                retrieve_use_matrix=retrieve_use_matrix,
+            )
         return self._sessions[k]
 
     def get(self, session_id: str, conversation_id: str) -> Optional[VectorStore]:

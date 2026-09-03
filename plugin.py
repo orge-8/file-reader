@@ -75,21 +75,29 @@ class ReaderConfig(PluginConfigBase):
     max_file_size: int = Field(default=100, description="单文件大小上限（MB）")
     chunk_size: int = Field(default=512, description="分块大小（字符数）")
     chunk_overlap: int = Field(default=100, description="分块重叠（字符数）")
-    retrieve_top_k: int = Field(default=5, description="检索返回的相关块数量")
+    chunk_merge_enabled: bool = Field(default=True, description="短碎片合并（v1.0.18 性能优化）：递归切分出的相邻短碎片合并到接近 chunk_size 再成块，块数降至约 1/3，入库向量化耗时同步下降；关闭则回退旧的逐碎片成块行为")
+    retrieve_top_k: int = Field(default=6, description="检索返回的相关块数量")
+    retrieve_use_matrix: bool = Field(default=True, description="矩阵化检索（v1.0.18 性能优化）：缓存 L2 归一化向量矩阵，查询时一次点积算全库相似度（入库/清理/删文件自动置脏重建）；块数多时检索开销显著下降，结果与逐条余弦一致；异常自动回退旧路径")
     file_retention_time: int = Field(default=60, description="文件有效时间（分钟）")
     file_max_rounds: int = Field(default=5, description="文件最大参与轮数")
     cleanup_interval: int = Field(default=15, description="后台清理间隔（分钟）")
     enable_group: bool = Field(default=True, description="是否处理群聊文件")
     insecure_download: bool = Field(default=False, description="下载文件时跳过 SSL 证书校验（运行机器存在 TLS MITM 代理、报 CERTIFICATE_VERIFY_FAILED 时开启）")
     injection_marker: str = Field(default="【文件检索】", description="注入文本的幂等标记")
+    inject_memo_enabled: bool = Field(default=True, description="注入去重缓存（v1.0.18）：同一会话同一问题在 TTL 内直接复用上次注入文本（零 embedding、零检索），覆盖 hook 每次尝试重跑与 Planner/回复双触发；文件入库、清文件、会话清理时自动失效")
+    inject_memo_ttl: int = Field(default=90, description="注入去重缓存的存活秒数")
     silent_success: bool = Field(default=True, description="文件入库成功后保持静默（不发回执，日志仍记录）；关闭后每次入库都回复「已解析 N 块」")
     embed_retry_interval: float = Field(default=2.0, description="嵌入失败后台重试间隔（分钟）；入库时 embedding 超时会先在后台队列排队，定时重试")
     embed_max_retries: int = Field(default=30, description="后台重试最大次数（超过后放弃并提示重发文件；默认 30 次 × 2 分钟 ≈ 覆盖 1 小时拥塞）")
-    embed_batch_size: int = Field(default=16, description="单次 llm.embed RPC 调用的最大文本条数；大文件（如 3 万字 ≈ 78 块）整体一把调用会撞 30s RPC 上限，拆批后每次调用远低于上限")
+    embed_batch_size: int = Field(default=64, description="单次 llm.embed RPC 调用的最大文本条数；v1.0.18 配合分块合并把默认从 16 提到 64（合并后单批约 8K 字仍远低于 30s RPC 上限），批数下降进一步缩短入库耗时；若 host 限流可调回 16")
+    embed_concurrency: int = Field(default=2, description="入库拆批后的并发批数：多批同时调用 llm.embed（1 = 旧串行行为）；host 出现限流/批量报错时调回 1")
+    query_embed_timeout: float = Field(default=8.0, description="提问时查询 embedding 的超时秒数：仅单次调用、超时立即放弃并降级到概要兜底，不重试（避免拥塞期把用户卡在请求模型之前）；0 = 关闭超时（旧行为，最坏可卡 ~96s）")
     direct_inject_max_chars: int = Field(default=6000, description="全文直注阈值（解析后总字符数）：会话内所有文件全文合计不超过该值时，跳过 RAG 检索、直接把文件全文注入上下文（小文件无需检索即可全量可见，还省一次查询 embedding 调用）；设为 0 关闭该行为，始终走检索")
     summary_enabled: bool = Field(default=True, description="大文件 LLM 概要：全文超 direct_inject_max_chars 的文件在入库后用 llm.generate 生成一段概要，注入上下文时附在检索片段前，让 LLM 对大文件先有整体认识；生成失败静默降级（不影响检索）")
     summary_source_chars: int = Field(default=12000, description="生成概要时截取的源文本长度（字符数）：从文件头、中、尾三段均匀取样拼接，控制摘要调用的 token 开销")
     summary_max_chars: int = Field(default=500, description="概要文本的最大长度（字符数）")
+    summary_await_on_inject: bool = Field(default=False, description="提问注入时是否同步等待概要生成（v1.0.17 旧行为）：概要缺失时同步调用 llm.generate 会把 BLOCKING hook 卡住数秒；默认 false = 缺失时立即用已有内容检索注入，概要在后台生成、下次提问自然带上")
+    summary_retry_interval: float = Field(default=600.0, description="概要生成失败后的冷却秒数：冷却期内不再尝试生成（避免每次提问都撞一次超时）；0 = 不冷却（每次注入都重试）")
 
 
 class NapcatConfig(PluginConfigBase):
@@ -147,6 +155,13 @@ class FileReaderPlugin(MaiBotPlugin):
         # embedding 失败重试队列（v1.0.11）：[{session_id, conversation_id, stream_id, name, text, attempts, next_ts}]
         self._embed_retry_queue: list[dict[str, Any]] = []
         self._retry_task: Optional[asyncio.Task] = None
+        # 注入去重缓存（v1.0.18 C3）：(session_id, query_key) -> (ts, inject_text)
+        # 覆盖 hook 每次尝试重跑与 Planner/回复双触发；入库/清文件/会话清理时必须失效
+        self._inject_memo: dict[tuple[str, str], tuple[float, str]] = {}
+        # 概要异步化（v1.0.18 C4）：in-flight 去重（同一 entry 的概要任务不重复起）
+        # 与失败冷却（file_name -> 上次失败时刻，冷却期内不再撞 llm.generate 超时）
+        self._summary_pending: set[int] = set()
+        self._summary_failed_ts: dict[str, float] = {}
 
         # 行为自检：确认 chunker / 解析器在进程内可用（runtime-gotchas 5.1 的对策）
         self._run_self_check()
@@ -192,12 +207,17 @@ class FileReaderPlugin(MaiBotPlugin):
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         """配置热重载。"""
         del scope, config_data, version
+        # v1.0.18 C5：热重载同步矩阵检索开关到已存在的会话库
+        use_matrix = bool(self.config.reader.retrieve_use_matrix)
+        for vs in self._store._sessions.values():
+            vs.retrieve_use_matrix = use_matrix
         self.ctx.logger.info(
-            "配置已热重载：chunk_size=%d, top_k=%d, retention=%dmin, max_rounds=%d",
+            "配置已热重载：chunk_size=%d, top_k=%d, retention=%dmin, max_rounds=%d, matrix_retrieve=%s",
             self.config.reader.chunk_size,
             self.config.reader.retrieve_top_k,
             self.config.reader.file_retention_time,
             self.config.reader.file_max_rounds,
+            use_matrix,
         )
 
     # ─── 行为自检 ────────────────────────────────────────────────
@@ -222,32 +242,66 @@ class FileReaderPlugin(MaiBotPlugin):
             self.ctx.logger.error("[自检] 解析器类型表: FAIL (%s)", e)
 
     # ─── embedding 封装 ──────────────────────────────────────────
-    async def _embed(self, texts: list[str]) -> Any:
+    async def _embed(self, texts: list[str], *, query_mode: bool = False) -> Any:
         """调用 MaiBot llm.embed，带自动重试（指数退避），最终失败返回空（上层抛可读错误）。
 
-        大批量拆批（真机 15:38 日志教训）：38996 字节 docx ≈ 78 块，整把一次
-        llm.embed RPC 单次就超 cap.call 30s 上限——与拥塞无关，A_Memorix 同期嵌入
-        都成功。按 reader.embed_batch_size（默认 16）拆批逐个调用再拼回。
+        v1.0.18：拆批后多批并发（embed_concurrency，默认 2）+ 批大小提到 64；
+        max_concurrent 一并透传给 host 侧调度。任一批失败仍整单返回 {}（防残缺向量）。
+        query_mode=True 时走查询分层：单次调用 + wait_for 超时，不重试（拥塞期不卡用户）。
         """
         batch_size = max(1, int(self.config.reader.embed_batch_size))
         if len(texts) <= batch_size:
-            return await self._embed_once(texts)
-        results: list[Any] = []
-        total_batches = (len(texts) + batch_size - 1) // batch_size
-        for i in range(0, len(texts), batch_size):
-            part = texts[i : i + batch_size]
-            part_result = await self._embed_once(part)
-            if part_result == {} or part_result is None:
-                # 某批失败：整单失败（上层会入队重试），避免拼出残缺向量
-                self.ctx.logger.warning(
-                    "embedding 拆批调用第 %d/%d 批失败，整单失败待重试", i // batch_size + 1, total_batches
-                )
-                return {}
-            results.append(part_result)
-            self.ctx.logger.info(
-                "embedding 拆批进度: %d/%d 批（%d 块）", i // batch_size + 1, total_batches, len(part)
+            return await self._embed_once(texts, query_mode=query_mode)
+
+        # 拆批
+        batches = [texts[i : i + batch_size] for i in range(0, len(texts), batch_size)]
+        total_batches = len(batches)
+        concurrency = max(1, int(self.config.reader.embed_concurrency)) if not query_mode else 1
+
+        if concurrency <= 1:
+            # 串行路径（embed_concurrency=1 等价旧行为）
+            results: list[Any] = []
+            for idx, part in enumerate(batches):
+                part_result = await self._embed_once(part, query_mode=query_mode)
+                if part_result == {} or part_result is None:
+                    self.ctx.logger.warning(
+                        "embedding 拆批调用第 %d/%d 批失败，整单失败待重试", idx + 1, total_batches
+                    )
+                    return {}
+                results.append(part_result)
+                self.ctx.logger.info("embedding 拆批进度: %d/%d 批（%d 块）", idx + 1, total_batches, len(part))
+            return self._merge_embed_results(results)
+
+        # 并发路径：Semaphore 限流，return_exceptions 收集失败批
+        sem = asyncio.Semaphore(concurrency)
+        done_log: dict[int, str] = {}
+
+        async def _run_one(idx: int, part: list[str]) -> Any:
+            async with sem:
+                return await self._embed_once(part, query_mode=query_mode)
+
+        async def _guarded(idx: int, part: list[str]) -> tuple[int, Any]:
+            try:
+                r = await _run_one(idx, part)
+                done_log[idx] = "ok"
+                return (idx, r)
+            except Exception as e:  # noqa: BLE001
+                done_log[idx] = f"{type(e).__name__}: {e}"
+                return (idx, {})
+
+        gathered = await asyncio.gather(*(_guarded(i, b) for i, b in enumerate(batches)))
+        gathered.sort(key=lambda x: x[0])  # 按原批序拼回，保证向量与文本对齐
+
+        failed = [i for i, r in gathered if r == {} or r is None]
+        if failed:
+            self.ctx.logger.warning(
+                "embedding 并发拆批 %d/%d 批失败（%s），整单失败待重试",
+                len(failed), total_batches, ",".join(str(i + 1) for i in failed),
             )
-        return self._merge_embed_results(results)
+            return {}
+        for i in range(total_batches):
+            self.ctx.logger.info("embedding 拆批进度: %d/%d 批（%d 块）", i + 1, total_batches, len(batches[i]))
+        return self._merge_embed_results([r for _, r in gathered])
 
     def _merge_embed_results(self, results: list[Any]) -> Any:
         """把多批 embed 结果拼成一个与单批同构的结果。"""
@@ -273,10 +327,29 @@ class FileReaderPlugin(MaiBotPlugin):
             return results[0]
         return results[0]
 
-    async def _embed_once(self, texts: list[str]) -> Any:
-        """单批 embed 调用 + 自动重试（指数退避），耗尽返回空。"""
+    async def _embed_once(self, texts: list[str], *, query_mode: bool = False) -> Any:
+        """单批 embed 调用 + 自动重试。
+
+        v1.0.18 重试分层：
+        - 入库（query_mode=False）：2 次尝试、退避 2s——入库走后台任务，可等；
+        - 查询（query_mode=True）：单次调用 + wait_for(query_embed_timeout)——
+          BLOCKING hook 卡在请求模型之前是用户感知延迟主因（旧行为最坏 ~96s），
+          超时立即返回 {}，上层注入路径会降级到概要兜底。
+        """
+        if query_mode:
+            timeout = float(self.config.reader.query_embed_timeout or 0)
+            try:
+                if timeout > 0:
+                    return await asyncio.wait_for(self.ctx.llm.embed(texts=texts), timeout=timeout)
+                return await self.ctx.llm.embed(texts=texts)
+            except (asyncio.TimeoutError, Exception) as e:  # noqa: BLE001
+                self._embedding_ok = False
+                self._embedding_err = f"{type(e).__name__}: {e}"
+                self.ctx.logger.warning("查询 embedding 失败（不重试，降级概要兜底）: %s", e)
+                return {}
+
         last_err: Optional[Exception] = None
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 result = await self.ctx.llm.embed(texts=texts)
                 self._embedding_ok = True
@@ -286,8 +359,8 @@ class FileReaderPlugin(MaiBotPlugin):
                 last_err = e
                 self._embedding_ok = False
                 self._embedding_err = f"{type(e).__name__}: {e}"
-                if attempt < 2:  # 还有重试机会
-                    delay = 2.0 * (attempt + 1)
+                if attempt < 1:  # 还有重试机会
+                    delay = 2.0
                     self.ctx.logger.warning(
                         "embedding 调用失败（第 %d 次），%.0fs 后重试: %s",
                         attempt + 1,
@@ -295,11 +368,11 @@ class FileReaderPlugin(MaiBotPlugin):
                         e,
                     )
                     await asyncio.sleep(delay)
-        self.ctx.logger.error("embedding 调用失败（已重试 2 次）: %s", last_err)
+        self.ctx.logger.error("embedding 调用失败（已重试 1 次）: %s", last_err)
         return {}
 
     async def _embed_query(self, query: str) -> Optional[list[float]]:
-        result = await self._embed([query])
+        result = await self._embed([query], query_mode=True)
         if isinstance(result, dict):
             if isinstance(result.get("results"), list) and result["results"]:
                 item = result["results"][0]
@@ -674,6 +747,8 @@ class FileReaderPlugin(MaiBotPlugin):
             self.config.reader.chunk_size,
             self.config.reader.chunk_overlap,
             self.config.reader.retrieve_top_k,
+            chunk_merge=bool(self.config.reader.chunk_merge_enabled),
+            retrieve_use_matrix=bool(self.config.reader.retrieve_use_matrix),
         )
         tmp_path: Optional[str] = None
         try:
@@ -743,12 +818,16 @@ class FileReaderPlugin(MaiBotPlugin):
                 session_id,
             )
             # v1.0.17：大文件后台预热概要（不阻塞回执；注入时 _ensure_summary 也会懒生成，这里只是让首次提问即命中）
+            # v1.0.18 C4：改走 _ensure_summary_async（in-flight 去重 + 失败冷却），注入触发时不会重复起任务
+            # v1.0.18 C1：阈值判定用 entry.total_chars()（原文长度），overlap 合并会让 join(chunks) 膨胀
             if (
                 bool(self.config.reader.summary_enabled)
-                and len("".join(entry.chunks)) > max(1, int(self.config.reader.direct_inject_max_chars))
+                and entry.total_chars() > max(1, int(self.config.reader.direct_inject_max_chars))
                 and not entry.summary
             ):
-                asyncio.create_task(self._warmup_summary(entry))
+                self._ensure_summary_async(entry)
+            # v1.0.18 C3：文件变动必须失效注入缓存，否则同一问题会复用旧文件的注入内容
+            self._memo_invalidate_session(session_id)
             if not self.config.reader.silent_success:
                 await self._reply(
                     stream_id,
@@ -948,6 +1027,52 @@ class FileReaderPlugin(MaiBotPlugin):
     # v1.0.16 教训：辅助方法必须放在 @HookHandler/@Tool 装饰器之前——
     # 装饰器绑定的是紧随其后的函数，曾把 _full_text_within_limit 注册成
     # inject_file_context hook 本体（本地直调测试发现不了，真机必炸）。
+
+    def _memo_get(self, session_id: str, query_key: str) -> Optional[str]:
+        """查注入去重缓存：TTL 内命中返回上次注入文本，否则 None。"""
+        if not bool(self.config.reader.inject_memo_enabled):
+            return None
+        item = self._inject_memo.get((session_id, query_key))
+        if item is None:
+            return None
+        ts, text = item
+        ttl = max(1, int(self.config.reader.inject_memo_ttl))
+        if time.time() - ts > ttl:
+            self._inject_memo.pop((session_id, query_key), None)
+            return None
+        return text
+
+    def _memo_put(self, session_id: str, query_key: str, text: str) -> None:
+        """写注入去重缓存：LRU 上限 128 条，超限先淘汰最旧。"""
+        if not bool(self.config.reader.inject_memo_enabled) or not text:
+            return
+        if len(self._inject_memo) >= 128:
+            oldest_key = min(self._inject_memo, key=lambda k: self._inject_memo[k][0])
+            self._inject_memo.pop(oldest_key, None)
+        self._inject_memo[(session_id, query_key)] = (time.time(), text)
+
+    def _memo_invalidate_session(self, session_id: str) -> None:
+        """文件变动后失效该会话的全部注入缓存（防止注入陈旧内容）。"""
+        for key in [k for k in self._inject_memo if k[0] == session_id]:
+            self._inject_memo.pop(key, None)
+
+    def _tick_rounds_once(self, vs: Any, query_key: str = "") -> None:
+        """轮数去重（v1.0.18 C3）：同一问题文本在 120s 窗口内只给文件 +1 轮。
+
+        旧逻辑 hook 与 tool 各 +1、且每次 attempt 都 +1，5 轮配额实际 2-3 轮就用光，
+        文件提前过期 → 用户重发 → 重新 embedding。这里用与 memo 同形的小缓存去重。
+        """
+        key = ("__round__", query_key.strip() or str(time.time() // 120))
+        item = self._inject_memo.get(key)
+        now = time.time()
+        if item is not None and now - item[0] < 120:
+            return  # 同一问题本轮已计数
+        if len(self._inject_memo) >= 128:
+            oldest_key = min(self._inject_memo, key=lambda k: self._inject_memo[k][0])
+            self._inject_memo.pop(oldest_key, None)
+        self._inject_memo[key] = (now, "")
+        vs.increment_rounds()
+
     def _full_text_within_limit(self, vs: Any) -> Optional[str]:
         """直注判定：会话内所有文件全文合计 ≤ direct_inject_max_chars 时返回拼接全文，否则 None。
 
@@ -958,7 +1083,8 @@ class FileReaderPlugin(MaiBotPlugin):
         limit = int(self.config.reader.direct_inject_max_chars)
         if limit <= 0 or not vs.files:
             return None
-        total = sum(len("".join(entry.chunks)) for entry in vs.files.values())
+        # v1.0.18：阈值判定用原文长度（source_chars），overlap 合并会让 join(chunks) 膨胀约 20%
+        total = sum(entry.total_chars() for entry in vs.files.values())
         if total > limit:
             return None
         parts: list[str] = []
@@ -1013,27 +1139,66 @@ class FileReaderPlugin(MaiBotPlugin):
             self.ctx.logger.warning("文件 %s 概要生成异常（静默降级）: %s", entry.file_name, e)
             return ""
 
+    def _summary_cooling(self, entry: Any) -> bool:
+        """概要失败冷却判断（v1.0.18 C4）：冷却期内不再尝试生成。"""
+        interval = float(self.config.reader.summary_retry_interval)
+        if interval <= 0:
+            return False
+        last_fail = self._summary_failed_ts.get(entry.file_name)
+        return last_fail is not None and (time.time() - last_fail) < interval
+
+    def _ensure_summary_async(self, entry: Any) -> bool:
+        """为单个大文件启动后台概要任务（v1.0.18 C4）。
+
+        in-flight 去重（与入库预热共用）：同一 entry 不重复起任务；
+        失败冷却期内跳过。返回是否实际启动了任务。
+        """
+        if entry.summary or id(entry) in self._summary_pending or self._summary_cooling(entry):
+            return False
+        self._summary_pending.add(id(entry))
+
+        async def _run() -> None:
+            try:
+                summary = await self._generate_file_summary(entry)
+                if summary:
+                    entry.summary = summary
+                    self._summary_failed_ts.pop(entry.file_name, None)
+                else:
+                    self._summary_failed_ts[entry.file_name] = time.time()
+            except Exception as e:  # noqa: BLE001
+                self._summary_failed_ts[entry.file_name] = time.time()
+                self.ctx.logger.warning("文件 %s 概要后台生成异常（已进入冷却）: %s", entry.file_name, e)
+            finally:
+                self._summary_pending.discard(id(entry))
+
+        asyncio.create_task(_run())
+        return True
+
     async def _ensure_summary(self, vs: Any) -> None:
-        """确保会话内所有大文件（全文超直注阈值）都有概要；已有则跳过。"""
+        """注入时的概要保障（v1.0.18 C4 异步化）。
+
+        summary_await_on_inject=true 时保持 v1.0.17 同步行为（测试/排障用）；
+        默认 false：只负责触发后台生成（in-flight + 冷却去重），不阻塞注入，
+        概要缺失的本次注入仍可正常检索，下次提问自然带上概要。
+        """
         if not bool(self.config.reader.summary_enabled):
             return
         limit = max(1, int(self.config.reader.direct_inject_max_chars))
+        await_now = bool(self.config.reader.summary_await_on_inject)
         for entry in vs.files.values():
-            total_len = len("".join(entry.chunks))
-            if total_len <= limit or entry.summary:
+            # v1.0.18：阈值判定用原文长度
+            if entry.total_chars() <= limit or entry.summary:
                 continue
-            summary = await self._generate_file_summary(entry)
-            if summary:
-                entry.summary = summary
-
-    async def _warmup_summary(self, entry: Any) -> None:
-        """入库后后台预热概要：生成失败静默，不影响入库回执。"""
-        try:
-            summary = await self._generate_file_summary(entry)
-            if summary:
-                entry.summary = summary
-        except Exception as e:  # noqa: BLE001
-            self.ctx.logger.warning("文件 %s 概要预热异常（静默降级）: %s", entry.file_name, e)
+            if await_now:
+                if self._summary_cooling(entry):
+                    continue
+                summary = await self._generate_file_summary(entry)
+                if summary:
+                    entry.summary = summary
+                else:
+                    self._summary_failed_ts[entry.file_name] = time.time()
+            else:
+                self._ensure_summary_async(entry)
 
     @HookHandler(
         "maisaka.replyer.before_model_request",
@@ -1041,6 +1206,8 @@ class FileReaderPlugin(MaiBotPlugin):
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
         error_policy=ErrorPolicy.SKIP,
+        # v1.0.18：显式超时（查询 embedding 单次 8s + 检索/拼装余量），防止 BLOCKING hook 卡死请求
+        timeout_ms=11000,
     )
     async def inject_file_context(self, **kwargs: Any) -> dict[str, Any]:
         """检索相关文件内容，注入 LLM 上下文。
@@ -1082,10 +1249,10 @@ class FileReaderPlugin(MaiBotPlugin):
                 modified["items"] = list(items) + [new_item]
                 if "item_schema_version" in kwargs:
                     modified["item_schema_version"] = kwargs["item_schema_version"]
-                vs.increment_rounds()
+                self._tick_rounds_once(vs, "direct-inject")
                 self.ctx.logger.info(
                     "文件全文直注（%.0f 字 ≤ 阈值 %d），跳过检索",
-                    sum(len("".join(e.chunks)) for e in vs.files.values()),
+                    sum(e.total_chars() for e in vs.files.values()),
                     int(self.config.reader.direct_inject_max_chars),
                 )
                 return {"action": "continue", "modified_kwargs": modified}
@@ -1094,6 +1261,20 @@ class FileReaderPlugin(MaiBotPlugin):
             query = self._extract_last_user_query(items)
             if not query:
                 return {"action": "continue"}
+
+            # 注入去重（v1.0.18 C3）：同一会话同一问题 TTL 内直接复用上次注入文本。
+            # hook 每次 attempt 都会重跑、Planner 与回复各触发一次——旧幂等只挡 items 内的
+            # marker，挡不住跨触发的重复 embedding 与重复检索。
+            memo_key = query.strip()
+            memo_text = self._memo_get(session_id, memo_key)
+            if memo_text:
+                new_item = self._make_system_item(memo_text)
+                modified = dict(kwargs)
+                modified["items"] = list(items) + [new_item]
+                if "item_schema_version" in kwargs:
+                    modified["item_schema_version"] = kwargs["item_schema_version"]
+                self.ctx.logger.info("文件注入命中去重缓存（同会话同问题 TTL 内），跳过检索")
+                return {"action": "continue", "modified_kwargs": modified}
 
             # 大文件概要（v1.0.17）：检索前先确保大文件有概要（异步生成、失败静默），
             # 有概要时即使本次检索无命中也能给 LLM 一个整体认识
@@ -1112,12 +1293,13 @@ class FileReaderPlugin(MaiBotPlugin):
                     for fname, s in summaries:
                         parts.append(f"《{fname}》概要：\n{s}")
                     inject_text = "\n\n".join(parts)
+                    self._memo_put(session_id, memo_key, inject_text)
                     new_item = self._make_system_item(inject_text)
                     modified = dict(kwargs)
                     modified["items"] = list(items) + [new_item]
                     if "item_schema_version" in kwargs:
                         modified["item_schema_version"] = kwargs["item_schema_version"]
-                    vs.increment_rounds()
+                    self._tick_rounds_once(vs, memo_key)
                     return {"action": "continue", "modified_kwargs": modified}
                 return {"action": "continue"}
 
@@ -1132,6 +1314,7 @@ class FileReaderPlugin(MaiBotPlugin):
             for i, r in enumerate(results, 1):
                 parts.append(f"[{i}] 来源「{r['file_name']}」 相关度 {r['score']:.3f}：\n{r['text']}")
             inject_text = "\n\n".join(parts)
+            self._memo_put(session_id, memo_key, inject_text)
 
             new_item = self._make_system_item(inject_text)
             modified = dict(kwargs)
@@ -1139,8 +1322,8 @@ class FileReaderPlugin(MaiBotPlugin):
             if "item_schema_version" in kwargs:
                 modified["item_schema_version"] = kwargs["item_schema_version"]
 
-            # 增加轮数（对命中文件计数，触发轮数过期）
-            vs.increment_rounds()
+            # 增加轮数（同问题每轮只 +1，hook/tool/attempt 共享去重）
+            self._tick_rounds_once(vs, memo_key)
 
             return {"action": "continue", "modified_kwargs": modified}
         except Exception as e:  # noqa: BLE001
@@ -1200,6 +1383,7 @@ class FileReaderPlugin(MaiBotPlugin):
             return True, "无法定位当前会话，清除失败。", 0
 
         removed = self._store.drop(session_id)
+        self._memo_invalidate_session(session_id)  # v1.0.18 C3：清文件后失效注入缓存
         text = f"🗑️ 已清除当前会话 {removed} 个文件块。" if removed else "当前会话没有已入库的文件。"
         await self._reply(str(kwargs.get("stream_id", "") or ""), text)
         return True, text, 2 if removed else 0
@@ -1310,11 +1494,13 @@ class FileReaderPlugin(MaiBotPlugin):
         # 直注路径（v1.0.14）：小文件直接返回全文，不检索
         full_text = self._full_text_within_limit(vs)
         if full_text:
-            vs.increment_rounds()
+            self._tick_rounds_once(vs, query)  # v1.0.18 C3：同问题每轮只 +1
             names = "、".join(vs.files.keys())
+            marker = self.config.reader.injection_marker
             return {
                 "content": (
-                    f"当前会话文件较小（≤ {int(self.config.reader.direct_inject_max_chars)} 字），"
+                    # v1.0.18 C3：带幂等标记，Planner 拿到全文后 hook 检测到标记即不再重复注入
+                    f"{marker} 当前会话文件较小（≤ {int(self.config.reader.direct_inject_max_chars)} 字），"
                     f"直接给出全文（会话 {resolved_sid}，文件：{names}）：\n\n{full_text}"
                 )
             }
@@ -1326,10 +1512,11 @@ class FileReaderPlugin(MaiBotPlugin):
         results = vs.retrieve(qvec)
         if not results:
             return {"content": "未在文件中检索到相关内容。"}
-        parts = [f"检索到以下相关片段（会话 {resolved_sid}，已入库文件：{'、'.join(vs.files.keys())}）："]
+        marker = self.config.reader.injection_marker
+        parts = [f"{marker} 检索到以下相关片段（会话 {resolved_sid}，已入库文件：{'、'.join(vs.files.keys())}）："]
         for i, r in enumerate(results, 1):
             parts.append(f"[{i}]「{r['file_name']}」({r['score']:.3f}):\n{r['text']}")
-        vs.increment_rounds()
+        self._tick_rounds_once(vs, query)  # v1.0.18 C3：同问题每轮只 +1
         return {"content": "\n\n".join(parts)}
 
     # ─── 后台清理循环 ────────────────────────────────────────────
@@ -1341,8 +1528,10 @@ class FileReaderPlugin(MaiBotPlugin):
                     retention = self.config.reader.file_retention_time * 60
                     max_rounds = self.config.reader.file_max_rounds
                     total_removed = 0
-                    for vs in list(self._store._sessions.values()):
+                    for (sid, _cid), vs in list(self._store._sessions.items()):
                         removed = vs.cleanup_expired(retention, max_rounds)
+                        if removed:
+                            self._memo_invalidate_session(sid)  # v1.0.18 C3：清理后失效该会话注入缓存
                         total_removed += len(removed)
                     if total_removed:
                         self.ctx.logger.info("后台清理：移除 %d 个过期文件", total_removed)
@@ -1421,6 +1610,8 @@ class FileReaderPlugin(MaiBotPlugin):
                                 self.config.reader.chunk_size,
                                 self.config.reader.chunk_overlap,
                                 self.config.reader.retrieve_top_k,
+                                chunk_merge=bool(self.config.reader.chunk_merge_enabled),
+                                retrieve_use_matrix=bool(self.config.reader.retrieve_use_matrix),
                             )
                             entry = await vs.add_file(item["name"], item["text"])
                         except Exception as e:  # noqa: BLE001

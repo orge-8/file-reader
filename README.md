@@ -46,7 +46,9 @@ pip install chardet          # txt 编码检测（建议装，缺失时多编码
 | reader.max_file_size | int | 100 | 单文件大小上限（MB） |
 | reader.chunk_size | int | 512 | 分块大小（字符数） |
 | reader.chunk_overlap | int | 100 | 分块重叠（字符数） |
-| reader.retrieve_top_k | int | 5 | 检索返回的相关块数量 |
+| reader.chunk_merge_enabled | bool | true | 短碎片合并（v1.0.18）：相邻短碎片合并到接近 chunk_size 再成块，块数降至约 1/3，入库向量化耗时同步下降；关闭回退旧逐碎片成块 |
+| reader.retrieve_top_k | int | 6 | 检索返回的相关块数量 |
+| reader.retrieve_use_matrix | bool | true | 矩阵化检索（v1.0.18）：缓存 L2 归一化向量矩阵，查询时一次点积算全库相似度（入库/清理自动置脏重建）；块数多时检索开销显著下降；异常自动回退逐条余弦 |
 | reader.file_retention_time | int | 60 | 文件有效时间（分钟） |
 | reader.file_max_rounds | int | 5 | 文件最大参与轮数 |
 | reader.cleanup_interval | int | 15 | 后台清理间隔（分钟） |
@@ -56,11 +58,17 @@ pip install chardet          # txt 编码检测（建议装，缺失时多编码
 | reader.silent_success | bool | true | 文件入库成功后保持静默（不发回执，日志仍记录）；设为 false 恢复「已解析 N 块」回执 |
 | reader.embed_retry_interval | float | 2.0 | 嵌入失败后台重试间隔（分钟）；入库时 embedding 超时会先进后台队列定时重试 |
 | reader.embed_max_retries | int | 30 | 后台重试最大次数（超过后放弃并提示重发文件；默认 ≈ 覆盖 1 小时拥塞，重试时实时读取、热改立即生效） |
-| reader.embed_batch_size | int | 16 | 单次 llm.embed RPC 的最大文本条数；大文件整把调用会撞 30s RPC 上限，拆批后每次调用远低于上限 |
+| reader.embed_batch_size | int | 64 | 单次 llm.embed RPC 的最大文本条数；v1.0.18 配合分块合并从 16 提到 64（合并后单批约 8K 字仍远低于 30s RPC 上限），批数下降进一步缩短入库耗时；host 限流可调回 16 |
+| reader.embed_concurrency | int | 2 | 入库拆批后的并发批数：多批同时调用 llm.embed（1 = 旧串行行为）；host 出现限流/批量报错时调回 1 |
+| reader.query_embed_timeout | float | 8.0 | 提问时查询 embedding 的超时秒数：仅单次调用、超时立即放弃并降级概要兜底，不重试（避免拥塞期把用户卡在请求模型之前）；0 = 关闭超时（旧行为） |
 | reader.direct_inject_max_chars | int | 6000 | 全文直注阈值（解析后总字符数）：会话内所有文件全文合计 ≤ 该值时，跳过 RAG 检索、直接把全文注入上下文（小文件全量可见且省一次查询 embedding）；0 = 关闭，始终检索 |
+| reader.inject_memo_enabled | bool | true | 注入去重缓存（v1.0.18）：同一会话同一问题在 TTL 内直接复用上次注入文本（零 embedding、零检索），覆盖 hook 每次尝试重跑与 Planner/回复双触发；文件入库、清文件、会话清理时自动失效 |
+| reader.inject_memo_ttl | int | 90 | 注入去重缓存的存活秒数 |
 | reader.summary_enabled | bool | true | 大文件 LLM 概要：全文超 direct_inject_max_chars 的文件在入库后用 llm.generate 生成一段概要，注入上下文时附在检索片段前，让 LLM 对大文件先有整体认识；生成失败静默降级（不影响检索） |
 | reader.summary_source_chars | int | 12000 | 生成概要时截取的源文本长度（字符数）：从文件头、中、尾三段均匀取样拼接，控制摘要调用的 token 开销 |
 | reader.summary_max_chars | int | 500 | 概要文本的最大长度（字符数） |
+| reader.summary_await_on_inject | bool | false | 提问注入时是否同步等待概要生成（v1.0.17 旧行为）；默认 false = 概要后台生成、不阻塞注入，下次提问自然带上 |
+| reader.summary_retry_interval | float | 600.0 | 概要生成失败后的冷却秒数：冷却期内不再尝试生成（避免每次提问都撞一次超时）；0 = 不冷却 |
 | **napcat.enabled** | bool | false | **启用 NapCat HTTP 兜底取文件**（见下，QQ 发文件必须开） |
 | napcat.http_url | str | http://127.0.0.1:3001 | NapCat OneBot HTTP 服务地址 |
 | napcat.access_token | str | 空 | NapCat HTTP 的 access_token（未设置则留空） |
@@ -128,6 +136,18 @@ python plugins/file-reader/test_file_reader.py
 - **Hook 报 `'ReaderConfig' object has no attribute 'xxx'`**：配置字段按 section 分层，`enabled` 在 `plugin` 段（`self.config.plugin.enabled`），读取参数在 `reader` 段；跨段误访问会直接 AttributeError（v1.0.0 真机踩过，v1.0.1 已修）。
 
 ## 更新日志
+
+### v1.0.18（2026-09-02）性能优化专项
+
+五项优化（C1–C5），全部带独立开关可回滚旧行为；回归 49/49 PASS + GATE PASS。
+
+- **C1 分块合并**（`chunk_merge_enabled`，默认开）：递归切分出的相邻短碎片合并到接近 `chunk_size` 再成块，块数降至约 1/3，入库向量化耗时同步下降；`FileEntry` 新增 `source_chars` 记录原文长度，直注/概要阈值判定不再被 overlap 膨胀误导。
+- **C2 embedding 并发提速**（`embed_concurrency` + `embed_batch_size`）：入库拆批后多批并发调用 `llm.embed`（默认并发 2），`embed_batch_size` 默认 16 → 64；新增 `query_embed_timeout`（默认 8s）——提问时查询 embedding 仅单次调用、超时立即降级概要兜底不重试，避免拥塞期把用户卡在请求模型之前。
+- **C3 注入 memo 去重**（`inject_memo_enabled` / `inject_memo_ttl`）：同一会话同一问题在 TTL（默认 90s）内直接复用上次注入文本，零 embedding、零检索；hook 检索路径与 search_file 工具输出共享幂等标记，互不重复注入；文件入库、清文件、会话清理时自动失效。
+- **C3 轮数去重**：`_tick_rounds_once` 按（问题，120s 窗口）计数，同问题跨 hook/tool/attempt 多次触发只算 1 轮——修复 5 轮配额被双触发减半的问题。
+- **C4 概要异步化**（`summary_await_on_inject`，默认 false）：提问注入不再同步等待概要生成（旧行为会把 BLOCKING hook 卡住数秒），概要在后台生成、下次提问自然带上；`id(entry)` in-flight 去重防止重复起任务；`summary_retry_interval`（默认 600s）失败冷却，避免每次提问都撞一次超时；入库预热与懒生成共用同一入口。
+- **C5 矩阵化检索**（`retrieve_use_matrix`，默认开）：缓存 L2 归一化向量矩阵，查询时一次点积算全库相似度；入库/清理/删文件自动置脏重建；块数多时检索开销显著下降，结果与逐条余弦一致，异常自动回退旧路径。
+- **测试**：42 → 49 用例，新增异步概要（不阻塞/in-flight 去重/失败冷却）、注入 memo（去重/失效/轮数去重/tool 标记）、矩阵检索（一致性/置脏/回退）等；新增 2b5 前排空后台任务等时序隔离措施。
 
 ### v1.0.17（2026-09-02）
 
