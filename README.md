@@ -56,6 +56,7 @@ pip install chardet          # txt 编码检测（建议装，缺失时多编码
 | reader.insecure_download | bool | false | 下载文件时跳过 SSL 证书校验（内网 MITM 代理环境用，见常见问题） |
 | reader.injection_marker | str | 【文件检索】 | 注入文本的幂等标记 |
 | reader.silent_success | bool | true | 文件入库成功后保持静默（不发回执，日志仍记录）；设为 false 恢复「已解析 N 块」回执 |
+| reader.silent_errors | bool | true | 错误回执静默（v1.0.20）：文件处理失败（不支持的类型/下载失败/超限/embedding 失败/重试耗尽等）只写日志、不发群消息；设为 false 恢复 ⚠️ 错误回执 |
 | reader.embed_retry_interval | float | 2.0 | 嵌入失败后台重试间隔（分钟）；入库时 embedding 超时会先进后台队列定时重试 |
 | reader.embed_max_retries | int | 30 | 后台重试最大次数（超过后放弃并提示重发文件；默认 ≈ 覆盖 1 小时拥塞，重试时实时读取、热改立即生效） |
 | reader.embed_batch_size | int | 64 | 单次 llm.embed RPC 的最大文本条数；v1.0.18 配合分块合并从 16 提到 64（合并后单批约 8K 字仍远低于 30s RPC 上限），批数下降进一步缩短入库耗时；host 限流可调回 16 |
@@ -136,6 +137,18 @@ python plugins/file-reader/test_file_reader.py
 - **Hook 报 `'ReaderConfig' object has no attribute 'xxx'`**：配置字段按 section 分层，`enabled` 在 `plugin` 段（`self.config.plugin.enabled`），读取参数在 `reader` 段；跨段误访问会直接 AttributeError（v1.0.0 真机踩过，v1.0.1 已修）。
 
 ## 更新日志
+
+### v1.0.20（2026-09-04）错误回执静默
+
+- **新增 `silent_errors` 配置（默认 true）**：文件处理失败（不支持的类型、下载失败、超限、embedding 失败/重试耗尽、NapCat 未启用等）不再发送 ⚠️ 错误回执到群，只写 `logger.warning` 日志；需要恢复错误回执时设为 `false`。
+- **收口方法**：新增 `_reply_error(stream_id, text, *, reason)` 统一处理所有错误回执点，所有错误路径替换为 `_reply_error`，受 `silent_errors` 开关控制。
+- **测试**：新增 silent_errors 静默测试（默认静默不回执，开关关闭恢复 ⚠️ 提示）+ 6 处既有测试适配（临时 `silent_errors = False` 验证错误回执可见性），53/53 PASS + GATE PASS。
+
+### v1.0.19（2026-09-03）防抖合并消息多文件修复
+
+- **修复：message-debounce-cn 防抖合并消息里只有第一个文件被处理**（真机 09-03 10:49 日志）：防抖插件会把连续多条文件消息合并成一条（最多观测到 14 个文件合并成 1 条），文本含多行 `[文件] xxx，大小: N，链接: https://...`；旧版 `re.search` 只取第一个 `[文件]`，其余文件全部静默丢弃——批量发 20 个文件只有 3~4 个入库，且无任何报错。
+- **修复方案**：新增 `_parse_file_hints`（复数）逐行解析全部 `[文件]` 行，每行独立摘出自己的下载链接（URL 各自归属，不再只认第一个）；`_detect_file` 对所有解析出的文件各自入库。单文件旧语义经 `_parse_file_hint` 兼容保留。
+- **测试**：新增防抖合并 3 行解析（文件名/大小/URL 逐行正确）+ 多文件端到端入库（各自走 URL 下载）2 个用例，52/52 PASS + GATE PASS。
 
 ### v1.0.18（2026-09-02）性能优化专项
 

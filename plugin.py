@@ -87,6 +87,7 @@ class ReaderConfig(PluginConfigBase):
     inject_memo_enabled: bool = Field(default=True, description="注入去重缓存（v1.0.18）：同一会话同一问题在 TTL 内直接复用上次注入文本（零 embedding、零检索），覆盖 hook 每次尝试重跑与 Planner/回复双触发；文件入库、清文件、会话清理时自动失效")
     inject_memo_ttl: int = Field(default=90, description="注入去重缓存的存活秒数")
     silent_success: bool = Field(default=True, description="文件入库成功后保持静默（不发回执，日志仍记录）；关闭后每次入库都回复「已解析 N 块」")
+    silent_errors: bool = Field(default=True, description="文件处理失败（不支持的类型/下载失败/超限/嵌入耗尽等）时保持静默（不发回执，日志仍记录，可用 /file_status 排查）；关闭后失败会回复 ⚠️ 提示")
     embed_retry_interval: float = Field(default=2.0, description="嵌入失败后台重试间隔（分钟）；入库时 embedding 超时会先在后台队列排队，定时重试")
     embed_max_retries: int = Field(default=30, description="后台重试最大次数（超过后放弃并提示重发文件；默认 30 次 × 2 分钟 ≈ 覆盖 1 小时拥塞）")
     embed_batch_size: int = Field(default=64, description="单次 llm.embed RPC 调用的最大文本条数；v1.0.18 配合分块合并把默认从 16 提到 64（合并后单批约 8K 字仍远低于 30s RPC 上限），批数下降进一步缩短入库耗时；若 host 限流可调回 16")
@@ -431,17 +432,20 @@ class FileReaderPlugin(MaiBotPlugin):
         if not files and self._looks_like_file(message):
             # 真机形态：适配器已把 file 段降级成 `[文件] xxx.docx，大小: 9547` 纯文本，
             # 本体只能拿 message_id 回头找 NapCat 要。
-            hint = self._parse_file_hint(message)
-            if hint:
-                hint["napcat_message_id"] = message.get("message_id")
+            # v1.0.19：防抖插件会把连续文件消息合并成一条，需解析全部 [文件] 行
+            hints = self._parse_file_hints(message)
+            if hints:
+                mid = message.get("message_id")
+                for hint in hints:
+                    hint["napcat_message_id"] = mid
                 # 留档：/file_status 里能看到最近一次文件消息的 message_id，便于核对 NapCat 回溯
                 self._last_file_hint = {
-                    "name": hint["name"],
-                    "size": hint["size_hint"],
-                    "mid": repr(message.get("message_id")),
+                    "name": "、".join(h["name"] for h in hints[:5]) + ("…" if len(hints) > 5 else ""),
+                    "size": hints[0]["size_hint"],
+                    "mid": repr(mid),
                     "stage": stage,
                 }
-                files = [hint]
+                files = hints
         if not files:
             return {"action": "continue"}
 
@@ -482,39 +486,49 @@ class FileReaderPlugin(MaiBotPlugin):
                     return True
         return False
 
-    def _parse_file_hint(self, message: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """从降级文本里解析文件名、大小与可选下载链接。
+    def _parse_file_hints(self, message: dict[str, Any]) -> list[dict[str, Any]]:
+        """从降级文本里解析全部文件（v1.0.19）：防抖插件会把连续多条文件消息合并成一条，
+        文本里出现多行 `[文件] xxx，大小: N，链接: https://...`——必须逐行解析，漏一行丢一个文件。
 
-        两种真机形态：
+        单行形态（v1.0.8 既有）：
         - 私聊：`[文件] 文章.docx，大小: 9547`
         - 群聊：`[文件] 文章.docx，大小: 9547，链接: https://tjc-download.ftn.qq.com/...`
 
-        返回 {"name", "size_hint", "url"?}；解析不出返回 None。
+        返回 [{"name", "size_hint", "url"?}, ...]；一行解析不出则跳过该行。
         """
         plain = str(message.get("processed_plain_text") or "") or str(message.get("text") or "")
-        # 注意：非贪婪 (.+?) 必须锚定，否则只会吃到第一个字符（"文"而非"文章.txt"）；
-        # name 后面可以跟 大小 和 链接 两个可选尾巴，链接里含逗号，必须先单独摘出来。
-        url_m = re.search(r"链接[:：]\s*(https?://\S+)", plain)
-        url = url_m.group(1).rstrip("，,。") if url_m else ""
-        # 去掉链接尾巴再匹配文件名，避免长 URL 被吞进 name；
-        # 截断处可能残留 "，大小: 9547，" 这类尾巴，让大小组可选+锚定吸收它
-        name_part = plain[: url_m.start()] if url_m else plain
-        m = re.search(
-            r"\[文件\]\s*(?P<name>.+?)(?:\s*[，,]\s*大小[:：]\s*(?P<size>\d+))?\s*[，,]?\s*$",
-            name_part,
-            re.MULTILINE,
-        )
-        if not m:
-            return None
-        name = m.group("name").strip()
-        if not name:
-            return None
-        size_raw = m.group("size")
-        size_hint = int(size_raw) if size_raw else 0
-        hint: dict[str, Any] = {"name": name, "size_hint": size_hint}
-        if url:
-            hint["url"] = url
-        return hint
+        if "[文件]" not in plain:
+            return []
+        hints: list[dict[str, Any]] = []
+        # 逐行解析：链接可能含逗号，先按行切分再在行内摘 URL
+        for line in plain.splitlines():
+            line = line.strip()
+            if "[文件]" not in line:
+                continue
+            url_m = re.search(r"链接[:：]\s*(https?://\S+)", line)
+            url = url_m.group(1).rstrip("，,。") if url_m else ""
+            # 去掉链接尾巴再匹配文件名，避免长 URL 被吞进 name
+            name_part = line[: url_m.start()] if url_m else line
+            m = re.search(
+                r"\[文件\]\s*(?P<name>.+?)(?:\s*[，,]\s*大小[:：]\s*(?P<size>\d+))?\s*[，,]?\s*$",
+                name_part,
+            )
+            if not m:
+                continue
+            name = m.group("name").strip()
+            if not name:
+                continue
+            size_raw = m.group("size")
+            hint: dict[str, Any] = {"name": name, "size_hint": int(size_raw) if size_raw else 0}
+            if url:
+                hint["url"] = url
+            hints.append(hint)
+        return hints
+
+    def _parse_file_hint(self, message: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """单文件形态兼容入口（v1.0.8 版语义，内部走 _parse_file_hints）。"""
+        hints = self._parse_file_hints(message)
+        return hints[0] if hints else None
 
     def _log_file_hook_diag(self, stage: str, kwargs: dict[str, Any], message: Any) -> None:
         """诊断载荷结构。
@@ -761,10 +775,11 @@ class FileReaderPlugin(MaiBotPlugin):
             if raw_bytes is None and fdata.get("napcat_message_id"):
                 # 适配器降级形态：拿 message_id 回头找 NapCat 要原始文件
                 if not self.config.napcat.enabled:
-                    await self._reply(
+                    await self._reply_error(
                         stream_id,
                         f"⚠️ 文件「{name}」读不到内容：适配器把文件降级成了纯文本，"
                         "请在插件配置里启用「NapCat 兜底」并填好 HTTP 地址与 token。",
+                        reason="napcat_disabled",
                     )
                     return
                 raw_bytes, napcat_path = await asyncio.to_thread(self._resolve_via_napcat, fdata)
@@ -772,24 +787,27 @@ class FileReaderPlugin(MaiBotPlugin):
                     raw_bytes = Path(str(napcat_path)).read_bytes()
             if raw_bytes is None:
                 if fdata.get("napcat_message_id"):
-                    await self._reply(
+                    await self._reply_error(
                         stream_id,
                         f"⚠️ 文件「{name}」无法读取：NapCat 未返回文件内容"
                         "（检查 HTTP 服务/token/message_id 是否对得上，或配置 cache_dir）。",
+                        reason="napcat_no_content",
                     )
                 else:
-                    await self._reply(
+                    await self._reply_error(
                         stream_id,
                         f"⚠️ 文件「{name}」无法读取：消息里没有文件内容，也没有可用于回溯的 message_id。",
+                        reason="no_content",
                     )
                 return
 
             # 大小检查
             max_bytes = self.config.reader.max_file_size * 1024 * 1024
             if len(raw_bytes) > max_bytes:
-                await self._reply(
+                await self._reply_error(
                     stream_id,
                     f"⚠️ 文件「{name}」大小 {len(raw_bytes) / 1024 / 1024:.1f}MB 超过上限 {self.config.reader.max_file_size}MB，已跳过。",
+                    reason="too_large",
                 )
                 return
 
@@ -834,12 +852,14 @@ class FileReaderPlugin(MaiBotPlugin):
                     f"📄 已解析「{name}」，切成 {len(entry.chunks)} 块并向量化。现在可以直接问我文件内容了。",
                 )
         except ValueError as e:
-            await self._reply(stream_id, f"⚠️ {e}")
+            await self._reply_error(stream_id, f"⚠️ {e}", reason="value_error")
         except RuntimeError as e:
-            await self._reply(stream_id, f"⚠️ {e}")
+            await self._reply_error(stream_id, f"⚠️ {e}", reason="runtime_error")
         except Exception as e:  # noqa: BLE001
             self.ctx.logger.error("处理文件 %s 失败: %s", name, e, exc_info=True)
-            await self._reply(stream_id, f"⚠️ 处理文件「{name}」失败：{type(e).__name__}")
+            await self._reply_error(
+                stream_id, f"⚠️ 处理文件「{name}」失败：{type(e).__name__}", reason="exception"
+            )
         finally:
             if tmp_path:
                 try:
@@ -1022,6 +1042,14 @@ class FileReaderPlugin(MaiBotPlugin):
             await self.ctx.send.text(text, stream_id)
         except Exception as e:  # noqa: BLE001
             self.ctx.logger.error("回执发送失败: %s", e)
+
+    async def _reply_error(self, stream_id: str, text: str, *, reason: str) -> None:
+        """错误回执收口（v1.0.20）：silent_errors 开启时只写日志不发群，
+        避免批量发文件时 ⚠️ 刷屏；日志带 reason 便于 /file_status 排查。"""
+        self.ctx.logger.warning("文件处理失败（silent_errors=%s）: %s | %s",
+                                bool(self.config.reader.silent_errors), reason, text)
+        if not bool(self.config.reader.silent_errors):
+            await self._reply(stream_id, text)
 
     # ─── LLM 上下文注入（before_model_request hook） ─────────────
     # v1.0.16 教训：辅助方法必须放在 @HookHandler/@Tool 装饰器之前——
@@ -1573,11 +1601,12 @@ class FileReaderPlugin(MaiBotPlugin):
                 "next_ts": time.time() + 30.0,  # 首次重试等 30s（短期抖动大概率自愈）
             }
         )
-        await self._reply(
+        await self._reply_error(
             stream_id,
             f"⚠️ 文件「{name}」已收到、内容也读出来了，但嵌入模型暂时无响应。"
             f"我会每隔 {self.config.reader.embed_retry_interval:.0f} 分钟自动重试入库（最多 {max_retries} 次），"
             "成功后无需重新发送。",
+            reason="embed_queued",
         )
 
     async def _start_retry_loop(self) -> None:
@@ -1619,10 +1648,11 @@ class FileReaderPlugin(MaiBotPlugin):
                                 self.ctx.logger.error(
                                     "文件 %s 重试 %d 次仍失败，放弃: %s", item["name"], item["attempts"], e
                                 )
-                                await self._reply(
+                                await self._reply_error(
                                     item["stream_id"],
                                     f"⚠️ 文件「{item['name']}」自动重试 {item['attempts']} 次仍未入库"
                                     "（嵌入模型持续无响应），麻烦重新发送一次文件。",
+                                    reason="embed_retries_exhausted",
                                 )
                                 continue
                             item["next_ts"] = time.time() + interval

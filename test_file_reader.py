@@ -231,13 +231,16 @@ async def _test_plugin_hooks() -> None:
     assert result == {"action": "continue"}, f"hook 应返回 continue: {result}"
     print("[PASS] on_file_message 直调（配置访问 + OneBot 段提取）")
 
-    # 等后台处理任务跑完（FakeHost 的 llm.embed 返回不含向量 → 优雅报错回执）
+    # 等后台处理任务跑完（FakeHost 的 llm.embed 返回不含向量 → embedding 失败入重试队列；
+    # v1.0.20 silent_errors 默认静默不发回执，这里验证的是回执行为，临时关掉）
+    plugin.config.reader.silent_errors = False
     await asyncio.sleep(0.3)
     replies = [m for m in runner.host.sent_messages if m.get("capability") == "send.text"]
     assert replies, "后台处理应产生一条回执（成功或可读错误提示）"
     reply_text = str(replies[0].get("text", ""))
     assert "embedding" in reply_text or "嵌入模型" in reply_text or "已解析" in reply_text, f"回执应是可读状态: {reply_text[:80]}"
     print(f"[PASS] 后台文件处理回执: {reply_text[:60]}")
+    plugin.config.reader.silent_errors = True  # 恢复默认静默
 
     # 1b. napcat 真机形态（v1.0.2 诊断日志实测采集）：kwargs 无 session_id、
     #     message.session_id 在顶层、message_info 为 user_info/group_info 嵌套、
@@ -276,6 +279,8 @@ async def _test_plugin_hooks() -> None:
         hook_name="chat.receive.after_process", message=fake_message_napcat
     )
     assert result == {"action": "continue"}, f"napcat 形态 hook 应返回 continue: {result}"
+    # v1.0.20 silent_errors 默认静默，此用例验证错误回执可见性，临时关掉
+    plugin.config.reader.silent_errors = False
     await asyncio.sleep(0.3)
     new_replies = [m for m in runner.host.sent_messages[sent_before:] if m.get("capability") == "send.text"]
     assert new_replies, "napcat raw_message(list) 形态应能提取到文件并产生回执"
@@ -284,10 +289,13 @@ async def _test_plugin_hooks() -> None:
     # （docx 在未装 docx2txt 的环境会提示装依赖，也是预期内的可读回执）
     readable = any(k in nap_reply for k in ("embedding", "已解析", "缺少依赖", "失败", "无法读取"))
     assert readable, f"napcat 回执应是可读状态: {nap_reply[:80]}"
+    plugin.config.reader.silent_errors = True
     # 1c. 双阶段 hook：before_process 提取后，after_process 同文件应被去重（不重复入库）
     # 真机背景：after_process 阶段文件已被转成 text 描述（raw=list[text(-)]），
     # 故 v1.0.4 新增 before_process hook 拿原始段，两阶段共用逻辑 + 10s 去重。
     # 用独立 session 避免与 1b 的去重键（session:文件名）冲突。
+    # v1.0.20 silent_errors 默认静默，此用例依赖回执计数验证去重，临时关掉
+    plugin.config.reader.silent_errors = False
     fake_message_napcat["session_id"] = "napcat-session-dual"
     dup_before = len(runner.host.sent_messages)
     result_early = await plugin.on_file_message_early(
@@ -304,6 +312,7 @@ async def _test_plugin_hooks() -> None:
     dup_new = [m for m in runner.host.sent_messages[dup_before:] if m.get("capability") == "send.text"]
     assert len(dup_new) == 1, f"两阶段同文件应只处理一次，实际 {len(dup_new)} 次: {[str(m.get('text', ''))[:40] for m in dup_new]}"
     print(f"[PASS] 双阶段 hook 去重（before 提取 + after 跳过）: 回执 {len(dup_new)} 条")
+    plugin.config.reader.silent_errors = True
 
     # 1d. 诊断策略：普通消息每阶段只打一行；疑似文件消息（[文件] 标记）每次都打
     # 背景：v1.0.4 的一次性诊断被首条普通文本消息消耗，文件消息结构没采到（真机踩过）。
@@ -421,6 +430,8 @@ async def _test_plugin_hooks() -> None:
     print("[PASS] silent_success 静默模式（成功不回执）")
 
     # 1f. NapCat 未启用时应给出可操作提示，而不是静默失败
+    # v1.0.20 silent_errors 默认静默，此用例验证错误回执可见性，临时关掉
+    plugin.config.reader.silent_errors = False
     sent_before = len(runner.host.sent_messages)
     plugin.config.napcat.enabled = False
     degraded2 = dict(degraded)
@@ -436,6 +447,7 @@ async def _test_plugin_hooks() -> None:
     off_reply = str(new_replies[0].get("text", ""))
     assert "NapCat 兜底" in off_reply, f"应提示启用 NapCat 兜底: {off_reply[:120]}"
     print(f"[PASS] NapCat 未启用时的可操作提示: {off_reply[:40]}")
+    plugin.config.reader.silent_errors = True
 
     # 1g. 群聊降级形态（v1.0.8）：带下载链接尾巴 `[文件] x.docx，大小: N，链接: https://...`
     # 真机 13:27 日志踩到：URL 被吞进文件名 → "不支持的文件类型: .(无扩展名)"。
@@ -446,6 +458,88 @@ async def _test_plugin_hooks() -> None:
     assert hint["name"] == "文章.docx" and hint["size_hint"] == 9547, hint
     assert hint["url"].startswith("https://tjc-download.ftn.qq.com/"), hint
     print("[PASS] 群聊降级形态解析（文件名不被 URL 吞掉）")
+
+    # 1g2. 防抖合并消息多文件解析（v1.0.19）：真机 09-03 10:49 日志——message-debounce-cn
+    # 把连续多条文件消息合并成一条，文本含多行 [文件]，旧版 re.search 只取第一个，
+    # 其余文件全部静默丢弃（14 个文件只有 pdf 入库）。必须逐行解析。
+    merged_text = (
+        "[文件] maibot_test.ini，大小: 177，链接: https://gzc-download.ftn.qq.com/ftn_handler/9ee/?fname=\n"
+        "[文件] maibot_test.js，大小: 973，链接: https://gzc-download.ftn.qq.com/ftn_handler/8c1/?fname=\n"
+        "[文件] maibot_test.json，大小: 1330，链接: https://gzc-download.ftn.qq.com/ftn_handler/e61/?fname="
+    )
+    hints = plugin._parse_file_hints({"processed_plain_text": merged_text})
+    assert len(hints) == 3, f"防抖合并 3 行应解析出 3 个文件: {len(hints)}"
+    assert [h["name"] for h in hints] == ["maibot_test.ini", "maibot_test.js", "maibot_test.json"], hints
+    assert [h["size_hint"] for h in hints] == [177, 973, 1330], hints
+    assert all(h["url"].startswith("https://gzc-download.ftn.qq.com/") for h in hints), hints
+    assert hints[0]["url"].endswith("9ee/?fname=") and hints[1]["url"].endswith("8c1/?fname="), hints
+    # 单文件兼容入口语义不变
+    single = plugin._parse_file_hint({"processed_plain_text": merged_text})
+    assert single is not None and single["name"] == "maibot_test.ini", single
+    # 无 [文件] 的消息返回空列表
+    assert plugin._parse_file_hints({"processed_plain_text": "普通聊天消息"}) == []
+    print("[PASS] 防抖合并消息多文件解析（逐行提取，URL 各自归属）")
+
+    # 1g3. 多文件端到端：合并消息里每个文件都应各自入库（走 url 下载路径）
+    plugin.config.napcat.enabled = False  # 强制走 hint["url"] 下载而非 NapCat 回溯
+    multi_degraded = {
+        "session_id": "debounce-multi",
+        "message_id": "multi-001",
+        "processed_plain_text": merged_text,
+        "text": merged_text,
+    }
+    _dl_calls: list[str] = []
+
+    async def _fake_download(url: str):
+        _dl_calls.append(url)
+        return f"测试文件内容 {len(_dl_calls)}：这是防抖合并下载的正文。".encode("utf-8")
+
+    plugin._download = _fake_download
+    await plugin.on_file_message(hook_name="chat.receive.after_process", message=multi_degraded)
+    await asyncio.sleep(0.5)
+    vs_multi = plugin._store.get("debounce-multi", "debounce-multi")
+    assert vs_multi is not None, "会话库应已创建"
+    in_files = set(vs_multi.files.keys())
+    assert in_files == {"maibot_test.ini", "maibot_test.js", "maibot_test.json"}, (
+        f"3 个文件应全部入库: {in_files}"
+    )
+    assert len(_dl_calls) == 3, f"应下载 3 次（每文件一次）: {_dl_calls}"
+    print(f"[PASS] 防抖合并多文件端到端入库（{_dl_calls[0].split('/')[-2]} 等 3 个，各自下载）")
+    plugin._store._sessions.pop(("debounce-multi", "debounce-multi"), None)
+
+    # 1g4. silent_errors 静默（v1.0.20）：真机 09-03 12:18——批量 21 文件里 4 个不支持的
+    # 类型（css/jsonl/tsv/png）逐条发 ⚠️ 刷屏；默认静默只写日志，关闭开关才回复。
+    err_degraded = {
+        "session_id": "silent-err",
+        "message_id": "silent-err-001",
+        "processed_plain_text": "[文件] 照片.png，大小: 40198，链接: https://gzc-download.ftn.qq.com/ftn_handler/png1/?fname=",
+        "text": "[文件] 照片.png，大小: 40198，链接: https://gzc-download.ftn.qq.com/ftn_handler/png1/?fname=",
+    }
+    plugin.config.reader.silent_errors = True
+    sent0 = len(runner.host.sent_messages)
+    await plugin.on_file_message(hook_name="chat.receive.after_process", message=err_degraded)
+    await asyncio.sleep(0.3)
+    err_replies = [
+        m for m in runner.host.sent_messages[sent0:]
+        if m.get("capability") == "send.text" and str(m.get("stream_id")) == "silent-err"
+    ]
+    assert not err_replies, f"silent_errors=true 时不支持类型不应回执: {[str(m.get('text',''))[:40] for m in err_replies]}"
+    # 关闭开关 → 恢复 ⚠️ 回执（清去重缓存避免 10s 窗口跳过本次）
+    plugin.config.reader.silent_errors = False
+    plugin._recent_file_keys.clear()
+    sent1 = len(runner.host.sent_messages)
+    await plugin.on_file_message(hook_name="chat.receive.after_process", message=err_degraded)
+    await asyncio.sleep(0.3)
+    err_replies2 = [
+        m for m in runner.host.sent_messages[sent1:]
+        if m.get("capability") == "send.text" and str(m.get("stream_id")) == "silent-err"
+    ]
+    assert err_replies2 and "不支持" in str(err_replies2[0].get("text", "")), (
+        f"silent_errors=false 应回复不支持的类型: {[str(m.get('text',''))[:40] for m in err_replies2]}"
+    )
+    plugin.config.reader.silent_errors = True  # 恢复默认
+    print("[PASS] silent_errors 静默（默认不支持的类型不回执，开关关闭恢复 ⚠️ 提示）")
+    plugin._store._sessions.pop(("silent-err", "silent-err"), None)
 
     # 1h. embedding 自动重试（v1.0.10；v1.0.18 改为 2 次尝试=1 失败+1 成功，退避简化）
     # 真机 14:05 日志：embedding 服务瞬时拥塞 cap.call 30s 超时，需重试免疫。
@@ -495,10 +589,13 @@ async def _test_plugin_hooks() -> None:
 
     # 清空队列（其他用例可能残留），并清掉同名会话向量库，确保从零开始
     plugin._embed_retry_queue = []
+    plugin._recent_file_keys.clear()
     plugin._store._sessions.pop(("retry-session", "retry-session"), None)
 
     call_count["n"] = 0
     plugin.ctx.llm.embed = _dead_embed  # 恒失败
+    # v1.0.20 silent_errors 默认静默不发回执，此用例验证错误回执可见性，临时关掉
+    plugin.config.reader.silent_errors = False
 
     sent_before = len(runner.host.sent_messages)
     await plugin._handle_file(

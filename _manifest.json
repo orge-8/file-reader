@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "org.mai-mai.file-reader",
-  "version": "1.0.18",
+  "version": "1.0.20",
   "name": "文件读取（File Reader）",
   "description": "解析 QQ 群/私聊上传的文件（pdf/docx/xlsx/pptx/csv/代码/文本等），分块向量化后按语义检索，把最相关内容注入 LLM 上下文，实现低开销的文件问答。参考 astrbot_plugin_file_reader_pro 移植。",
   "author": {
