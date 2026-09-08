@@ -52,6 +52,20 @@ from chunker import RecursiveCharacterChunker  # noqa: E402
 from file_parser import describe_supported_types, read_any_file_to_text  # noqa: E402
 from vector_store import SessionStore  # noqa: E402
 
+# v1.1.0：降级文本解析正则提到模块级预编译（每次 hook 现编译是无谓开销）
+_RE_HINT_URL = re.compile(r"链接[:：]\s*(https?://\S+)")
+_RE_HINT_NAME = re.compile(
+    r"\[文件\]\s*(?P<name>.+?)(?:\s*[，,]\s*大小[:：]\s*(?P<size>\d+))?\s*[，,]?\s*$"
+)
+
+
+class _DownloadTooLargeError(Exception):
+    """下载前/下载中即判定超限（v1.1.0）：不再把超限文件全量拉进内存。"""
+
+    def __init__(self, size_bytes: float) -> None:
+        super().__init__(f"download exceeds limit: {size_bytes:.0f} bytes")
+        self.size_mb = size_bytes / 1024 / 1024
+
 
 # ─── 配置模型 ────────────────────────────────────────────────────
 class PluginSectionConfig(PluginConfigBase):
@@ -72,7 +86,7 @@ class ReaderConfig(PluginConfigBase):
     __ui_icon__ = "folder"
     __ui_order__ = 1
 
-    max_file_size: int = Field(default=100, description="单文件大小上限（MB）")
+    max_file_size: int = Field(default=30, description="单文件大小上限（MB）。注意内存占用约为文件大小的 2~3 倍（字节+解析文本+向量同时驻留），大内存机器可调高")
     chunk_size: int = Field(default=512, description="分块大小（字符数）")
     chunk_overlap: int = Field(default=100, description="分块重叠（字符数）")
     chunk_merge_enabled: bool = Field(default=True, description="短碎片合并（v1.0.18 性能优化）：递归切分出的相邻短碎片合并到接近 chunk_size 再成块，块数降至约 1/3，入库向量化耗时同步下降；关闭则回退旧的逐碎片成块行为")
@@ -80,7 +94,7 @@ class ReaderConfig(PluginConfigBase):
     retrieve_use_matrix: bool = Field(default=True, description="矩阵化检索（v1.0.18 性能优化）：缓存 L2 归一化向量矩阵，查询时一次点积算全库相似度（入库/清理/删文件自动置脏重建）；块数多时检索开销显著下降，结果与逐条余弦一致；异常自动回退旧路径")
     file_retention_time: int = Field(default=60, description="文件有效时间（分钟）")
     file_max_rounds: int = Field(default=5, description="文件最大参与轮数")
-    cleanup_interval: int = Field(default=15, description="后台清理间隔（分钟）")
+    cleanup_interval: int = Field(default=5, description="后台清理间隔（分钟）：清理过期文件、回收空会话向量库、裁剪概要冷却表")
     enable_group: bool = Field(default=True, description="是否处理群聊文件")
     insecure_download: bool = Field(default=False, description="下载文件时跳过 SSL 证书校验（运行机器存在 TLS MITM 代理、报 CERTIFICATE_VERIFY_FAILED 时开启）")
     injection_marker: str = Field(default="【文件检索】", description="注入文本的幂等标记")
@@ -153,16 +167,28 @@ class FileReaderPlugin(MaiBotPlugin):
         self._recent_file_keys: dict[str, float] = {}
         # 最近一次"被降级成纯文本"的文件消息留档（供 /file_status 排查）
         self._last_file_hint: dict[str, Any] = {}
-        # embedding 失败重试队列（v1.0.11）：[{session_id, conversation_id, stream_id, name, text, attempts, next_ts}]
+        # embedding 失败重试队列（v1.0.11）：[{session_id, conversation_id, stream_id, name, tmp_path, attempts, next_ts}]
+        # v1.1.0：队列条目存临时文件路径而非解析全文——全文（可达数 MB）不再驻留队列最长 1 小时
         self._embed_retry_queue: list[dict[str, Any]] = []
         self._retry_task: Optional[asyncio.Task] = None
         # 注入去重缓存（v1.0.18 C3）：(session_id, query_key) -> (ts, inject_text)
         # 覆盖 hook 每次尝试重跑与 Planner/回复双触发；入库/清文件/会话清理时必须失效
         self._inject_memo: dict[tuple[str, str], tuple[float, str]] = {}
-        # 概要异步化（v1.0.18 C4）：in-flight 去重（同一 entry 的概要任务不重复起）
+        # 概要异步化（v1.0.18 C4）：in-flight 去重（同一文件的概要任务不重复起）
         # 与失败冷却（file_name -> 上次失败时刻，冷却期内不再撞 llm.generate 超时）
-        self._summary_pending: set[int] = set()
+        # v1.1.0：pending 键从 id(entry) 改为 file_name——id() 在 entry 释放后可能被新对象复用，
+        # 理论上会误判 in-flight 导致该文件概要永远不生成
+        self._summary_pending: set[str] = set()
         self._summary_failed_ts: dict[str, float] = {}
+        # v1.1.0：后台任务句柄注册表——create_task 裸调只靠事件循环弱引用持有，
+        # 有 GC 提前回收风险；且 on_unload 需要统一取消，防任务泄漏到重载后的旧 store
+        self._bg_tasks: set[asyncio.Task] = set()
+        # v1.1.0：下载用 httpx 单例（连接复用，免每次新建 client + SSL 上下文）
+        self._http_client: Optional[Any] = None
+        self._http_client_verify: bool = True
+        # v1.1.0：NapCat urllib SSL 上下文缓存（create_default_context 是 ms 级 CPU 调用）
+        self._napcat_ssl_ctx: Optional[ssl.SSLContext] = None
+        self._napcat_ssl_verify: bool = False
 
         # 行为自检：确认 chunker / 解析器在进程内可用（runtime-gotchas 5.1 的对策）
         self._run_self_check()
@@ -202,8 +228,36 @@ class FileReaderPlugin(MaiBotPlugin):
             except (asyncio.CancelledError, Exception):
                 pass
             self._retry_task = None
+        # v1.1.0：统一取消进行中的下载/解析/概要任务（旧版泄漏到重载后仍写旧 store）
+        for task in list(self._bg_tasks):
+            task.cancel()
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+            self._bg_tasks.clear()
+        # v1.1.0：关闭 httpx 单例连接池
+        if self._http_client is not None:
+            try:
+                await self._http_client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+            self._http_client = None
+        # v1.1.0：清掉重试队列残留的临时文件（条目已改存路径）
+        for item in self._embed_retry_queue:
+            tmp = item.get("tmp_path")
+            if tmp:
+                try:
+                    os.remove(str(tmp))
+                except OSError:
+                    pass
+        self._embed_retry_queue = []
         self._store.save_meta()
         self.ctx.logger.info("文件读取插件已卸载")
+
+    def _spawn_bg(self, coro: Any) -> None:
+        """注册式 create_task（v1.1.0）：持句柄防 GC 提前回收，on_unload 统一取消。"""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         """配置热重载。"""
@@ -469,9 +523,7 @@ class FileReaderPlugin(MaiBotPlugin):
 
         # 后台处理，不阻塞聊天主流程（runtime-gotchas 5.3）
         for fdata in to_handle:
-            asyncio.create_task(
-                self._handle_file(session_id, conversation_id, stream_id, fdata)
-            )
+            self._spawn_bg(self._handle_file(session_id, conversation_id, stream_id, fdata))
         return {"action": "continue"}
 
     def _looks_like_file(self, message: dict[str, Any]) -> bool:
@@ -505,14 +557,11 @@ class FileReaderPlugin(MaiBotPlugin):
             line = line.strip()
             if "[文件]" not in line:
                 continue
-            url_m = re.search(r"链接[:：]\s*(https?://\S+)", line)
+            url_m = _RE_HINT_URL.search(line)
             url = url_m.group(1).rstrip("，,。") if url_m else ""
             # 去掉链接尾巴再匹配文件名，避免长 URL 被吞进 name
             name_part = line[: url_m.start()] if url_m else line
-            m = re.search(
-                r"\[文件\]\s*(?P<name>.+?)(?:\s*[，,]\s*大小[:：]\s*(?P<size>\d+))?\s*[，,]?\s*$",
-                name_part,
-            )
+            m = _RE_HINT_NAME.search(name_part)
             if not m:
                 continue
             name = m.group("name").strip()
@@ -765,13 +814,25 @@ class FileReaderPlugin(MaiBotPlugin):
             retrieve_use_matrix=bool(self.config.reader.retrieve_use_matrix),
         )
         tmp_path: Optional[str] = None
+        queued_for_retry = False  # v1.1.0：入队后临时文件归重试队列持有，finally 不再删
+        # 大小上限提前算好：下载路径在下载前/下载中就要用它做预检（v1.1.0）
+        max_bytes = self.config.reader.max_file_size * 1024 * 1024
         try:
             # 取文件字节
+            # v1.1.0：本地路径读文件包 to_thread——100MB 级同步 read_bytes 会冻结整个事件循环
             raw_bytes = fdata.get("bytes")
             if raw_bytes is None and fdata.get("path"):
-                raw_bytes = Path(str(fdata["path"])).read_bytes()
+                raw_bytes = await asyncio.to_thread(Path(str(fdata["path"])).read_bytes)
             if raw_bytes is None and fdata.get("url"):
-                raw_bytes = await self._download(str(fdata["url"]))
+                try:
+                    raw_bytes = await self._download(str(fdata["url"]), max_bytes)
+                except _DownloadTooLargeError as e:
+                    await self._reply_error(
+                        stream_id,
+                        f"⚠️ 文件「{name}」大小约 {e.size_mb:.1f}MB 超过上限 {self.config.reader.max_file_size}MB，已跳过。",
+                        reason="too_large",
+                    )
+                    return
             if raw_bytes is None and fdata.get("napcat_message_id"):
                 # 适配器降级形态：拿 message_id 回头找 NapCat 要原始文件
                 if not self.config.napcat.enabled:
@@ -784,7 +845,7 @@ class FileReaderPlugin(MaiBotPlugin):
                     return
                 raw_bytes, napcat_path = await asyncio.to_thread(self._resolve_via_napcat, fdata)
                 if raw_bytes is None and napcat_path:
-                    raw_bytes = Path(str(napcat_path)).read_bytes()
+                    raw_bytes = await asyncio.to_thread(Path(str(napcat_path)).read_bytes)
             if raw_bytes is None:
                 if fdata.get("napcat_message_id"):
                     await self._reply_error(
@@ -801,8 +862,7 @@ class FileReaderPlugin(MaiBotPlugin):
                     )
                 return
 
-            # 大小检查
-            max_bytes = self.config.reader.max_file_size * 1024 * 1024
+            # 大小检查（base64/本地路径来源在此兜底；URL 来源已在下载中预检）
             if len(raw_bytes) > max_bytes:
                 await self._reply_error(
                     stream_id,
@@ -816,6 +876,8 @@ class FileReaderPlugin(MaiBotPlugin):
             fd, tmp_path = tempfile.mkstemp(suffix=suffix)
             with os.fdopen(fd, "wb") as f:
                 f.write(raw_bytes)
+            # 解析前释放原始字节引用，降低瞬时内存峰值（raw_bytes + 文本 + 向量曾同时驻留）
+            raw_bytes = None
 
             # 解析
             text = await asyncio.to_thread(read_any_file_to_text, tmp_path, name)
@@ -826,7 +888,9 @@ class FileReaderPlugin(MaiBotPlugin):
             except RuntimeError as e:
                 # embedding 为空/超时：放入后台重试队列（v1.0.11）
                 # 注意：ValueError（内容为空）不在此列，走下方通用分支
-                await self._enqueue_embed_retry(session_id, conversation_id, stream_id, name, text)
+                # v1.1.0：队列条目存临时文件路径而非全文，临时文件转交队列持有
+                await self._enqueue_embed_retry(session_id, conversation_id, stream_id, name, str(tmp_path))
+                queued_for_retry = True
                 self.ctx.logger.warning("文件 %s 入库失败（embedding），已入后台重试队列: %s", name, e)
                 return
             self.ctx.logger.info(
@@ -861,11 +925,24 @@ class FileReaderPlugin(MaiBotPlugin):
                 stream_id, f"⚠️ 处理文件「{name}」失败：{type(e).__name__}", reason="exception"
             )
         finally:
-            if tmp_path:
+            if tmp_path and not queued_for_retry:
                 try:
                     os.remove(tmp_path)
                 except OSError:
                     pass
+
+    def _napcat_ssl_context(self) -> ssl.SSLContext:
+        """NapCat urllib SSL 上下文缓存（v1.1.0）：create_default_context 是 ms 级 CPU 调用，
+        旧版每次 _napcat_post 新建（每文件 2~3 次请求）；verify_ssl 配置变化时重建。"""
+        verify = bool(self.config.napcat.verify_ssl)
+        if self._napcat_ssl_ctx is None or self._napcat_ssl_verify != verify:
+            ctx = ssl.create_default_context()
+            if not verify:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            self._napcat_ssl_ctx = ctx
+            self._napcat_ssl_verify = verify
+        return self._napcat_ssl_ctx
 
     # ─── NapCat HTTP 兜底（同步实现，调用处包 asyncio.to_thread） ───
     def _napcat_post(self, endpoint: str, payload: dict[str, Any]) -> Optional[Any]:
@@ -879,10 +956,7 @@ class FileReaderPlugin(MaiBotPlugin):
         token = (cfg.access_token or "").strip()
         if token:
             req.add_header("Authorization", f"Bearer {token}")
-        ctx = ssl.create_default_context()
-        if not cfg.verify_ssl:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+        ctx = self._napcat_ssl_context()
         try:
             with urllib.request.urlopen(req, timeout=cfg.timeout, context=ctx) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -1011,26 +1085,58 @@ class FileReaderPlugin(MaiBotPlugin):
             path = self._search_cache_dir(name, size_hint)
         return (None, path)
 
-    async def _download(self, url: str) -> Optional[bytes]:
-        """下载文件（用 httpx，可选依赖）。
+    async def _get_http_client(self) -> Any:
+        """下载用 httpx 单例（v1.1.0）：连接池复用，免每次下载新建 client 与 SSL 上下文。
+        insecure_download 配置变化时关闭旧 client 重建。"""
+        import httpx  # type: ignore
+
+        verify = not self.config.reader.insecure_download
+        if self._http_client is not None and self._http_client_verify != verify:
+            try:
+                await self._http_client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+            self._http_client = None
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=30, verify=verify)
+            self._http_client_verify = verify
+        return self._http_client
+
+    async def _download(self, url: str, max_bytes: int) -> Optional[bytes]:
+        """流式下载文件（v1.1.0 重写）。
+
+        旧版问题：resp.content 一次性读入、大小检查在下载完成之后——
+        超限文件也先全量拉进内存（raw_bytes + base64 + 临时文件 + 解析文本同时驻留，
+        瞬时内存 2~3 倍文件大小）。
+        现行为：Content-Length 预检 + 边下边累计、超限立即中断抛 _DownloadTooLargeError。
 
         运行机器若存在 TLS MITM 代理（proxy-root-ca.cer），HTTPS 会报
         CERTIFICATE_VERIFY_FAILED；可开 reader.insecure_download 跳过校验。
         """
         try:
-            import httpx  # type: ignore
+            import httpx  # type: ignore  # noqa: F401
         except ImportError:
             self.ctx.logger.error("下载文件需要 httpx，请安装：pip install httpx")
             return None
-        verify = not self.config.reader.insecure_download
         try:
-            async with httpx.AsyncClient(timeout=30, verify=verify) as client:
-                resp = await client.get(url)
+            client = await self._get_http_client()
+            async with client.stream("GET", url) as resp:
                 resp.raise_for_status()
-                return resp.content
+                # 预检：Content-Length 已超限直接中断（不必开始下载）
+                cl = resp.headers.get("content-length")
+                if cl and cl.isdigit() and int(cl) > max_bytes:
+                    raise _DownloadTooLargeError(float(cl))
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes(65536):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise _DownloadTooLargeError(float(total))
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        except _DownloadTooLargeError:
+            raise
         except Exception as e:  # noqa: BLE001
-            if not verify and isinstance(e, Exception) and "CERTIFICATE_VERIFY_FAILED" in str(e):
-                pass  # 已跳过校验仍失败，走通用报错
             self.ctx.logger.error("下载 %s 失败: %s", url, e)
             return None
 
@@ -1117,7 +1223,7 @@ class FileReaderPlugin(MaiBotPlugin):
             return None
         parts: list[str] = []
         for fname, entry in vs.files.items():
-            parts.append(f"《{fname}》全文：\n{''.join(entry.chunks)}")
+            parts.append(f"《{fname}》全文：\n{entry.full_text()}")
         return "\n\n".join(parts)
 
     @staticmethod
@@ -1127,7 +1233,7 @@ class FileReaderPlugin(MaiBotPlugin):
         大文件全文直接喂摘要 LLM token 开销大且易撞上下文限制；
         首尾段保留开头与结尾信息，中段保留主体内容。
         """
-        full = "".join(entry.chunks)
+        full = entry.full_text()
         if len(full) <= max_chars:
             return full
         seg = max_chars // 3
@@ -1181,9 +1287,9 @@ class FileReaderPlugin(MaiBotPlugin):
         in-flight 去重（与入库预热共用）：同一 entry 不重复起任务；
         失败冷却期内跳过。返回是否实际启动了任务。
         """
-        if entry.summary or id(entry) in self._summary_pending or self._summary_cooling(entry):
+        if entry.summary or entry.file_name in self._summary_pending or self._summary_cooling(entry):
             return False
-        self._summary_pending.add(id(entry))
+        self._summary_pending.add(entry.file_name)
 
         async def _run() -> None:
             try:
@@ -1197,9 +1303,9 @@ class FileReaderPlugin(MaiBotPlugin):
                 self._summary_failed_ts[entry.file_name] = time.time()
                 self.ctx.logger.warning("文件 %s 概要后台生成异常（已进入冷却）: %s", entry.file_name, e)
             finally:
-                self._summary_pending.discard(id(entry))
+                self._summary_pending.discard(entry.file_name)
 
-        asyncio.create_task(_run())
+        self._spawn_bg(_run())
         return True
 
     async def _ensure_summary(self, vs: Any) -> None:
@@ -1261,8 +1367,8 @@ class FileReaderPlugin(MaiBotPlugin):
             marker = self.config.reader.injection_marker
 
             # 幂等：已有同样标记则跳过（直注 / 检索两条路径共用）
-            existing = " ".join(self._item_text(it) for it in items)
-            if marker in existing:
+            # v1.1.0：逐项早退检查，不再把全部 items 文本拼成一个大字符串只为找 marker
+            if any(marker in self._item_text(it) for it in items):
                 return {"action": "continue"}
 
             # 直注路径（v1.0.14）：全文合计 ≤ 阈值 → 不做检索、不调查询 embedding，
@@ -1556,13 +1662,19 @@ class FileReaderPlugin(MaiBotPlugin):
                     retention = self.config.reader.file_retention_time * 60
                     max_rounds = self.config.reader.file_max_rounds
                     total_removed = 0
-                    for (sid, _cid), vs in list(self._store._sessions.items()):
+                    for (sid, cid), vs in list(self._store._sessions.items()):
                         removed = vs.cleanup_expired(retention, max_rounds)
                         if removed:
                             self._memo_invalidate_session(sid)  # v1.0.18 C3：清理后失效该会话注入缓存
                         total_removed += len(removed)
+                        # v1.1.0：文件清空后回收空会话壳——旧版 (sid,cid)→空 VectorStore 永久驻留，
+                        # 长期运行的 bot 会话数无界增长
+                        if not vs.files:
+                            self._store.drop(sid, cid)
                     if total_removed:
                         self.ctx.logger.info("后台清理：移除 %d 个过期文件", total_removed)
+                    # v1.1.0：概要失败冷却表随清理周期裁剪——旧版按文件名无界增长
+                    self._prune_summary_failed()
                     self._store.save_meta()
                 except asyncio.CancelledError:
                     raise
@@ -1571,6 +1683,18 @@ class FileReaderPlugin(MaiBotPlugin):
 
         self._cleanup_task = asyncio.create_task(loop())
 
+    def _prune_summary_failed(self) -> None:
+        """裁剪概要失败冷却表（v1.1.0）：删 24 小时前的记录，且总量封顶 256 条（超了删最旧）。"""
+        if not self._summary_failed_ts:
+            return
+        now = time.time()
+        self._summary_failed_ts = {
+            k: v for k, v in self._summary_failed_ts.items() if now - v < 86400.0
+        }
+        while len(self._summary_failed_ts) > 256:
+            oldest = min(self._summary_failed_ts, key=lambda k: self._summary_failed_ts[k])
+            self._summary_failed_ts.pop(oldest, None)
+
     # ─── embedding 失败后台重试队列（v1.0.11） ───────────────────
     async def _enqueue_embed_retry(
         self,
@@ -1578,14 +1702,26 @@ class FileReaderPlugin(MaiBotPlugin):
         conversation_id: str,
         stream_id: str,
         name: str,
-        text: str,
+        tmp_path: str,
     ) -> None:
         """把解析好但 embedding 失败的文件放进后台重试队列，并回复准确措辞。
 
         措辞设计：明确"文件已收到、内容已读出"，只是嵌入模型暂时无响应——
         避免 bot 之后从空检索结果瞎猜成「链接拉取超时」（真机 14:28 日志踩过）。
+
+        v1.1.0：条目存临时文件路径而非解析全文——旧版全文（可达数 MB）会在队列里
+        驻留最长约 1 小时（30 次 × 2 分钟），多文件并发失败时内存叠加；
+        现由重试循环在到期时重新读取解析，成功/放弃/on_unload 时删除临时文件。
         """
         # 同名文件已在队列里（如 10s 去重窗口外的重复发送）：覆盖旧条目即可
+        for item in self._embed_retry_queue:
+            if item["session_id"] == session_id and item["name"] == name:
+                old_tmp = item.get("tmp_path")
+                if old_tmp and old_tmp != tmp_path:
+                    try:
+                        os.remove(str(old_tmp))
+                    except OSError:
+                        pass
         self._embed_retry_queue = [
             item for item in self._embed_retry_queue if not (item["session_id"] == session_id and item["name"] == name)
         ]
@@ -1596,7 +1732,7 @@ class FileReaderPlugin(MaiBotPlugin):
                 "conversation_id": conversation_id,
                 "stream_id": stream_id,
                 "name": name,
-                "text": text,
+                "tmp_path": tmp_path,
                 "attempts": 0,
                 "next_ts": time.time() + 30.0,  # 首次重试等 30s（短期抖动大概率自愈）
             }
@@ -1608,6 +1744,17 @@ class FileReaderPlugin(MaiBotPlugin):
             "成功后无需重新发送。",
             reason="embed_queued",
         )
+
+    @staticmethod
+    def _discard_retry_tmp(item: dict[str, Any]) -> None:
+        """删除重试条目持有的临时文件（成功入库 / 放弃 / 文件丢失时调用）。"""
+        tmp = item.get("tmp_path")
+        if tmp:
+            try:
+                os.remove(str(tmp))
+            except OSError:
+                pass
+            item["tmp_path"] = ""
 
     async def _start_retry_loop(self) -> None:
         """后台定时扫描重试队列：到期的条目重新尝试入库。"""
@@ -1631,7 +1778,21 @@ class FileReaderPlugin(MaiBotPlugin):
                         # max_retries 重试时实时读配置（真机 15:20 日志教训：入队时写死会
                         # 在长拥塞里耗尽；热改配置立即生效，正在排队的文件也能受益）
                         max_retries = max(1, int(self.config.reader.embed_max_retries))
+                        # v1.1.0：条目只存临时文件路径，重试前重新读取解析；
+                        # 文件已丢失（如系统清了 temp 目录）直接放弃，不再无谓重试
+                        tmp_path = str(item.get("tmp_path") or "")
+                        if not tmp_path or not os.path.exists(tmp_path):
+                            self.ctx.logger.error(
+                                "文件 %s 的临时文件已丢失，放弃重试（请重新发送文件）", item["name"]
+                            )
+                            await self._reply_error(
+                                item["stream_id"],
+                                f"⚠️ 文件「{item['name']}」的缓存已被系统清理，无法自动重试，麻烦重新发送一次文件。",
+                                reason="embed_retry_tmp_lost",
+                            )
+                            continue
                         try:
+                            text = await asyncio.to_thread(read_any_file_to_text, tmp_path, item["name"])
                             vs = self._store.get_or_create(
                                 item["session_id"],
                                 item["conversation_id"],
@@ -1642,12 +1803,13 @@ class FileReaderPlugin(MaiBotPlugin):
                                 chunk_merge=bool(self.config.reader.chunk_merge_enabled),
                                 retrieve_use_matrix=bool(self.config.reader.retrieve_use_matrix),
                             )
-                            entry = await vs.add_file(item["name"], item["text"])
+                            entry = await vs.add_file(item["name"], text)
                         except Exception as e:  # noqa: BLE001
                             if item["attempts"] >= max_retries:
                                 self.ctx.logger.error(
                                     "文件 %s 重试 %d 次仍失败，放弃: %s", item["name"], item["attempts"], e
                                 )
+                                self._discard_retry_tmp(item)
                                 await self._reply_error(
                                     item["stream_id"],
                                     f"⚠️ 文件「{item['name']}」自动重试 {item['attempts']} 次仍未入库"
@@ -1666,6 +1828,8 @@ class FileReaderPlugin(MaiBotPlugin):
                                 e,
                             )
                             continue
+                        # 成功入库：释放临时文件
+                        self._discard_retry_tmp(item)
                         # 成功入库
                         self.ctx.logger.info(
                             "重试入库成功 %s：%d 块（第 %d 次尝试，session=%s）",

@@ -64,6 +64,11 @@ _NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 _NS_S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
+# _parse_xml 兜底分支的替换正则（模块级预编译，v1.1.0）
+_RE_XML_PREFIX_TAG = re.compile(r"<(/?)([A-Za-z0-9]+):")
+_RE_XML_NS_DECL = re.compile(r'xmlns:[A-Za-z0-9]+="[^"]*"')
+_RE_XML_PREFIX_ATTR = re.compile(r"\s([A-Za-z0-9]+):([A-Za-z0-9]+)=")
+
 
 def _docx_from_zip(path: str) -> str:
     """标准库解析 docx：按段落 <w:p> 收集 <w:t> 文本，制表/换行转字符。"""
@@ -202,12 +207,10 @@ def _parse_xml(data: bytes) -> "ET.Element":
         return ET.fromstring(data)
     except ET.ParseError:
         # 部分 OOXML 写入器会引用 r: / mc: 等前缀却不声明；去掉所有前缀后重试
-        import re as _re
-
         text = data.decode("utf-8", errors="replace")
-        text = _re.sub(r"<(/?)([A-Za-z0-9]+):", r"<\1\2_", text)  # <r:id> → <r_id>，避免 unbound prefix
-        text = _re.sub(r'xmlns:[A-Za-z0-9]+="[^"]*"', "", text)
-        text = _re.sub(r"\s([A-Za-z0-9]+):([A-Za-z0-9]+)=", r" \1_\2=", text)  # 属性 r:id → r_id
+        text = _RE_XML_PREFIX_TAG.sub(r"<\1\2_", text)  # <r:id> → <r_id>，避免 unbound prefix
+        text = _RE_XML_NS_DECL.sub("", text)
+        text = _RE_XML_PREFIX_ATTR.sub(r" \1_\2=", text)  # 属性 r:id → r_id
         return ET.fromstring(text)
 
 

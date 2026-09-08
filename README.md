@@ -24,14 +24,14 @@ MaiBot 插件：解析 QQ 群/私聊上传的文件，分块向量化后按语�
 
 **核心格式零依赖**：docx / xlsx / pptx / csv / txt 及全部代码/文本类文件用 Python 标准库（zipfile + ElementTree / csv）直接解析，**无需安装任何第三方库**——插件跑在 MaiBot 的独立子进程里，这样本地与真机行为完全一致，也省去了找对 python.exe 装库的麻烦。
 
-`numpy`（必需，已写入 manifest dependencies）。
+`numpy`、`httpx`（必需，已写入 manifest dependencies；httpx 用于 URL 文件下载，缺失时下载路径不可用）。
 
-第三方库仅作兜底或覆盖老格式，可按需安装：
+第三方库仅作兜底或覆盖老格式，可按需安装（**pandas 非必需**——xlsx/csv 已零依赖，仅 xls/ods 老格式需要）：
 
 ```bash
-pip install numpy            # 必需
+pip install numpy httpx      # 必需
 pip install pdfminer.six     # PDF（无标准库解法，必装才能读 PDF）
-pip install pandas openpyxl  # xls/ods 老表格格式（xlsx/csv 已零依赖）
+pip install pandas openpyxl  # 仅 xls/ods 老表格格式（xlsx/csv 已零依赖）
 pip install python-docx      # .doc 老格式（建议转存 .docx）
 pip install chardet          # txt 编码检测（建议装，缺失时多编码轮询兜底）
 ```
@@ -43,7 +43,7 @@ pip install chardet          # txt 编码检测（建议装，缺失时多编码
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | plugin.enabled | bool | true | 是否启用插件 |
-| reader.max_file_size | int | 100 | 单文件大小上限（MB） |
+| reader.max_file_size | int | 30 | 单文件大小上限（MB）。内存占用约为文件大小的 2~3 倍（字节+解析文本+向量同时驻留），v1.1.0 起下载在开始前/下载中超限即中断，不再全量拉进内存 |
 | reader.chunk_size | int | 512 | 分块大小（字符数） |
 | reader.chunk_overlap | int | 100 | 分块重叠（字符数） |
 | reader.chunk_merge_enabled | bool | true | 短碎片合并（v1.0.18）：相邻短碎片合并到接近 chunk_size 再成块，块数降至约 1/3，入库向量化耗时同步下降；关闭回退旧逐碎片成块 |
@@ -51,7 +51,7 @@ pip install chardet          # txt 编码检测（建议装，缺失时多编码
 | reader.retrieve_use_matrix | bool | true | 矩阵化检索（v1.0.18）：缓存 L2 归一化向量矩阵，查询时一次点积算全库相似度（入库/清理自动置脏重建）；块数多时检索开销显著下降；异常自动回退逐条余弦 |
 | reader.file_retention_time | int | 60 | 文件有效时间（分钟） |
 | reader.file_max_rounds | int | 5 | 文件最大参与轮数 |
-| reader.cleanup_interval | int | 15 | 后台清理间隔（分钟） |
+| reader.cleanup_interval | int | 5 | 后台清理间隔（分钟）；同时负责回收空会话向量库与裁剪概要冷却表（v1.1.0） |
 | reader.enable_group | bool | true | 是否处理群聊文件 |
 | reader.insecure_download | bool | false | 下载文件时跳过 SSL 证书校验（内网 MITM 代理环境用，见常见问题） |
 | reader.injection_marker | str | 【文件检索】 | 注入文本的幂等标记 |
@@ -137,6 +137,36 @@ python plugins/file-reader/test_file_reader.py
 - **Hook 报 `'ReaderConfig' object has no attribute 'xxx'`**：配置字段按 section 分层，`enabled` 在 `plugin` 段（`self.config.plugin.enabled`），读取参数在 `reader` 段；跨段误访问会直接 AttributeError（v1.0.0 真机踩过，v1.0.1 已修）。
 
 ## 更新日志
+
+### v1.1.0（2026-09-07）性能与内存专项优化
+
+审计报告见 `PERF_AUDIT.md`（11 项），本版全部修复：
+
+**事件循环阻塞（P0）**
+- **本地路径读文件进线程**：`_handle_file` 里 `Path.read_bytes()`（含 NapCat 落盘路径分支）是同步 IO，100MB 级文件会冻结整个事件循环（所有聊天/hook 全停顿）；现包 `asyncio.to_thread`，与解析路径行为对齐。
+- **分块进线程**：递归分块是 CPU 密集任务（百万字文本可达秒级），`VectorStore.add_file` 的 `chunker.chunk()` 同样包 `to_thread`。
+- **下载流式化 + 双重预检**：Content-Length 超限直接中断（不开始下载）；流式边下边累计，超限立即抛 `_DownloadTooLargeError`——旧版 `resp.content` 全量入内存且大小检查在下载完成之后，超限文件也先全下（瞬时内存 2~3 倍文件大小）。超限回执措辞不变。
+- **httpx AsyncClient 单例**：连接池复用，免每次下载新建 client + SSL 上下文；`insecure_download` 配置变化时自动重建。
+
+**内存无界增长（P1）**
+- **空会话回收**：文件全过期后，(session_id, conversation_id) → 空 VectorStore 壳永久驻留（每群/每人一个）；清理循环现 `drop` 空库。
+- **后台任务句柄注册表**：`create_task` 裸调只靠事件循环弱引用持有（有 GC 提前回收风险），且进行中的下载/解析/概要任务在 `on_unload` 后泄漏、插件重载后仍写旧 store；现统一走 `_spawn_bg()` 注册，卸载时全部取消并等待收尾。
+- **重试队列不再持有全文**：条目从「解析全文」（可达数 MB × 最长 1 小时驻留）改为「临时文件路径」，重试到期时重新读取解析；成功/放弃/覆盖/on_unload 时均删除临时文件；临时文件丢失（系统清 temp）时明确提示重发。
+
+**内存占用与计算效率（P2）**
+- **向量统一 float32 ndarray**：入库后 `List[List[float]]`（Python float 每维 ~32B）转 `np.float32` 单块数组，内存约降 8 倍；矩阵构建/余弦直接复用；无 numpy 时自动回退列表。
+- **检索 Top-K 用 argpartition**：O(N log N) 全排序 → O(N) 选 K 再排序；库大时有感。
+- **注入幂等检查早退**：逐项检查 marker 即停，不再把全部上下文 items 拼成大字符串。
+- **直注/概要全文缓存**：`FileEntry.full_text()` 缓存 join 结果，memo 未命中时不再每次 hook 重新拼接。
+- **概要 pending 键修正**：`id(entry)` → `file_name`——CPython 下 entry 释放后 id 可能被新对象复用，理论上误判 in-flight 导致某文件概要永不生成。
+- **概要冷却表裁剪**：`_summary_failed_ts` 24h 过期 + 总量封顶 256，随清理周期执行。
+- **正则预编译**：降级文本解析 2 个正则、OOXML 前缀修正 3 个正则提到模块级。
+- **NapCat SSL 上下文缓存**：`ssl.create_default_context()` 是 ms 级 CPU 调用，旧版每次 `_napcat_post` 新建；现实例级缓存（verify_ssl 变化时重建）。
+
+**依赖与配置**
+- **manifest 补声明 `httpx>=0.24`**：URL 下载路径的必需依赖，旧版漏声明——真机未装 httpx 时下载功能直接废掉。
+- **`max_file_size` 默认 100 → 30MB**：与流式预检配合，内存峰值可控；大内存机器可调回。
+- **`cleanup_interval` 默认 15 → 5 分钟**：过期文件最长多驻留时间同步下降；空会话回收/冷却表裁剪也挂在这个周期上。
 
 ### v1.0.20（2026-09-04）错误回执静默
 

@@ -490,7 +490,7 @@ async def _test_plugin_hooks() -> None:
     }
     _dl_calls: list[str] = []
 
-    async def _fake_download(url: str):
+    async def _fake_download(url: str, max_bytes: int = 0):
         _dl_calls.append(url)
         return f"测试文件内容 {len(_dl_calls)}：这是防抖合并下载的正文。".encode("utf-8")
 
@@ -638,7 +638,9 @@ async def _test_plugin_hooks() -> None:
     )
     sent_before2 = len(runner.host.sent_messages)
     plugin.config.reader.silent_success = False  # 先开回执验证重试成功有反馈
-    entry = await vs_retry.add_file(item["name"], item["text"])
+    # v1.1.0：队列条目存临时文件路径而非全文，重试前需重新读取解析
+    retry_text = read_any_file_to_text(item["tmp_path"], item["name"])
+    entry = await vs_retry.add_file(item["name"], retry_text)
     assert len(entry.chunks) > 0, "恢复 embedding 后应能正常入库"
     assert ("retry-session", "retry-session") in plugin._store._sessions
     vs_check = plugin._store._sessions[("retry-session", "retry-session")]
@@ -665,7 +667,10 @@ async def _test_plugin_hooks() -> None:
     await asyncio.sleep(0.3)
     same_name_items = [i for i in plugin._embed_retry_queue if i["name"] == "同名文档.txt"]
     assert len(same_name_items) == 1, f"同名文件应只保留一条队列记录: {len(same_name_items)}"
-    assert same_name_items[0]["text"] == "second" .encode("utf-8").decode("utf-8", "ignore") or True  # 内容以最终入库为准
+    # v1.1.0：条目存 tmp_path，二次入队应指向新临时文件（旧的已被覆盖删除）
+    assert same_name_items[0]["tmp_path"] and os.path.exists(same_name_items[0]["tmp_path"]), (
+        "覆盖入队后应持有有效临时文件"
+    )
     print("[PASS] 同名文件重复入队覆盖（不重复排队）")
     plugin._embed_retry_queue = []
     plugin.ctx.llm.embed = _orig_llm_embed

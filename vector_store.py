@@ -26,22 +26,33 @@ class FileEntry:
 
     file_name: str
     chunks: List[str] = field(default_factory=list)
-    vectors: List[List[float]] = field(default_factory=list)
+    # v1.1.0：add_file 入库后转为单个 float32 ndarray（numpy 可用时）——
+    # list-of-list 的 Python float 每维约 32B，是 float32 的 ~8 倍；ndarray 大幅省内存。
+    # numpy 不可用或转换失败时保持 List[List[float]]，两条路径下游均兼容。
+    vectors: Any = field(default_factory=list)
     upload_time: float = field(default_factory=time.time)
     rounds: int = 0
     summary: str = ""  # 大文件 LLM 概要（v1.0.17）；空 = 未生成或生成失败
     # 原始解析文本长度（v1.0.18）：分块合并带 overlap 后 join(chunks) 会膨胀约 20%，
     # 直注/概要阈值判定必须用原文长度；0 = 旧数据无该字段，回退 sum(len(chunks))
     source_chars: int = 0
+    # 全文拼接缓存（v1.1.0）：直注/概要取样每次都要 join(chunks)，缓存一次免重复拼接
+    _full_text_cache: str = field(default="", repr=False)
 
     def total_chars(self) -> int:
         """原文长度：优先 source_chars，旧数据回退分块拼接长度。"""
-        return self.source_chars if self.source_chars > 0 else len("".join(self.chunks))
+        return self.source_chars if self.source_chars > 0 else len(self.full_text())
+
+    def full_text(self) -> str:
+        """分块拼接全文（缓存）。chunks 入库后不变，缓存安全。"""
+        if not self._full_text_cache and self.chunks:
+            self._full_text_cache = "".join(self.chunks)
+        return self._full_text_cache
 
 
-def _cosine(a: List[float], b: List[float]) -> float:
-    """余弦相似度。空向量返回 0。"""
-    if not a or not b or len(a) != len(b):
+def _cosine(a: Any, b: Any) -> float:
+    """余弦相似度。空向量返回 0。a/b 兼容 list 与 numpy 1D 数组。"""
+    if a is None or b is None or len(a) == 0 or len(b) == 0 or len(a) != len(b):
         return 0.0
     if np is None:
         # 无 numpy 兜底：纯 Python 点积
@@ -97,13 +108,22 @@ class VectorStore:
         """解析文本 → 分块 → 向量化 → 存入。"""
         from chunker import RecursiveCharacterChunker  # noqa: F401  (确认可用)
 
-        chunks = self._chunker.chunk(content)
+        # v1.1.0：递归分块是 CPU 密集任务（大文本可达秒级），进线程避免冻结事件循环
+        chunks = await asyncio.to_thread(self._chunker.chunk, content)
         if not chunks:
             chunks = [content] if content.strip() else []
         if not chunks:
             raise ValueError("文件内容为空，无可向量化文本")
 
         vectors = await self._embed(chunks)
+
+        # v1.1.0：向量统一转 float32 ndarray（内存约为 list-of-float 的 1/8）；
+        # 转换失败（如 ragged）回退原列表，下游 _build_matrix/_cosine 均兼容。
+        if np is not None:
+            try:
+                vectors = np.asarray(vectors, dtype="float32")
+            except (ValueError, TypeError):
+                pass
 
         # v1.0.18：记录原文长度（overlap 合并会让 join(chunks) 膨胀，阈值判定要用原文长度）
         entry = FileEntry(file_name=file_name, chunks=chunks, vectors=vectors, source_chars=len(content))
@@ -162,8 +182,10 @@ class VectorStore:
         rows: List[Any] = []
         index: List[tuple[str, int, str]] = []
         for fname, entry in self._files.items():
-            for i, vec in enumerate(entry.vectors):
-                if not vec:
+            # v1.1.0：entry.vectors 可能是 ndarray——不能用 `not vec` 判空（歧义真值）
+            for i in range(len(entry.vectors)):
+                vec = entry.vectors[i]
+                if vec is None or len(vec) == 0:
                     continue
                 rows.append(vec)
                 index.append((fname, i, entry.chunks[i]))
@@ -193,7 +215,13 @@ class VectorStore:
         if qn == 0:
             return []
         scores = self._mat_cache @ (q / qn)
-        order = np.argsort(scores)[::-1][:k]
+        # v1.1.0：argpartition 取 Top-K（O(N)），只对 K 个候选排序；替代全排序 O(N log N)
+        n = scores.shape[0]
+        if n <= k:
+            order = np.argsort(scores)[::-1]
+        else:
+            part = np.argpartition(scores, n - k)[n - k:]
+            order = part[np.argsort(scores[part])[::-1]]
         return [
             {
                 "file_name": self._mat_index[i][0],
