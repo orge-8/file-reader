@@ -13,9 +13,11 @@
 """
 import asyncio
 import base64
+import ipaddress
 import json
 import os
 import re
+import socket
 import ssl
 import sys
 import tempfile
@@ -23,7 +25,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, ClassVar, Iterable, Optional
+from typing import Any, Callable, ClassVar, Iterable, Optional
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 # 补 sys.path，让同目录辅助模块可导入（runtime-gotchas 5.2）
 _PLUGIN_DIR = str(Path(__file__).resolve().parent)
@@ -67,6 +70,210 @@ class _DownloadTooLargeError(Exception):
         self.size_mb = size_bytes / 1024 / 1024
 
 
+# ─── URL 下载校验（v1.2.0 SSRF 防护） ────────────────────────────
+# 威胁模型：待下载的 URL 来自**消息正文**——适配器把 file 段降级成
+# `[文件] x.docx，大小: 9547，链接: <URL>` 纯文本，`_parse_file_hints` 再把 URL 抠出来。
+# 也就是说 URL 完全由发消息的人控制：任何群成员发一句带内网地址的"文件消息"，
+# 旧版就会直接 GET 它并把响应体解析进 LLM 上下文。
+#
+# 关键设计点：**必须校验"解析后的 IP"，不能只校验域名**。
+#   只挡域名会被这些写法绕过（都能表达 127.0.0.1）：
+#     http://2130706433/         十进制 IP
+#     http://0x7f000001/         十六进制 IP
+#     http://127.1/              短写
+#     http://127.0.0.1.nip.io/   通配 DNS 解析到回环
+#     http://attacker.com/       自己的 A 记录指向 10.0.0.1
+#   所以流程是「域名白名单 → 解析 → 逐个 IP 判公网」，两层都过才放行。
+DOWNLOAD_POLICY_WHITELIST = "whitelist"
+DOWNLOAD_POLICY_PUBLIC = "public"
+DOWNLOAD_POLICY_OFF = "off"
+DOWNLOAD_POLICIES: tuple[str, ...] = (
+    DOWNLOAD_POLICY_WHITELIST,
+    DOWNLOAD_POLICY_PUBLIC,
+    DOWNLOAD_POLICY_OFF,
+)
+
+# 默认白名单：QQ 侧提供文件下载的域名（子域一并放行）。
+# ftn.qq.com 覆盖 tjc-download / gzc-download / hzfile 等实际出现过的 CDN 主机。
+DEFAULT_DOWNLOAD_HOSTS = "ftn.qq.com,qfile.qq.com,nt.qq.com.cn,qq.com,weixin.qq.com"
+
+
+class _UrlRejectedError(Exception):
+    """URL 未通过下载前校验。reason 是稳定标识，便于日志检索与测试断言。"""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+        self.detail = detail
+
+
+def normalize_download_policy(raw: Any) -> str:
+    """归一化策略名；无法识别时**退回最严格的 whitelist**（配置写错不应导致校验被绕过）。"""
+    value = str(raw or "").strip().lower()
+    return value if value in DOWNLOAD_POLICIES else DOWNLOAD_POLICY_WHITELIST
+
+
+def parse_allowed_hosts(raw: Any) -> list[str]:
+    """白名单解析：既接受逗号/分号/空白分隔的字符串（TOML 友好），也接受列表形态。"""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items: list[str] = re.split(r"[,;\s]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(x) for x in raw]
+    else:
+        items = [str(raw)]
+    out: list[str] = []
+    for item in items:
+        item = item.strip()
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def host_in_allowlist(host: str, allowed: Iterable[str]) -> bool:
+    """后缀白名单匹配（含子域），且**边界安全**。
+
+    边界安全指：`eviltfn.qq.com` 不能因为以 `ftn.qq.com` 结尾就放行——
+    必须匹配 `host == suffix` 或 `host` 以 `.suffix` 结尾。
+    顺手容忍用户把条目填成 `https://ftn.qq.com:443/` 这类形态。
+    """
+    target = str(host or "").strip().lower().rstrip(".")
+    if not target:
+        return False
+    for entry in allowed:
+        suffix = str(entry or "").strip().lower()
+        suffix = suffix.split("://")[-1].split("/")[0]  # 容忍整条 URL
+        suffix = suffix.split("@")[-1]  # 容忍内嵌凭据
+        suffix = suffix.split(":")[0]  # 容忍带端口
+        suffix = suffix.lstrip(".").rstrip(".")
+        if not suffix:
+            continue
+        if target == suffix or target.endswith("." + suffix):
+            return True
+    return False
+
+
+def resolve_host_ips(host: str, port: int) -> list[str]:
+    """主机名 → 去重后的 IP 列表（含 IPv4/IPv6）。解析失败抛 OSError。"""
+    ips: list[str] = []
+    for info in socket.getaddrinfo(host, port or None, proto=socket.IPPROTO_TCP):
+        addr = info[4][0]
+        if addr and addr not in ips:
+            ips.append(addr)
+    return ips
+
+
+def is_public_ip(ip_text: str) -> bool:
+    """是否公网单播地址。回环/私网/链路本地/组播/保留/未指定一律 False。
+
+    注意：**不能只信 `is_global`**。CPython 的 IPv4 `is_global` 只排除
+    `_private_networks` 里那一段（0/8、10/8、127/8、169.254/16、172.16/12、
+    192.0.0/29、192.0.2/24、192.168/16、198.18/15、198.51.100/24、
+    203.0.113/24、240/4、255.255.255.255/32），**组播 224.0.0.0/4 不在其中**——
+    实测 `is_global('224.0.0.1')` 返回 True。所以这里把 is_multicast /
+    is_reserved / is_link_local / is_loopback / is_private / is_unspecified
+    一并显式排掉，再叠加 is_global（本用例由测试抓出）。
+
+    `169.254.169.254`（云元数据）落在 IPv4 链路本地段；`::1` 是 IPv6 回环；
+    IPv4-mapped IPv6（`::ffff:127.0.0.1`）要拆成 IPv4 再判，否则会被当成公网。
+    """
+    try:
+        ip = ipaddress.ip_address(str(ip_text).strip())
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if (
+        ip.is_multicast
+        or ip.is_reserved
+        or ip.is_link_local
+        or ip.is_loopback
+        or ip.is_private
+        or ip.is_unspecified
+    ):
+        return False
+    return bool(ip.is_global)
+
+
+def validate_download_target(
+    url: str,
+    *,
+    policy: str = DOWNLOAD_POLICY_WHITELIST,
+    allowed_hosts: Iterable[str] = (),
+    allow_private_hosts: bool = False,
+    resolver: Optional[Callable[[str, int], list[str]]] = None,
+) -> tuple[str, str]:
+    """下载前校验目标 URL，返回 (原始 URL, 主机名)；不合规抛 _UrlRejectedError。
+
+    校验顺序（任一不过即拒绝）：
+      1. scheme 只能是 http/https（挡 `file://`、`gopher://`、`ftp://`）
+      2. 禁止 URL 内嵌凭据（`http://user:pass@host/`）——容易被用来混淆主机
+      3. policy=whitelist：主机必须命中白名单（白名单为空则拒绝一切）
+      4. 解析主机 → **每个** IP 都必须是公网地址
+
+    resolver 可注入（默认 system DNS），便于脱机单测模拟"域名合法但解析到内网"。
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        raise _UrlRejectedError("empty_url")
+    try:
+        parts = urlsplit(raw)
+    except ValueError as e:
+        raise _UrlRejectedError("bad_url", str(e)) from e
+
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise _UrlRejectedError("bad_scheme", scheme or "(none)")
+    if parts.username or parts.password:
+        raise _UrlRejectedError("userinfo_not_allowed")
+
+    host = (parts.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise _UrlRejectedError("no_host")
+    try:
+        port = parts.port or (443 if scheme == "https" else 80)
+    except ValueError as e:
+        raise _UrlRejectedError("bad_port", str(e)) from e
+
+    policy_norm = normalize_download_policy(policy)
+    if policy_norm == DOWNLOAD_POLICY_OFF:
+        # 显式关闭校验（排障用）。仍保留 scheme/凭据的前三条检查——这两项永不放开。
+        return (raw, host)
+
+    allowed = parse_allowed_hosts(allowed_hosts)
+    if policy_norm == DOWNLOAD_POLICY_WHITELIST:
+        if not allowed:
+            raise _UrlRejectedError("allowlist_empty", "download_allowed_hosts 为空，默认拒绝")
+        if not host_in_allowlist(host, allowed):
+            raise _UrlRejectedError("host_not_allowed", host)
+
+    resolve = resolver or resolve_host_ips
+    try:
+        ips = resolve(host, port)
+    except OSError as e:
+        raise _UrlRejectedError("dns_failed", f"{host}: {e}") from e
+    if not ips:
+        raise _UrlRejectedError("dns_empty", host)
+
+    if not allow_private_hosts:
+        blocked = [ip for ip in ips if not is_public_ip(ip)]
+        if blocked:
+            raise _UrlRejectedError("non_public_address", f"{host} → {','.join(blocked)}")
+
+    return (raw, host)
+
+
+def redact_url(url: str) -> str:
+    """日志脱敏：QQ 文件链接的 query 里带 `fname`/signature 等凭据，只留 scheme+host+path。"""
+    try:
+        parts = urlsplit(str(url or ""))
+    except ValueError:
+        return "(unparsable url)"
+    tail = "?<已隐去>" if parts.query else ""
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", "")) + tail
+
+
 # ─── 配置模型 ────────────────────────────────────────────────────
 class PluginSectionConfig(PluginConfigBase):
     """插件基础配置。"""
@@ -96,7 +303,48 @@ class ReaderConfig(PluginConfigBase):
     file_max_rounds: int = Field(default=5, description="文件最大参与轮数")
     cleanup_interval: int = Field(default=5, description="后台清理间隔（分钟）：清理过期文件、回收空会话向量库、裁剪概要冷却表")
     enable_group: bool = Field(default=True, description="是否处理群聊文件")
-    insecure_download: bool = Field(default=False, description="下载文件时跳过 SSL 证书校验（运行机器存在 TLS MITM 代理、报 CERTIFICATE_VERIFY_FAILED 时开启）")
+    download_url_policy: str = Field(
+        default=DOWNLOAD_POLICY_WHITELIST,
+        description=(
+            "URL 下载校验策略（v1.2.0 防 SSRF）：whitelist = 只允许 download_allowed_hosts 内的域名（默认）；"
+            "public = 允许任意主机但仍必须是公网 IP；off = 不校验（仅排障用，危险）。"
+            "无论哪种策略都始终拒绝回环/私网/链路本地地址，并逐跳校验重定向。"
+            "写错的值会退回最严格的 whitelist"
+        ),
+    )
+    download_allowed_hosts: str = Field(
+        default=DEFAULT_DOWNLOAD_HOSTS,
+        description=(
+            "URL 下载域名白名单，逗号分隔，后缀匹配（含子域）。"
+            f"默认：{DEFAULT_DOWNLOAD_HOSTS}。留空 = whitelist 策略下拒绝一切 URL 下载"
+        ),
+    )
+    download_max_redirects: int = Field(
+        default=3,
+        description="URL 下载允许的最大重定向跳数：每一跳重新做域名+地址校验（防白名单域名 302 到内网）；0 = 不跟随重定向",
+    )
+    download_allow_private_hosts: bool = Field(
+        default=False,
+        description=(
+            "允许下载目标解析到内网/回环地址（v1.2.0）。"
+            "仅当你的适配器用本机 HTTP 服务提供文件时才需要开启，且必须把该主机加进白名单；"
+            "开启等于重新放开对内网的访问能力，默认保持关闭"
+        ),
+    )
+    download_ca_bundle: str = Field(
+        default="",
+        description=(
+            "自定义 CA 证书路径（PEM）：运行机器有 TLS MITM 代理时，指向代理根证书即可**保持证书校验开启**，"
+            "比 insecure_download 安全得多，建议优先用这个"
+        ),
+    )
+    insecure_download: bool = Field(
+        default=False,
+        description=(
+            "下载文件时跳过 SSL 证书校验（运行机器存在 TLS MITM 代理、报 CERTIFICATE_VERIFY_FAILED 时开启）。"
+            "优先改用 download_ca_bundle 指定代理根证书；开启后白名单域名之外仍是拒绝的，但对该域名的证书不再把关"
+        ),
+    )
     injection_marker: str = Field(default="【文件检索】", description="注入文本的幂等标记")
     inject_memo_enabled: bool = Field(default=True, description="注入去重缓存（v1.0.18）：同一会话同一问题在 TTL 内直接复用上次注入文本（零 embedding、零检索），覆盖 hook 每次尝试重跑与 Planner/回复双触发；文件入库、清文件、会话清理时自动失效")
     inject_memo_ttl: int = Field(default=90, description="注入去重缓存的存活秒数")
@@ -185,7 +433,8 @@ class FileReaderPlugin(MaiBotPlugin):
         self._bg_tasks: set[asyncio.Task] = set()
         # v1.1.0：下载用 httpx 单例（连接复用，免每次新建 client + SSL 上下文）
         self._http_client: Optional[Any] = None
-        self._http_client_verify: bool = True
+        # v1.2.0：缓存的是「实际传给 httpx 的 verify 值」——可能是 True / False / CA 证书路径
+        self._http_client_verify: Any = True
         # v1.1.0：NapCat urllib SSL 上下文缓存（create_default_context 是 ms 级 CPU 调用）
         self._napcat_ssl_ctx: Optional[ssl.SSLContext] = None
         self._napcat_ssl_verify: bool = False
@@ -295,6 +544,44 @@ class FileReaderPlugin(MaiBotPlugin):
             self.ctx.logger.info("[自检] 解析器类型表: PASS")
         except Exception as e:  # noqa: BLE001
             self.ctx.logger.error("[自检] 解析器类型表: FAIL (%s)", e)
+
+        # v1.2.0：下载安全策略自检——把风险配置在启动时喊出来，而不是等出事
+        try:
+            raw_policy = str(self.config.reader.download_url_policy or "")
+            if raw_policy.strip().lower() not in DOWNLOAD_POLICIES:
+                self.ctx.logger.error(
+                    "[自检] download_url_policy=%r 不是合法值，已退回最严格的 %s（可选：%s）",
+                    raw_policy,
+                    DOWNLOAD_POLICY_WHITELIST,
+                    "/".join(DOWNLOAD_POLICIES),
+                )
+            policy = normalize_download_policy(raw_policy)
+            hosts = parse_allowed_hosts(self.config.reader.download_allowed_hosts)
+            risky: list[str] = []
+            if policy == DOWNLOAD_POLICY_OFF:
+                risky.append("download_url_policy=off（URL 下载不做任何域名/IP 校验）")
+            if bool(self.config.reader.download_allow_private_hosts):
+                risky.append("download_allow_private_hosts=true（允许下载目标指向内网/回环）")
+            if bool(self.config.reader.insecure_download):
+                risky.append(
+                    "insecure_download=true（关闭 TLS 证书校验；建议改用 download_ca_bundle 指定代理根证书）"
+                )
+            if policy == DOWNLOAD_POLICY_WHITELIST and not hosts:
+                self.ctx.logger.warning(
+                    "[自检] 下载白名单为空且策略为 whitelist —— 所有 URL 来源的文件都会被拒绝下载"
+                )
+            if risky:
+                for line in risky:
+                    self.ctx.logger.warning("[自检][安全] 风险配置：%s", line)
+            else:
+                self.ctx.logger.info(
+                    "[自检] 下载安全策略: PASS (policy=%s, 白名单 %d 项, 重定向上限 %d)",
+                    policy,
+                    len(hosts),
+                    int(self.config.reader.download_max_redirects),
+                )
+        except Exception as e:  # noqa: BLE001
+            self.ctx.logger.error("[自检] 下载安全策略: FAIL (%s)", e)
 
     # ─── embedding 封装 ──────────────────────────────────────────
     async def _embed(self, texts: list[str], *, query_mode: bool = False) -> Any:
@@ -833,6 +1120,15 @@ class FileReaderPlugin(MaiBotPlugin):
                         reason="too_large",
                     )
                     return
+                except _UrlRejectedError as e:
+                    # v1.2.0：URL 来源的文件被安全策略拦下——回执里说清"是没有下载权限"，
+                    # 而不是笼统的"读不到内容"（后者会让人以为插件坏了）
+                    await self._reply_error(
+                        stream_id,
+                        self._reject_reply_text(name, e),
+                        reason=f"url_rejected:{e.reason}",
+                    )
+                    return
             if raw_bytes is None and fdata.get("napcat_message_id"):
                 # 适配器降级形态：拿 message_id 回头找 NapCat 要原始文件
                 if not self.config.napcat.enabled:
@@ -1085,12 +1381,34 @@ class FileReaderPlugin(MaiBotPlugin):
             path = self._search_cache_dir(name, size_hint)
         return (None, path)
 
+    def _download_verify_setting(self) -> Any:
+        """下载用的 TLS 校验设置（v1.2.0）：默认系统 CA；配了 CA 证书就用该路径；
+        只有显式开 insecure_download 才彻底关闭校验。
+
+        顺序刻意如此——运行机器有 TLS MITM 代理时，正确做法是把代理根证书路径填进
+        download_ca_bundle（校验照常生效），而不是关掉校验。
+        """
+        if bool(self.config.reader.insecure_download):
+            return False
+        bundle = str(self.config.reader.download_ca_bundle or "").strip()
+        if bundle:
+            if Path(bundle).is_file():
+                return bundle
+            self.ctx.logger.error(
+                "download_ca_bundle 不是有效文件，已忽略并回到系统默认证书: %s", bundle
+            )
+        return True
+
     async def _get_http_client(self) -> Any:
         """下载用 httpx 单例（v1.1.0）：连接池复用，免每次下载新建 client 与 SSL 上下文。
-        insecure_download 配置变化时关闭旧 client 重建。"""
+        insecure_download / download_ca_bundle 变化时关闭旧 client 重建。
+
+        v1.2.0：显式 `follow_redirects=False`——重定向改由 _download 手动逐跳处理，
+        每一跳都要重新过域名+地址校验（否则白名单域名可以 302 到 169.254.169.254）。
+        """
         import httpx  # type: ignore
 
-        verify = not self.config.reader.insecure_download
+        verify = self._download_verify_setting()
         if self._http_client is not None and self._http_client_verify != verify:
             try:
                 await self._http_client.aclose()
@@ -1098,47 +1416,122 @@ class FileReaderPlugin(MaiBotPlugin):
                 pass
             self._http_client = None
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=30, verify=verify)
+            self._http_client = httpx.AsyncClient(
+                timeout=30, verify=verify, follow_redirects=False
+            )
             self._http_client_verify = verify
         return self._http_client
 
     async def _download(self, url: str, max_bytes: int) -> Optional[bytes]:
-        """流式下载文件（v1.1.0 重写）。
+        """流式下载文件（v1.1.0 重写，v1.2.0 加 SSRF 防护 + 逐跳重定向）。
 
-        旧版问题：resp.content 一次性读入、大小检查在下载完成之后——
-        超限文件也先全量拉进内存（raw_bytes + base64 + 临时文件 + 解析文本同时驻留，
-        瞬时内存 2~3 倍文件大小）。
-        现行为：Content-Length 预检 + 边下边累计、超限立即中断抛 _DownloadTooLargeError。
+        v1.1.0 已解决的内存问题：Content-Length 预检 + 边下边累计，超限立即中断。
+
+        v1.2.0 新增的安全边界（URL 由消息正文控制，见文件顶部 URL 校验段说明）：
+          - 请求前：validate_download_target 校验 scheme/凭据/域名白名单/解析后 IP 必须公网
+          - 重定向：关闭 httpx 自动跟随，改为手动逐跳——**每一跳都重新校验**，
+            并限制跳数（download_max_redirects）。这样即使白名单域名被 302 到
+            169.254.169.254 也会在下一跳被拦下。
+          - 失败原因全部落日志（含具体 host），但 URL 的 query 部分打码——
+            QQ 文件链接的 query 里带下载凭据。
 
         运行机器若存在 TLS MITM 代理（proxy-root-ca.cer），HTTPS 会报
-        CERTIFICATE_VERIFY_FAILED；可开 reader.insecure_download 跳过校验。
+        CERTIFICATE_VERIFY_FAILED；建议配 reader.download_ca_bundle 指向代理根证书
+        （校验保持开启），万不得已再用 reader.insecure_download 跳过校验。
         """
         try:
             import httpx  # type: ignore  # noqa: F401
         except ImportError:
             self.ctx.logger.error("下载文件需要 httpx，请安装：pip install httpx")
             return None
+
+        policy = normalize_download_policy(self.config.reader.download_url_policy)
+        allowed_hosts = parse_allowed_hosts(self.config.reader.download_allowed_hosts)
+        allow_private = bool(self.config.reader.download_allow_private_hosts)
+        try:
+            max_hops = max(0, int(self.config.reader.download_max_redirects))
+        except (TypeError, ValueError):
+            max_hops = 3
+
+        current = str(url or "")
         try:
             client = await self._get_http_client()
-            async with client.stream("GET", url) as resp:
-                resp.raise_for_status()
-                # 预检：Content-Length 已超限直接中断（不必开始下载）
-                cl = resp.headers.get("content-length")
-                if cl and cl.isdigit() and int(cl) > max_bytes:
-                    raise _DownloadTooLargeError(float(cl))
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in resp.aiter_bytes(65536):
-                    total += len(chunk)
-                    if total > max_bytes:
-                        raise _DownloadTooLargeError(float(total))
-                    chunks.append(chunk)
-                return b"".join(chunks)
+            for hop in range(max_hops + 1):
+                # ① 每一跳都先校验目标（首跳=原始 URL，后续=上一跳的 Location）
+                target, host = validate_download_target(
+                    current,
+                    policy=policy,
+                    allowed_hosts=allowed_hosts,
+                    allow_private_hosts=allow_private,
+                )
+                async with client.stream("GET", target) as resp:
+                    # ② 重定向：手动接管，绝不自动跟随
+                    if resp.is_redirect:
+                        location = resp.headers.get("location")
+                        if not location:
+                            self.ctx.logger.warning(
+                                "[下载拒绝] %s 返回 %s 但没有 Location 头", host, resp.status_code
+                            )
+                            return None
+                        if hop >= max_hops:
+                            self.ctx.logger.warning(
+                                "[下载拒绝] 重定向超过 %d 跳（最后一跳 %s → %s）",
+                                max_hops,
+                                host,
+                                redact_url(location),
+                            )
+                            return None
+                        # 相对 Location 按当前 URL 解析为绝对地址，供下一轮重新校验
+                        current = urljoin(target, location)
+                        self.ctx.logger.info(
+                            "[下载] 第 %d 跳重定向：%s → %s", hop + 1, host, redact_url(current)
+                        )
+                        continue
+                    resp.raise_for_status()
+                    # ③ 预检：Content-Length 已超限直接中断（不必开始下载）
+                    cl = resp.headers.get("content-length")
+                    if cl and cl.isdigit() and int(cl) > max_bytes:
+                        raise _DownloadTooLargeError(float(cl))
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.aiter_bytes(65536):
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise _DownloadTooLargeError(float(total))
+                        chunks.append(chunk)
+                    return b"".join(chunks)
+            return None
         except _DownloadTooLargeError:
             raise
+        except _UrlRejectedError as e:
+            # 安全拦截：向上抛，让 _handle_file 回一句可读的拒绝原因（而不是"读不到内容"）
+            self.ctx.logger.warning(
+                "[下载拒绝] URL 未通过安全校验（%s）: %s", e.reason, redact_url(current)
+            )
+            raise
         except Exception as e:  # noqa: BLE001
-            self.ctx.logger.error("下载 %s 失败: %s", url, e)
+            self.ctx.logger.error("下载 %s 失败: %s", redact_url(current), e)
             return None
+
+    def _reject_reply_text(self, name: str, err: _UrlRejectedError) -> str:
+        """把 URL 拒绝原因翻译成一句人话（不透露解析到的内网地址等细节）。"""
+        head = f"⚠️ 文件「{name}」没有下载："
+        reason = err.reason
+        if reason == "host_not_allowed":
+            return head + "文件链接不在允许下载的域名白名单内（默认只允许 QQ 文件域）。"
+        if reason == "allowlist_empty":
+            return head + "插件未配置任何允许下载的域名（download_allowed_hosts 为空）。"
+        if reason == "non_public_address":
+            return head + "文件链接指向内网/本机地址，出于安全已拒绝下载。"
+        if reason == "bad_scheme":
+            return head + "文件链接的协议不受支持（仅支持 http/https）。"
+        if reason == "userinfo_not_allowed":
+            return head + "文件链接格式异常（含内嵌凭据），已拒绝下载。"
+        if reason in ("dns_failed", "dns_empty"):
+            return head + "文件链接的域名解析失败。"
+        if reason == "bad_url":
+            return head + "文件链接无法解析。"
+        return head + f"文件链接未通过安全校验（{reason}）。"
 
     async def _reply(self, stream_id: str, text: str) -> None:
         if not stream_id:

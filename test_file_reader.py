@@ -496,11 +496,35 @@ async def _test_plugin_hooks() -> None:
 
     plugin._download = _fake_download
     await plugin.on_file_message(hook_name="chat.receive.after_process", message=multi_degraded)
-    await asyncio.sleep(0.5)
+
+    async def _wait_until(pred, timeout: float = 5.0, label: str = "") -> bool:
+        """轮询等待后台任务收敛。
+
+        原来这里写的是固定 `await asyncio.sleep(0.5)` 再断言——三个文件是并发后台处理的，
+        解析+入库耗时随机器负载浮动，固定 sleep 属于竞态（实测偶发少一个文件而误报失败）。
+        改为轮询到条件成立，超时才失败。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if pred():
+                return True
+            await asyncio.sleep(0.02)
+        return bool(pred())
+
+    vs_multi = plugin._store.get("debounce-multi", "debounce-multi")
+    expected_names = {"maibot_test.ini", "maibot_test.js", "maibot_test.json"}
+    # 注意：谓词内部必须重新取会话库——循环外只取一次的话，早期拿到的 None
+    # 会被永久缓存，轮询永远等不到条件成立（第一版就踩了这个坑）。
+    await _wait_until(
+        lambda: (lambda vs: vs is not None and set(vs.files.keys()) == expected_names)(
+            plugin._store.get("debounce-multi", "debounce-multi")
+        ),
+        label="3 文件入库",
+    )
     vs_multi = plugin._store.get("debounce-multi", "debounce-multi")
     assert vs_multi is not None, "会话库应已创建"
     in_files = set(vs_multi.files.keys())
-    assert in_files == {"maibot_test.ini", "maibot_test.js", "maibot_test.json"}, (
+    assert in_files == expected_names, (
         f"3 个文件应全部入库: {in_files}"
     )
     assert len(_dl_calls) == 3, f"应下载 3 次（每文件一次）: {_dl_calls}"
@@ -726,20 +750,28 @@ async def _test_plugin_hooks() -> None:
     batch_sizes.clear()
     plugin.config.reader.embed_batch_size = 3
     plugin.config.reader.embed_concurrency = 1  # 与 1j 同为串行路径
+    fail_calls: list[str] = []
 
     async def _batch_partial_fail(*args, **kwargs):
         texts = kwargs.get("texts") or ([kwargs["text"]] if kwargs.get("text") else args[0] if args else [])
-        # _embed_once 内部会对同一批重试（共 2 次调用）；
-        # 按"批"而非"调用次数"计数：第 2 批的调用全部失败
-        if len(texts) <= 3 and batch_seq["n"] >= 1:
+        # 按"批内容"而非调用次数区分：batch_size=3 + 输入 a..f → 第 1 批 a/b/c、第 2 批 d/e/f。
+        # 第 2 批的全部调用（含 _embed_once 内部那 1 次重试）都必须失败。
+        # 【修正】这里原来写的是 `if len(texts) <= 3 and batch_seq["n"] >= 1`，
+        # 而 batch_seq 从未定义 —— 首次调用即抛 NameError，导致第 1 批就失败、
+        # 整单返回空，断言 result == {} 于是"因错误原因通过"，实际根本没验证到
+        # "第 2 批失败"这个场景。下面用 calls 列表反向锁死模拟真的按预期被调用过。
+        fail_calls.append(texts[0] if texts else "?")
+        if texts and texts[0] == "d":
             raise TimeoutError("[E_TIMEOUT] 第 2 批超时")
-        batch_seq["n"] += 1
         return _fake_embed(texts)
 
     plugin.ctx.llm.embed = _batch_partial_fail
     result = await plugin._embed(["a", "b", "c", "d", "e", "f"])  # 2 批，第 2 批失败
     # 第 2 批失败会触发 _embed_once 内部重试（2 次调用全失败），最终整单返回空
     assert result == {}, f"某批失败应整单返回空: {type(result)}"
+    assert fail_calls == ["a", "d", "d"], (
+        f"应为 第1批1次 + 第2批重试2次，实际 {fail_calls}（模拟未按预期生效=用例假通过）"
+    )
     print("[PASS] 拆批部分失败整单返回空（不拼残缺向量，第 2 批重试全失败）")
     plugin.config.reader.embed_batch_size = 16
     plugin.ctx.llm.embed = _orig_llm_embed
@@ -1316,11 +1348,347 @@ async def _test_plugin_hooks() -> None:
     await plugin.on_unload()
 
 
+class _FakeStreamResponse:
+    """最小 httpx 响应替身：_download 只用到这几个属性。"""
+
+    def __init__(self, status_code: int, headers: dict | None = None, body: bytes = b""):
+        self.status_code = status_code
+        self.headers = dict(headers or {})
+        self._body = body
+
+    @property
+    def is_redirect(self) -> bool:
+        return self.status_code in (301, 302, 303, 307, 308) and "location" in self.headers
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    async def aiter_bytes(self, chunk_size: int = 65536):
+        for i in range(0, len(self._body), chunk_size):
+            yield self._body[i : i + chunk_size]
+
+
+class _FakeStreamContext:
+    def __init__(self, resp: _FakeStreamResponse):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeHttpxClient:
+    """按 URL 返回预设响应的 httpx.AsyncClient 替身，并记录**实际请求过**的 URL。
+
+    requested 是关键证据：断言"内网地址从未被请求"，而不是只看返回值。
+    """
+
+    def __init__(self, routes: dict[str, _FakeStreamResponse]):
+        self.routes = routes
+        self.requested: list[str] = []
+
+    def stream(self, method: str, url: str, **kwargs):
+        self.requested.append(url)
+        return _FakeStreamContext(self.routes.get(url, _FakeStreamResponse(404)))
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def _test_download_guard() -> None:
+    """URL 下载校验层（v1.2.0 SSRF 防护）——纯函数级用例。
+
+    威胁模型：待下载 URL 来自消息正文。适配器把 file 段降级成
+    `[文件] x.docx，大小: 9547，链接: <URL>`，`_parse_file_hints` 再把 URL 抠出来，
+    也就是 URL 由发消息的人完全控制。下面每一条都是"群里任何人都能发出来的写法"。
+    """
+    import plugin as plugin_mod
+
+    # 3a. 域名后缀匹配必须边界安全
+    assert plugin_mod.host_in_allowlist("tjc-download.ftn.qq.com", ["ftn.qq.com"])
+    assert plugin_mod.host_in_allowlist("ftn.qq.com", ["ftn.qq.com"])
+    assert not plugin_mod.host_in_allowlist("eviltfn.qq.com", ["ftn.qq.com"]), "后缀绕过必须被拒"
+    assert not plugin_mod.host_in_allowlist("ftn.qq.com.evil.com", ["ftn.qq.com"])
+    assert not plugin_mod.host_in_allowlist("", ["ftn.qq.com"])
+    # 用户把条目填成整条 URL / 带端口 / 带点，也要能用
+    assert plugin_mod.host_in_allowlist("ftn.qq.com", ["https://ftn.qq.com:443/path"])
+    assert plugin_mod.host_in_allowlist("a.ftn.qq.com", [".ftn.qq.com"])
+    print("[PASS] 下载白名单后缀匹配（边界安全：eviltfn.qq.com / ftn.qq.com.evil.com 均不放行）")
+
+    # 3b. 白名单解析
+    assert plugin_mod.parse_allowed_hosts("a.com, b.com;c.com\nd.com") == ["a.com", "b.com", "c.com", "d.com"]
+    assert plugin_mod.parse_allowed_hosts(["a.com", "a.com", " b.com "]) == ["a.com", "b.com"]
+    assert plugin_mod.parse_allowed_hosts("") == [] and plugin_mod.parse_allowed_hosts(None) == []
+    print("[PASS] 下载白名单解析（逗号/分号/换行/列表，去重去空）")
+
+    # 3c. 公网判定
+    for ip in (
+        "127.0.0.1", "127.1.2.3", "10.0.0.1", "172.16.5.5", "192.168.1.1",
+        "169.254.169.254", "0.0.0.0", "224.0.0.1",
+        "::1", "fe80::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1",
+    ):
+        assert not plugin_mod.is_public_ip(ip), f"{ip} 不应判为公网"
+    assert plugin_mod.is_public_ip("8.8.8.8")
+    assert plugin_mod.is_public_ip("93.184.216.34")
+    assert not plugin_mod.is_public_ip("not-an-ip")
+    print("[PASS] 公网地址判定（回环/私网/链路本地/云元数据/IPv4-mapped 全部拒绝）")
+
+    # 3d. 拒绝矩阵：reviewer 报告的那两条 URL 正在其中
+    allowed = plugin_mod.DEFAULT_DOWNLOAD_HOSTS.split(",")
+    rejected: list[tuple[str, str]] = [
+        ("http://127.0.0.1:3001/x", "host_not_allowed"),
+        ("http://169.254.169.254/latest/meta-data/", "host_not_allowed"),
+        ("http://[::1]/x", "host_not_allowed"),
+        ("http://2130706433/", "host_not_allowed"),
+        ("http://0x7f000001/", "host_not_allowed"),
+        ("http://127.1/", "host_not_allowed"),
+        ("http://192.168.1.1/x", "host_not_allowed"),
+        ("http://10.0.0.5/admin", "host_not_allowed"),
+        ("http://localhost:3001/x", "host_not_allowed"),
+        ("http://attacker.example/x", "host_not_allowed"),
+        ("file:///etc/passwd", "bad_scheme"),
+        ("ftp://ftn.qq.com/x", "bad_scheme"),
+        ("http://user:pw@ftn.qq.com/x", "userinfo_not_allowed"),
+        ("", "empty_url"),
+    ]
+    for url, reason in rejected:
+        try:
+            plugin_mod.validate_download_target(url, policy="whitelist", allowed_hosts=allowed)
+            raise AssertionError(f"{url!r} 应被拒绝（预期 {reason}）")
+        except plugin_mod._UrlRejectedError as e:
+            assert e.reason == reason, f"{url!r} 拒绝原因应 {reason}，实际 {e.reason}"
+    print(f"[PASS] 拒绝矩阵：{len(rejected)} 条内网/元数据/非白名单 URL 全部拦下")
+
+    # 3e. 关键一条：白名单域名 + DNS 解析到内网 → 必须拒绝
+    #     只比对域名字符串是挡不住这种攻击的（攻击者自控 DNS 即可把请求引回内网），
+    #     所以校验必须落在"解析结果"上。resolver 注入让这条用例脱机可跑。
+    def _resolver_to(ip: str):
+        return lambda host, port: [ip]
+
+    for bad_ip in ("127.0.0.1", "169.254.169.254", "10.1.2.3", "::1"):
+        try:
+            plugin_mod.validate_download_target(
+                "https://tjc-download.ftn.qq.com/ftn_handler/x?fname=a",
+                policy="whitelist",
+                allowed_hosts=allowed,
+                resolver=_resolver_to(bad_ip),
+            )
+            raise AssertionError(f"白名单域名解析到 {bad_ip} 应被拒绝")
+        except plugin_mod._UrlRejectedError as e:
+            assert e.reason == "non_public_address", f"{bad_ip}: 实际 {e.reason}"
+    # DNS 轮询返回混合结果（公网+内网）：只要有一个落在内网就拒绝
+    try:
+        plugin_mod.validate_download_target(
+            "https://tjc-download.ftn.qq.com/x",
+            policy="whitelist",
+            allowed_hosts=allowed,
+            resolver=lambda host, port: ["93.184.216.34", "10.0.0.1"],
+        )
+        raise AssertionError("混合解析结果含内网 IP 应被拒绝")
+    except plugin_mod._UrlRejectedError as e:
+        assert e.reason == "non_public_address", e.reason
+    # 正常公网解析 → 放行
+    _target, _host = plugin_mod.validate_download_target(
+        "https://tjc-download.ftn.qq.com/x?fname=a",
+        policy="whitelist",
+        allowed_hosts=allowed,
+        resolver=lambda host, port: ["93.184.216.34"],
+    )
+    assert _host == "tjc-download.ftn.qq.com"
+    print("[PASS] DNS 指向内网被拦（白名单域名+内网解析=拒绝；混合解析也拒；公网解析放行）")
+
+    # 3f. 策略语义
+    _pub = lambda host, port: ["93.184.216.34"]  # noqa: E731
+    _t, _h = plugin_mod.validate_download_target(
+        "http://my-cdn.example/x", policy="public", allowed_hosts=[], resolver=_pub
+    )
+    assert _h == "my-cdn.example"
+    try:
+        plugin_mod.validate_download_target(
+            "http://my-cdn.example/x", policy="public", allowed_hosts="", resolver=_resolver_to("127.0.0.1")
+        )
+        raise AssertionError("public 策略下内网地址仍应被拒绝")
+    except plugin_mod._UrlRejectedError as e:
+        assert e.reason == "non_public_address", e.reason
+    # 白名单为空 + whitelist → 拒绝一切（最安全的默认）
+    try:
+        plugin_mod.validate_download_target("https://ftn.qq.com/x", policy="whitelist", allowed_hosts="", resolver=_pub)
+        raise AssertionError("白名单为空应拒绝")
+    except plugin_mod._UrlRejectedError as e:
+        assert e.reason == "allowlist_empty", e.reason
+    # off 策略放开域名/IP 校验，但 scheme 与内嵌凭据这两条永不放开
+    plugin_mod.validate_download_target("http://127.0.0.1:3001/x", policy="off", allowed_hosts="")
+    for _url, _reason in (("file:///etc/passwd", "bad_scheme"), ("http://u:p@127.0.0.1/x", "userinfo_not_allowed")):
+        try:
+            plugin_mod.validate_download_target(_url, policy="off", allowed_hosts="")
+            raise AssertionError(f"off 策略下 {_url!r} 仍应被拒")
+        except plugin_mod._UrlRejectedError as e:
+            assert e.reason == _reason, f"{_url}: 实际 {e.reason}"
+    # 策略名写错 → 退回最严格（配置笔误不能变成校验绕过）
+    assert plugin_mod.normalize_download_policy("WHITELIST") == "whitelist"
+    assert plugin_mod.normalize_download_policy("pbulic") == "whitelist"
+    assert plugin_mod.normalize_download_policy("") == "whitelist"
+    try:
+        plugin_mod.validate_download_target(
+            "http://attacker.example/x", policy="pbulic", allowed_hosts=allowed, resolver=_pub
+        )
+        raise AssertionError("非法策略应退回 whitelist 并拒绝白名单外域名")
+    except plugin_mod._UrlRejectedError as e:
+        assert e.reason == "host_not_allowed", e.reason
+    # 文档化的逃生口：白名单内 + 显式允许私网，两个条件同时满足才放行
+    _t3, _ = plugin_mod.validate_download_target(
+        "http://localhost:3001/download/f.docx",
+        policy="whitelist",
+        allowed_hosts="localhost",
+        allow_private_hosts=True,
+        resolver=_resolver_to("127.0.0.1"),
+    )
+    assert _t3.endswith("/download/f.docx")
+    print("[PASS] 策略语义（whitelist/public/off/非法值退回 whitelist/私网逃生口需双重显式开启）")
+
+    # 3g. 日志脱敏：QQ 下载链接 query 里带 fname/signature 等凭据，不能整条进日志
+    _red = plugin_mod.redact_url("https://tjc-download.ftn.qq.com/ftn_handler/abc?fname=secret&sig=deadbeef")
+    assert "secret" not in _red and "deadbeef" not in _red, _red
+    assert "tjc-download.ftn.qq.com/ftn_handler/abc" in _red, _red
+    print(f"[PASS] 下载日志脱敏: {_red}")
+
+
+async def _test_download_redirect_guard() -> None:
+    """_download 的重定向逐跳校验（v1.2.0）。
+
+    用独立的 runner，避免污染 _test_plugin_hooks 里那一大串被改来改去的配置。
+    用 IP 字面量当"白名单宿主"：不触发真实 DNS，用例与网络环境解耦。
+    """
+    import plugin as plugin_mod
+    from test_runner import PluginTestRunner
+
+    runner = PluginTestRunner(_PLUGIN_DIR)
+    plugin = await runner.setup()
+    # 坑：test_runner 用 spec_from_file_location("plugin_under_test", ...) 加载插件，
+    # 得到的是**另一份模块对象**——它的 _UrlRejectedError 与被测插件抛出的不是同一个类，
+    # except 永远接不住；而且该模块没有注册进 sys.modules（按名字查会 KeyError）。
+    # 从被测方法自己的 __globals__（即那份模块的命名空间）里取异常类最稳。
+    under_test_globals = type(plugin)._download.__globals__
+    UrlRejectedError = under_test_globals["_UrlRejectedError"]
+    DownloadTooLargeError = under_test_globals["_DownloadTooLargeError"]
+    # setup() 只建实例，不跑生命周期；走一遍 on_load 顺带覆盖 v1.2.0 新增的
+    # 「下载安全策略自检」不会抛异常，on_unload 取消后台任务也一并回归。
+    await runner.run_lifecycle()
+    public_host = "93.184.216.34"  # 公网 IP 字面量，getaddrinfo 不做网络查询
+    base = f"http://{public_host}"
+
+    def _bind(client: _FakeHttpxClient) -> None:
+        async def _factory():
+            return client
+
+        plugin._get_http_client = _factory  # type: ignore[method-assign]
+
+    try:
+        plugin.config.reader.download_url_policy = "whitelist"
+        plugin.config.reader.download_allowed_hosts = public_host
+        plugin.config.reader.download_max_redirects = 2
+
+        # 4a. 首跳合法、302 到云元数据 → 第二跳必须被拦下，且元数据地址**从未被请求**
+        client = _FakeHttpxClient({
+            f"{base}/f/a.docx": _FakeStreamResponse(
+                302, {"location": "http://169.254.169.254/latest/meta-data/"}
+            ),
+        })
+        _bind(client)
+        try:
+            await plugin._download(f"{base}/f/a.docx", 1024)
+            raise AssertionError("重定向到云元数据应被拒绝")
+        except UrlRejectedError as e:
+            assert e.reason == "host_not_allowed", e.reason
+        assert client.requested == [f"{base}/f/a.docx"], (
+            f"元数据地址不应被请求: {client.requested}"
+        )
+        print("[PASS] 重定向到云元数据被拦（169.254.169.254 从未被请求）")
+
+        # 4b. 首跳即被拒 → 零请求发出
+        client_direct = _FakeHttpxClient({})
+        _bind(client_direct)
+        try:
+            await plugin._download("http://169.254.169.254/latest/meta-data/", 1024)
+            raise AssertionError("云元数据地址应被拒绝")
+        except UrlRejectedError as e:
+            assert e.reason == "host_not_allowed", e.reason
+        assert client_direct.requested == [], f"被拒 URL 不应发起任何请求: {client_direct.requested}"
+        print("[PASS] 首跳即被拒时零请求发出（不发包，不只是不解析响应）")
+
+        # 4c. 白名单内重定向正常跟随（确认没把功能一起改坏）
+        client_ok = _FakeHttpxClient({
+            f"{base}/old": _FakeStreamResponse(301, {"location": f"{base}/new"}),
+            f"{base}/new": _FakeStreamResponse(200, body=b"OK-CONTENT"),
+        })
+        _bind(client_ok)
+        data = await plugin._download(f"{base}/old", 1024)
+        assert data == b"OK-CONTENT", data
+        assert client_ok.requested == [f"{base}/old", f"{base}/new"], client_ok.requested
+        print("[PASS] 白名单内重定向正常跟随（301 → 200，两跳都过校验）")
+
+        # 4d. 相对 Location 按当前 URL 解析为绝对地址后再校验
+        client_rel = _FakeHttpxClient({
+            f"{base}/old": _FakeStreamResponse(302, {"location": "/new"}),
+            f"{base}/new": _FakeStreamResponse(200, body=b"REL"),
+        })
+        _bind(client_rel)
+        data_rel = await plugin._download(f"{base}/old", 1024)
+        assert data_rel == b"REL", data_rel
+        assert client_rel.requested == [f"{base}/old", f"{base}/new"], client_rel.requested
+        print("[PASS] 相对 Location 正确解析为绝对地址（/new → 同主机，仍过校验）")
+
+        # 4e. 重定向跳数上限：最多请求 1 + download_max_redirects 次
+        routes = {
+            f"{base}/r{i}": _FakeStreamResponse(302, {"location": f"{base}/r{i + 1}"}) for i in range(6)
+        }
+        client_loop = _FakeHttpxClient(routes)
+        _bind(client_loop)
+        data_loop = await plugin._download(f"{base}/r0", 1024)
+        assert data_loop is None, "超过重定向上限应放弃并返回 None"
+        assert len(client_loop.requested) == 3, (
+            f"max_redirects=2 时应共请求 3 次（1+2），实际 {client_loop.requested}"
+        )
+        print("[PASS] 重定向跳数受限（max_redirects=2 → 共 3 次请求后放弃，不无限跟）")
+
+        # 4f. 超限仍在下载体开始前中断
+        client_big = _FakeHttpxClient({
+            f"{base}/big": _FakeStreamResponse(200, {"content-length": "999999"}, b"x" * 100),
+        })
+        _bind(client_big)
+        try:
+            await plugin._download(f"{base}/big", 1024)
+            raise AssertionError("超限应抛 _DownloadTooLargeError")
+        except DownloadTooLargeError:
+            pass
+        print("[PASS] Content-Length 预检超限即中断（v1.1.0 行为未回退）")
+
+        # 4g. 策略为 off 时确实放行内网（逃生口真的可用，不是死代码）
+        plugin.config.reader.download_url_policy = "off"
+        client_off = _FakeHttpxClient({
+            "http://127.0.0.1:3001/f/x": _FakeStreamResponse(200, body=b"LOCAL"),
+        })
+        _bind(client_off)
+        data_off = await plugin._download("http://127.0.0.1:3001/f/x", 1024)
+        assert data_off == b"LOCAL", data_off
+        plugin.config.reader.download_url_policy = "whitelist"
+        print("[PASS] policy=off 时内网地址放行（逃生口可用，默认不生效）")
+    finally:
+        await plugin.on_unload()
+
+
 async def _run() -> int:
     try:
         await _test_modules()
         print()
+        await _test_download_guard()
+        print()
         await _test_plugin_hooks()
+        print()
+        await _test_download_redirect_guard()
         print("\n全部通过 ✓")
         return 0
     except AssertionError as e:

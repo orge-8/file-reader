@@ -24,17 +24,65 @@ MaiBot 插件：解析 QQ 群/私聊上传的文件，分块向量化后按语�
 
 **核心格式零依赖**：docx / xlsx / pptx / csv / txt 及全部代码/文本类文件用 Python 标准库（zipfile + ElementTree / csv）直接解析，**无需安装任何第三方库**——插件跑在 MaiBot 的独立子进程里，这样本地与真机行为完全一致，也省去了找对 python.exe 装库的麻烦。
 
-`numpy`、`httpx`（必需，已写入 manifest dependencies；httpx 用于 URL 文件下载，缺失时下载路径不可用）。
+**由 manifest `dependencies` 声明（插件管理器会安装，无需手工处理）**：
 
-第三方库仅作兜底或覆盖老格式，可按需安装（**pandas 非必需**——xlsx/csv 已零依赖，仅 xls/ods 老格式需要）：
+| 包 | 用途 | 缺失后果 |
+|---|---|---|
+| `numpy` >=1.24 | 向量库余弦相似度（`vector_store.py`） | 插件无法加载 |
+| `httpx` >=0.24 | URL 来源文件的流式下载 | URL 下载路径不可用 |
+| `pdfminer.six` >=20221105 | **PDF 解析** | 收到 PDF 只报「缺少依赖 pdfminer.six」，读不到内容 |
+
+> ⚠️ **PDF 是必需依赖**：PDF 没有标准库解法，`file_parser.py` 里 `_read_pdf` 在缺 `pdfminer.six` 时会直接抛错。
+> 之所以由 manifest 声明而不是"可选手工安装"，是因为插件描述里把 PDF 列为核心能力之一——
+> 装完开箱读不了 PDF 属于功能与声明不符。若你的插件管理器不自动装依赖，请手动执行：
+> `pip install pdfminer.six`
+
+**可选手工安装**（缺失时全部有降级路径，不影响插件加载与其它格式）：
 
 ```bash
-pip install numpy httpx      # 必需
-pip install pdfminer.six     # PDF（无标准库解法，必装才能读 PDF）
-pip install pandas openpyxl  # 仅 xls/ods 老表格格式（xlsx/csv 已零依赖）
-pip install python-docx      # .doc 老格式（建议转存 .docx）
-pip install chardet          # txt 编码检测（建议装，缺失时多编码轮询兜底）
+pip install chardet          # txt 编码探测；缺失时退回多编码轮询猜测
+pip install pandas openpyxl  # 仅 .xls / .ods 老表格格式（xlsx/csv 已零依赖）
+pip install python-docx      # 仅 .doc 老格式（建议直接转存 .docx）
 ```
+
+## 下载安全策略（v1.2.0）
+
+插件的 URL 下载路径**不接受任意地址**。原因是一个真实的攻击面：适配器会把 file 段降级成纯文本
+`[文件] x.docx，大小: 9547，链接: <URL>`，插件从这段文本里抠出 URL 去下载。
+也就是说 **URL 完全由发消息的人控制**——任何群成员发一句带内网地址的"文件消息"，
+旧版本就会去 GET 它并把响应体解析进 LLM 上下文（SSRF）。
+
+因此 v1.2.0 起，下载前必须过四道校验：
+
+1. **协议**：只允许 `http` / `https`（挡 `file://` 等）
+2. **凭据**：拒绝 URL 内嵌用户名密码（`http://user:pass@host/`，常用于混淆真实主机）
+3. **域名白名单**：默认只允许 QQ 文件域，见 `reader.download_allowed_hosts`
+4. **解析后地址**：把主机名解析成 IP，**每个 IP 都必须是公网地址**——
+   拒绝回环 `127.0.0.0/8`、私网 `10/8`·`172.16/12`·`192.168/16`、
+   链路本地 `169.254/16`（含云元数据 `169.254.169.254`）、IPv6 回环/链路本地等
+
+**为什么必须做第 4 步**：只比对域名字符串挡不住这些写法，它们都能表达 `127.0.0.1`——
+
+| 写法 | 说明 |
+|---|---|
+| `http://2130706433/` | 十进制的 127.0.0.1 |
+| `http://0x7f000001/` | 十六进制的 127.0.0.1 |
+| `http://127.1/` | 短写 |
+| `http://127.0.0.1.nip.io/` | 通配 DNS 解析到回环 |
+| `http://attacker.com/` | 自己的 A 记录指向 `10.0.0.1` |
+
+所以流程是「**白名单 → 解析 → 逐个 IP 判公网**」，两层都过才放行。
+
+**重定向**：httpx 的自动跟随被显式关闭，改为手动逐跳处理（`reader.download_max_redirects`，默认 3 跳）。
+**每一跳都重新做上面四道校验**——否则一个白名单域名只要 302 到 `http://169.254.169.254/` 就能绕过。
+
+**关于 TLS 校验**（回应当前 review 里 `insecure_download` 的提醒）：
+运行机器存在 TLS MITM 代理时不必关掉证书校验，把代理根证书路径填进
+`reader.download_ca_bundle` 即可**保持校验开启**。只有万不得已才用 `reader.insecure_download`
+（它只对该域名关校验、不会放开白名单之外的地址，但毕竟丢了证书这道关）。
+
+**日志脱敏**：QQ 文件链接的 query 里带 `fname`/签名等凭据，所以下载日志只记录
+`scheme + host + path`，query 一律打码为 `?<已隐去>`。
 
 ## 配置
 
@@ -53,7 +101,12 @@ pip install chardet          # txt 编码检测（建议装，缺失时多编码
 | reader.file_max_rounds | int | 5 | 文件最大参与轮数 |
 | reader.cleanup_interval | int | 5 | 后台清理间隔（分钟）；同时负责回收空会话向量库与裁剪概要冷却表（v1.1.0） |
 | reader.enable_group | bool | true | 是否处理群聊文件 |
-| reader.insecure_download | bool | false | 下载文件时跳过 SSL 证书校验（内网 MITM 代理环境用，见常见问题） |
+| reader.download_url_policy | str | whitelist | URL 下载校验策略（v1.2.0）：`whitelist` = 只允许白名单域名；`public` = 允许任意主机但仍必须是公网 IP；`off` = 不校验（仅排障，危险）。三种策略**都**拒绝回环/私网/链路本地地址并逐跳校验重定向；写错的值退回 `whitelist` |
+| reader.download_allowed_hosts | str | ftn.qq.com,qfile.qq.com,nt.qq.com.cn,qq.com,weixin.qq.com | URL 下载域名白名单，逗号分隔，后缀匹配（含子域，边界安全：`eviltfn.qq.com` 不匹配 `ftn.qq.com`）。留空 = `whitelist` 下拒绝一切 URL 下载 |
+| reader.download_max_redirects | int | 3 | URL 下载最大重定向跳数，**每一跳重新做域名+地址校验**；0 = 不跟随重定向 |
+| reader.download_allow_private_hosts | bool | false | 允许下载目标解析到内网/回环（v1.2.0）。仅当适配器用本机 HTTP 服务提供文件时才需要，且该主机还必须同时加进白名单；开启等于重新放开对内网的访问能力，默认关闭 |
+| reader.download_ca_bundle | str | （空） | 自定义 CA 证书路径（PEM）。运行机器有 TLS MITM 代理时指向代理根证书即可**保持证书校验开启**，优先用这个而不是 insecure_download |
+| reader.insecure_download | bool | false | 下载文件时跳过 SSL 证书校验（内网 MITM 代理环境用，见常见问题）。优先改用 `download_ca_bundle`；开启后白名单之外仍是拒绝的，但对该域名不再把关证书 |
 | reader.injection_marker | str | 【文件检索】 | 注入文本的幂等标记 |
 | reader.silent_success | bool | true | 文件入库成功后保持静默（不发回执，日志仍记录）；设为 false 恢复「已解析 N 块」回执 |
 | reader.silent_errors | bool | true | 错误回执静默（v1.0.20）：文件处理失败（不支持的类型/下载失败/超限/embedding 失败/重试耗尽等）只写日志、不发群消息；设为 false 恢复 ⚠️ 错误回执 |
@@ -119,24 +172,81 @@ file 段的 `file_id` → `get_file` 换本地路径 → 读盘解析。任一�
 # 结构自检
 python tools/check_plugin.py plugins/file-reader
 
-# 冒烟测试（完整生命周期）
-python tools/smoke_test.py plugins/file-reader
+# 冒烟测试（FakeHost 完整生命周期，9 项：组件清单 / manifest 一致性 / SSRF 守卫 / 卸载收尾）
+python plugins/file-reader/tests/smoke_test.py
 
-# 功能自测（解析→分块→向量化→检索→清理，用伪 embedding 不依赖真模型）
+# 下载安全守卫（pytest，60 项参数化用例，门禁里的 pytest 步骤跑的就是它）
+python -m pytest -q plugins/file-reader/tests
+
+# 功能自测（解析→分块→向量化→检索→清理 + hook 直调，66 项，用伪 embedding 不依赖真模型）
 python plugins/file-reader/test_file_reader.py
 ```
+
+> ⚠️ **`run_gates.py` 的 pytest 步骤只收集 `tests/` 目录**。综合功能自测
+> `test_file_reader.py` 位于**插件根目录**，门禁**看不到它**——改完功能必须手工跑一次，
+> 并确认退出码为 0。v1.1.0 就是因为只信了门禁的"全绿"，把已经变红的自测和 SSRF 问题
+> 一起带进了提交（当时门禁只跑 `check_plugin`，冒烟与 pytest 都是缺席状态）。
+> 现在 `tests/` 下已有冒烟与 pytest 用例，但**根目录那 66 项仍不在门禁范围内**。
 
 ## 常见问题
 
 - **插件未加载**：检查 `_manifest.json` 是否合法、`numpy` 是否安装、三个生命周期方法是否齐全。
 - **embedding 不可用**：`/file_status` 查看；需在 MaiBot 配置里启用一个支持 embedding 的模型（`llm.embed` 能力）。
-- **某类文件解析失败**：docx/xlsx/pptx/txt/代码已零依赖；PDF 需 `pdfminer.six`，xls/ods 需 `pandas openpyxl`（建议转存 xlsx/csv），按需安装。
+- **某类文件解析失败**：docx/xlsx/pptx/txt/代码已零依赖；PDF 需 `pdfminer.six`（**已由 manifest 声明**，插件管理器会装；若手装环境请 `pip install pdfminer.six`）；xls/ods 需 `pandas openpyxl`（建议转存 xlsx/csv），按需安装。
 - **发出文件后回执「适配器把文件降级成了纯文本」**：说明 `napcat.enabled` 未开——按上方「NapCat 兜底」章节配置 HTTP 与 token。
 - **回执「NapCat 未返回文件内容」**：看日志里 `[napcat]` 开头的行；常见原因是 HTTP 服务未启用、token 错、`message_id` 对不上（可在 `/file_status` 里看「最近文件消息」的 mid），此时可配 `napcat.cache_dir` 走目录兜底。
-- **下载报 CERTIFICATE_VERIFY_FAILED**：运行环境存在 TLS MITM 代理（如安全软件的 proxy-root-ca.cer）时，文件下载 URL 的证书链校验会失败；将 `reader.insecure_download` 设为 `true` 可跳过校验（仅建议在内网可控环境使用）。
+- **下载报 CERTIFICATE_VERIFY_FAILED**：运行环境存在 TLS MITM 代理（如安全软件的 proxy-root-ca.cer）时，文件下载 URL 的证书链校验会失败。**首选**把代理根证书路径填进 `reader.download_ca_bundle`（校验保持开启）；仅在内网可控环境下才考虑 `reader.insecure_download = true`（跳过校验）。
+- **文件「没有下载：文件链接不在允许下载的域名白名单内」**（v1.2.0）：URL 来源的文件被安全策略拦下了，日志里会有 `[下载拒绝] URL 未通过安全校验（<原因>）`。若你的环境用的是非 QQ 的适配器/CDN，把它的域名加进 `reader.download_allowed_hosts`（逗号分隔，后缀匹配）；确需放开任意公网主机可改 `download_url_policy = public`（仍会拒绝内网地址）。
+- **想让本机适配器的 HTTP 文件服务被读**（如文件 URL 指向 `127.0.0.1`）：需**同时**满足两个条件——把该主机加进 `download_allowed_hosts`，并设 `download_allow_private_hosts = true`。注意这等于重新放开对内网的访问能力，请确认你真的需要。
 - **Hook 报 `'ReaderConfig' object has no attribute 'xxx'`**：配置字段按 section 分层，`enabled` 在 `plugin` 段（`self.config.plugin.enabled`），读取参数在 `reader` 段；跨段误访问会直接 AttributeError（v1.0.0 真机踩过，v1.0.1 已修）。
 
 ## 更新日志
+
+### v1.2.0（2026-09-20）下载 SSRF 防护 + 依赖声明修正
+
+针对插件市场 review 的三条阻断项与一条提醒：
+
+- **【安全·阻断】URL 下载加白名单与地址校验（SSRF）**。旧版 `_download` 对 URL 不做任何域名或目标地址校验：
+  而该 URL 来自消息正文（`_parse_file_hints` 从 `链接: ...` 抠出来），等于任何群成员都能
+  让插件去 GET `http://127.0.0.1:...` 或 `http://169.254.169.254/latest/meta-data` 并把响应解析进上下文。
+  现新增模块级校验层，下载前必过：协议（仅 http/https）→ 拒绝内嵌凭据 → 域名后缀白名单
+  → **解析后每个 IP 必须为公网**。默认白名单为 QQ 文件域，**只比域名字符串挡不住**
+  `http://2130706433/`、`http://0x7f000001/`、`http://127.0.0.1.nip.io/` 这类写法，所以校验落在解析结果上。
+  新增配置：`download_url_policy` / `download_allowed_hosts` / `download_max_redirects` /
+  `download_allow_private_hosts`（详见「下载安全策略」一节）。
+- **【安全】重定向逐跳校验**。httpx 自动跟随关闭，改为手动逐跳：每一跳重新过完整校验，
+  跳数受 `download_max_redirects` 限制——否则白名单域名 302 到内网即可绕过。
+  副作用是修复了旧版「QQ 链接 302 时下载直接失败」的行为。
+- **【安全】`insecure_download` 不再是绕开 TLS 的唯一手段**。新增 `download_ca_bundle`：
+  指向 MITM 代理根证书即可保持证书校验开启（更推荐）。启动自检会把
+  `insecure_download` / `download_allow_private_hosts` / `policy=off` 这些风险配置
+  以 `[自检][安全] 风险配置：...` 显式打日志。
+- **【安全】下载日志脱敏**：QQ 下载链接 query 带凭据，日志只留 scheme+host+path。
+- **【阻断】manifest `urls.repository` 修正**为实际仓库 `github.com/orge-8/file-reader`
+  （旧值误写为 `maibot-file-reader`）。
+- **【阻断】manifest 补声明 `pdfminer.six`**：PDF 无标准库解析路径，缺库时只报「缺少依赖」，
+  而描述里 PDF 是核心能力——属功能与声明不符，现作为必需依赖由 manifest 声明。
+- **【修复】两处测试用例缺陷**（v1.1.0 自测里就存在，是它掩盖了上面的问题）：
+  - `1j2 拆批部分失败` 用例引用了未定义的 `batch_seq`，首次调用即抛 `NameError`，
+    于是"第 1 批失败 → 整单返回空"也满足断言 `result == {}`，**用例本身完全没验证到目标场景**。
+    已改为按批内容区分失败批，并反查模拟调用序列 `["a","d","d"]` 锁死"第 2 批重试全失败"。
+  - `1g3 多文件端到端` 用固定 `await asyncio.sleep(0.5)` 等并发后台任务，属竞态（偶发误报少文件）。
+    已改为轮询等待条件成立。
+- **【修复】`is_public_ip` 不能只依赖 `is_global`**：CPython 的 IPv4 `is_global` 不把组播
+  `224.0.0.0/4` 算作非公网（实测返回 True），已显式叠加 `is_multicast`/`is_reserved`/
+  `is_link_local`/`is_loopback`/`is_private`/`is_unspecified` 判定（由新增测试抓出）。
+- 新增 15 条 SSRF 回归用例，含"白名单域名被 302 到云元数据后 **169.254.169.254 从未被请求**"
+  与"首跳即被拒时零请求发出"两条以"实际发包记录"为证据的断言。
+- **补齐测试基建，让门禁不再是假绿**（v1.1.0 门禁只跑了 `check_plugin` 一项，
+  冒烟与 pytest 都是缺席状态，所以"全绿"毫无意义）：
+  - 新增 `tests/smoke_test.py`（9 项）与 `tests/fakehost.py`：装入插件跑完整生命周期，
+    覆盖组件清单（数量/类型/处理器名，专抓装饰器绑错人）、manifest 一致性、
+    SSRF 守卫、风险配置告警、卸载收尾、hook 只读性、命令回执。
+  - 新增 `tests/test_download_guard.py`（60 项参数化用例）：把下载安全契约做成
+    门禁能跑到的一份，含"解析结果而非域名字符串""混合 DNS 结果也拒""非法策略退回 whitelist"。
+  - 门禁结果从 `PASS 1 SKIP 0 FAIL 0`（假绿）变为 `PASS 3 SKIP 0 FAIL 0`。
+  - 另修：`tests/smoke_test.py` 里日志断言的 `_LogCapture` 曾把 `getMessage()` 二次格式化，
+    退化成未填参的模板文本，导致告警断言永远不匹配（自测写错，非产品缺陷）。
 
 ### v1.1.0（2026-09-07）性能与内存专项优化
 

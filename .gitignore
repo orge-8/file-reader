@@ -1,19 +1,18 @@
-# 运行时生成，不入库
+# 插件运行时配置（Runner 自动生成，可能含 access_token 等凭据）——不入库
 /config.toml
+
+# 插件运行期落盘状态（会话元数据等，随运行环境变化）——不入库
 /data/
+/runtime/
 
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 .venv/
 venv/
 
-# IDE / 系统
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
-
-# 日志与临时文件
-*.log
-*.tmp
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
