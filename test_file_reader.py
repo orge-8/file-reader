@@ -944,6 +944,12 @@ async def _test_plugin_hooks() -> None:
     from vector_store import FileEntry as _FE2
 
     # 不传 session_id（LLM 真机形态：参数缺失）→ 兜底命中 inject-session
+    # v1.2.1 起兜底收紧为"仅当全局只有一个会话存有文件才回退"（2a6b 验证拒绝路径）。
+    # 共享 runner 此前用例已往库里写入多个会话的文件——那正是旧行为会发生
+    # 跨会话串扰的现场。这里临时把库隔离成只有 inject-session 再验证单会话兜底。
+    _saved_for_fb = dict(plugin._store._sessions)
+    plugin._store._sessions.clear()
+    plugin._store._sessions[("inject-session", "inject-session")] = vs_inject
     res_noid = await plugin.search_file(query="苹果")
     assert "全文" in res_noid.get("content", ""), f"空 session_id 应兜底命中: {res_noid}"
     assert "inject-session" in res_noid["content"], f"返回应携带实际会话 ID: {res_noid['content'][:120]}"
@@ -953,6 +959,9 @@ async def _test_plugin_hooks() -> None:
     # 显式传对的 session_id → 直接命中
     res_right = await plugin.search_file(query="苹果", session_id="inject-session")
     assert "全文" in res_right.get("content", ""), f"显式命中不应受影响: {res_right}"
+    # 恢复共享库，交给 2a6b 做多会话歧义断言
+    plugin._store._sessions.clear()
+    plugin._store._sessions.update(_saved_for_fb)
     # 库完全为空时仍应如实报告
     saved_sessions = dict(plugin._store._sessions)
     plugin._store._sessions.clear()
@@ -961,6 +970,52 @@ async def _test_plugin_hooks() -> None:
     plugin._store.drop("inject-session")
     assert "还没有已入库的文件" in res_empty.get("content", ""), f"空库应如实报告: {res_empty}"
     print("[PASS] search_file 会话兜底（空/错 session_id 自动定位最近入库会话，空库如实报告）")
+
+    # 2a6b. 跨会话兜底收紧（v1.2.1 review 隐私项）：**多个**会话都有文件时，
+    #     未指明/指错 session_id 一律拒绝兜底——旧版回退"最近入库会话"，
+    #     多群场景等于把 A 会话上传的文件正文塞进 B 会话的 LLM 上下文，
+    #     且真机日志证明 Planner 确实经常不传 session_id。fail-closed：宁可
+    #     如实报告并提示补传 session_id，不猜。
+    vs_priv_b = plugin._store.get_or_create(
+        "priv-session-b", "priv-session-b", plugin._embed,
+        plugin.config.reader.chunk_size, plugin.config.reader.chunk_overlap,
+        plugin.config.reader.retrieve_top_k,
+    )
+    vs_priv_b.files["B会话文件.txt"] = _FE2(
+        file_name="B会话文件.txt",
+        chunks=["这是 B 会话独有的隐私内容，绝不能出现在别的会话里。"],
+        vectors=[],
+    )
+    # 重建 A 会话（2a6 结尾把它 drop 了）→ 现在两个会话都有文件，兜底有歧义
+    vs_priv_a = plugin._store.get_or_create(
+        "inject-session", "inject-session", plugin._embed,
+        plugin.config.reader.chunk_size, plugin.config.reader.chunk_overlap,
+        plugin.config.reader.retrieve_top_k,
+    )
+    vs_priv_a.files["A会话文件.txt"] = _FE2(
+        file_name="A会话文件.txt",
+        chunks=["这是 A 会话的文件内容。"],
+        vectors=[],
+    )
+    res_ambig = await plugin.search_file(query="隐私内容")  # 不传 session_id（LLM 真机形态）
+    assert "无法确定" in res_ambig.get("content", ""), f"多会话 + 空 session_id 应拒绝兜底: {res_ambig}"
+    assert "B 会话独有的隐私内容" not in res_ambig.get("content", ""), "拒绝兜底时不得泄露任何会话内容"
+    res_ambig2 = await plugin.search_file(query="隐私内容", session_id="totally-other-session")
+    assert "没有已入库的文件" in res_ambig2.get("content", ""), (
+        f"多会话 + 错 session_id 应拒绝并说明，实际: {res_ambig2}"
+    )
+    assert "B 会话独有的隐私内容" not in res_ambig2.get("content", ""), (
+        "错 session_id 拒绝时不得泄露其他会话内容"
+    )
+    # 显式传对 → 各自命中各自会话（能力没有一起被砍掉）
+    res_a = await plugin.search_file(query="A 会话的文件", session_id="inject-session")
+    assert "这是 A 会话的文件内容" in res_a.get("content", ""), f"显式 A 会话 sid 应命中 A: {res_a}"
+    res_b = await plugin.search_file(query="隐私内容", session_id="priv-session-b")
+    assert "B 会话独有的隐私内容" in res_b.get("content", ""), f"显式 B 会话 sid 应命中 B: {res_b}"
+    # 清场：不影响后续用例
+    plugin._store.drop("priv-session-b")
+    plugin._store.drop("inject-session")
+    print("[PASS] search_file 跨会话兜底收紧（多会话歧义拒绝兜底、拒绝不泄露内容、显式 session_id 各自命中）")
 
     # ─── 2b. 大文件 LLM 概要（v1.0.17；v1.0.18 C4 后同步行为需显式开 summary_await_on_inject） ───
     # FakeHost 的 llm.generate 未模拟能力返回 {"success": True}（无 response 字段），
@@ -1389,9 +1444,13 @@ class _FakeHttpxClient:
     def __init__(self, routes: dict[str, _FakeStreamResponse]):
         self.routes = routes
         self.requested: list[str] = []
+        # v1.2.1：记录最后一次 stream() 的 kwargs（headers/extensions），
+        # 供连接钉定用例断言 Host 头保留原主机名、https 带 sni_hostname
+        self.last_kwargs: dict = {}
 
     def stream(self, method: str, url: str, **kwargs):
         self.requested.append(url)
+        self.last_kwargs = dict(kwargs)
         return _FakeStreamContext(self.routes.get(url, _FakeStreamResponse(404)))
 
     async def aclose(self) -> None:
@@ -1555,6 +1614,38 @@ async def _test_download_guard() -> None:
     assert "tjc-download.ftn.qq.com/ftn_handler/abc" in _red, _red
     print(f"[PASS] 下载日志脱敏: {_red}")
 
+    # 3h. 连接钉定（v1.2.1 防 DNS 重绑定）：校验通过的 IP 必须能带出来钉到连接上
+    _collected: list[str] = []
+    plugin_mod.validate_download_target(
+        "https://tjc-download.ftn.qq.com/x?fname=a",
+        policy="whitelist",
+        allowed_hosts=allowed,
+        resolver=lambda h, p: ["93.184.216.34", "2001:4860:4860::8888"],
+        collect_ips=_collected,
+    )
+    assert _collected == ["93.184.216.34", "2001:4860:4860::8888"], _collected
+    _pin_url, _pin_extra = plugin_mod.build_pinned_request(
+        "https://tjc-download.ftn.qq.com/ftn_handler/abc?fname=a", "tjc-download.ftn.qq.com", _collected[0]
+    )
+    assert _pin_url == "https://93.184.216.34/ftn_handler/abc?fname=a", _pin_url
+    assert _pin_extra["headers"]["host"] == "tjc-download.ftn.qq.com", _pin_extra
+    assert _pin_extra["extensions"]["sni_hostname"] == "tjc-download.ftn.qq.com", _pin_extra
+    # 拒绝路径一个 IP 都不能带出（防止拒绝后被误钉）
+    _collected_bad: list[str] = []
+    try:
+        plugin_mod.validate_download_target(
+            "https://tjc-download.ftn.qq.com/x",
+            policy="whitelist",
+            allowed_hosts=allowed,
+            resolver=_resolver_to("127.0.0.1"),
+            collect_ips=_collected_bad,
+        )
+        raise AssertionError("内网解析应被拒绝")
+    except plugin_mod._UrlRejectedError as e:
+        assert e.reason == "non_public_address", e.reason
+    assert _collected_bad == [], f"校验失败路径不得带出 IP: {_collected_bad}"
+    print("[PASS] 连接钉定：collect_ips 仅在通过时带出 IP；build_pinned_request 换 IP 保留 Host/SNI（证书校验不降级）")
+
 
 async def _test_download_redirect_guard() -> None:
     """_download 的重定向逐跳校验（v1.2.0）。
@@ -1676,6 +1767,48 @@ async def _test_download_redirect_guard() -> None:
         assert data_off == b"LOCAL", data_off
         plugin.config.reader.download_url_policy = "whitelist"
         print("[PASS] policy=off 时内网地址放行（逃生口可用，默认不生效）")
+
+        # 4h. 连接钉定（v1.2.1 防 DNS 重绑定）：白名单用**域名** + 桩解析 →
+        #     出站请求的主机必须是已校验的 IP，Host 头保留原主机名。
+        #     校验和连接各解析一次 DNS 的旧版做不到这一点——域名会参与连接。
+        real_resolve = under_test_globals["resolve_host_ips"]
+        try:
+            under_test_globals["resolve_host_ips"] = lambda host, port: ["93.184.216.34"]
+            plugin.config.reader.download_allowed_hosts = "cdn.example.com"
+            client_pin = _FakeHttpxClient({
+                "http://93.184.216.34/f/pin.docx": _FakeStreamResponse(200, body=b"PINNED"),
+            })
+            _bind(client_pin)
+            data_pin = await plugin._download("http://cdn.example.com/f/pin.docx", 1024)
+            assert data_pin == b"PINNED", data_pin
+            assert client_pin.requested == ["http://93.184.216.34/f/pin.docx"], (
+                f"请求应钉到已校验 IP（域名不应参与连接）: {client_pin.requested}"
+            )
+            assert client_pin.last_kwargs.get("headers", {}).get("host") == "cdn.example.com", (
+                f"Host 头应保留原主机名: {client_pin.last_kwargs}"
+            )
+            print("[PASS] 连接钉定：请求打到已校验 IP、Host 头保留原主机名（重绑定窗口关闭）")
+
+            # 4i. 重定向每一跳独立「校验 → 钉定」：第二跳（另一白名单域）连它自己校验过的 IP
+            #     （桩必须返回 list——validate 逐个迭代判公网，返回字符串会被逐字符拆开）
+            under_test_globals["resolve_host_ips"] = lambda host, port: {
+                "cdn.example.com": ["93.184.216.34"],
+                "mirror.example.com": ["8.8.4.4"],
+            }[host]
+            plugin.config.reader.download_allowed_hosts = "cdn.example.com,mirror.example.com"
+            client_hop = _FakeHttpxClient({
+                "http://93.184.216.34/old": _FakeStreamResponse(302, {"location": "http://mirror.example.com/new"}),
+                "http://8.8.4.4/new": _FakeStreamResponse(200, body=b"HOP2"),
+            })
+            _bind(client_hop)
+            data_hop = await plugin._download("http://cdn.example.com/old", 1024)
+            assert data_hop == b"HOP2", data_hop
+            assert client_hop.requested == ["http://93.184.216.34/old", "http://8.8.4.4/new"], (
+                f"每一跳都应连各自校验过的 IP: {client_hop.requested}"
+            )
+            print("[PASS] 重定向逐跳钉定：第二跳连接它自己校验过的 IP")
+        finally:
+            under_test_globals["resolve_host_ips"] = real_resolve
     finally:
         await plugin.on_unload()
 

@@ -471,6 +471,28 @@ def check_self_report_warns_on_risky_config() -> list[str]:
     for keyword in ("download_url_policy=off", "download_allow_private_hosts", "insecure_download"):
         if keyword not in joined:
             failures.append(f"风险配置 {keyword} 没有在启动自检里告警")
+
+    # v1.2.1：napcat.verify_ssl=false 且 http_url 是 https 地址 → 必须告警
+    # （存量实例的 config.toml 不会跟随新默认值 true，只能靠这条启动告警兜住）
+    capture2 = _LogCapture()
+    for target in targets:
+        target.addHandler(capture2)
+        target.setLevel(logging.DEBUG)
+    try:
+        runner_https = Runner(config_overrides={
+            "napcat.enabled": True,
+            "napcat.http_url": "https://napcat.example:3001",
+            "napcat.verify_ssl": False,
+        })
+        asyncio.run(runner_https.plugin.on_load())
+        asyncio.run(runner_https.plugin.on_unload())
+    finally:
+        for target, level in previous_levels:
+            target.removeHandler(capture2)
+            target.setLevel(level)
+    joined2 = "\n".join(capture2.lines)
+    if "napcat.verify_ssl" not in joined2:
+        failures.append("verify_ssl=false 且 https 地址时，启动自检没有告警 napcat.verify_ssl")
     return failures
 
 
@@ -525,6 +547,94 @@ def check_status_command_replies(runner: Runner) -> list[str]:
     return failures
 
 
+def check_search_file_session_isolation(runner: Runner) -> list[str]:
+    """search_file 的跨会话兜底必须收紧（v1.2.1 review 隐私项）。
+
+    旧版：LLM 不传 session_id 时回退"最近有文件入库的会话"——多群场景下会把
+    A 会话上传的文件正文塞进 B 会话的 LLM 上下文（真机 Planner 确实经常不传
+    该参数）。现在：仅当**唯一**会话有文件才兜底；多会话歧义时拒绝并提示补传
+    session_id，且拒绝路径不得泄露任何会话内容；显式传对 sid 的能力必须还在。
+    """
+    failures: list[str] = []
+    plugin = runner.plugin
+
+    async def drive():
+        from vector_store import FileEntry
+
+        try:
+            for sid, name, text in (
+                ("iso-session-a", "A会话文件.txt", "A 会话独有的内容甲乙丙。"),
+                ("iso-session-b", "B会话文件.txt", "B 会话独有的隐私内容丁戊己。"),
+            ):
+                vs = plugin._store.get_or_create(
+                    sid, sid, plugin._embed,
+                    plugin.config.reader.chunk_size, plugin.config.reader.chunk_overlap,
+                    plugin.config.reader.retrieve_top_k,
+                )
+                vs.files[name] = FileEntry(file_name=name, chunks=[text], vectors=[])
+
+            res = await plugin.search_file(query="隐私内容")  # 不传 session_id（LLM 真机形态）
+            if "无法确定" not in res.get("content", ""):
+                failures.append(f"多会话 + 空 session_id 应拒绝兜底，实际: {res}")
+            if "丁戊己" in res.get("content", "") or "甲乙丙" in res.get("content", ""):
+                failures.append(f"拒绝兜底时泄露了会话内容: {res}")
+
+            res_wrong = await plugin.search_file(query="隐私内容", session_id="no-such-session")
+            if "没有已入库的文件" not in res_wrong.get("content", ""):
+                failures.append(f"多会话 + 错 session_id 应拒绝并说明，实际: {res_wrong}")
+            if "丁戊己" in res_wrong.get("content", ""):
+                failures.append(f"错 session_id 拒绝时泄露了其他会话内容: {res_wrong}")
+
+            res_ok = await plugin.search_file(query="隐私内容", session_id="iso-session-b")
+            if "丁戊己" not in res_ok.get("content", ""):
+                failures.append(f"显式传对 session_id 应正常命中: {res_ok}")
+        finally:
+            plugin._store.drop("iso-session-a")
+            plugin._store.drop("iso-session-b")
+
+    asyncio.run(drive())
+    return failures
+
+
+def check_download_pins_validated_ip() -> list[str]:
+    """下载连接必须钉在已校验的 IP 上（v1.2.1 review SSRF 项：DNS 重绑定窗口）。
+
+    旧版：validate 校验时解析一次 DNS，httpx 连接时再解析一次——两次解析之间
+    域名可以换 IP（policy=public 时攻击者自持 DNS 即可利用）。现在出站请求
+    URL 的主机就是校验时的那个 IP，连接阶段不再有第二次解析。白名单条目故意
+    用域名并打桩 resolve_host_ips：若钉定失效，请求 URL 会是域名本身，这里就红。
+    """
+    failures: list[str] = []
+    runner = Runner()
+    plugin = runner.plugin
+    under_test = type(plugin)._download.__globals__
+
+    async def drive():
+        await plugin.on_load()
+        try:
+            plugin.config.reader.download_url_policy = "whitelist"
+            plugin.config.reader.download_allowed_hosts = "cdn.example.com"
+            real_resolve = under_test["resolve_host_ips"]
+            under_test["resolve_host_ips"] = lambda host, port: ["93.184.216.34"]
+            try:
+                client = _fake_http_client(
+                    {"http://93.184.216.34/f/a.docx": {"status": 200, "body": b"PINNED"}}
+                )
+                _bind_fake_client(plugin, client)
+                data = await plugin._download("http://cdn.example.com/f/a.docx", 4096)
+                if data != b"PINNED":
+                    failures.append(f"钉定下载应成功，实际 {data!r}")
+                if client.requested != ["http://93.184.216.34/f/a.docx"]:
+                    failures.append(f"出站请求应钉到已校验 IP，实际 {client.requested}")
+            finally:
+                under_test["resolve_host_ips"] = real_resolve
+        finally:
+            await plugin.on_unload()
+
+    asyncio.run(drive())
+    return failures
+
+
 # ═══════════════════════════════════════════════ 运行
 
 _runner_cache: dict[str, Runner] = {}
@@ -550,6 +660,8 @@ CHECKS = [
     ("命令中文触发词正则", check_command_patterns),
     ("生命周期加载与卸载收尾", check_lifecycle_and_unload_cleanup),
     ("SSRF 守卫：内网/云元数据一律拒且零发包", check_ssrf_guard_blocks_internal_targets),
+    ("下载连接钉定（防 DNS 重绑定，v1.2.1）", check_download_pins_validated_ip),
+    ("search_file 跨会话兜底护栏（v1.2.1）", lambda: check_search_file_session_isolation(_shared_runner())),
     ("风险配置在启动自检里告警", check_self_report_warns_on_risky_config),
     ("文件检测 hook 只读不改写消息", lambda: check_messages_are_not_rewritten(_shared_runner())),
     ("file_status 命令回执", lambda: check_status_command_replies(_shared_runner())),

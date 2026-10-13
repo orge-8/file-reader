@@ -101,7 +101,7 @@ pip install python-docx      # 仅 .doc 老格式（建议直接转存 .docx）
 | reader.file_max_rounds | int | 5 | 文件最大参与轮数 |
 | reader.cleanup_interval | int | 5 | 后台清理间隔（分钟）；同时负责回收空会话向量库与裁剪概要冷却表（v1.1.0） |
 | reader.enable_group | bool | true | 是否处理群聊文件 |
-| reader.download_url_policy | str | whitelist | URL 下载校验策略（v1.2.0）：`whitelist` = 只允许白名单域名；`public` = 允许任意主机但仍必须是公网 IP；`off` = 不校验（仅排障，危险）。三种策略**都**拒绝回环/私网/链路本地地址并逐跳校验重定向；写错的值退回 `whitelist` |
+| reader.download_url_policy | str | whitelist | URL 下载校验策略（v1.2.0）：`whitelist` = 只允许白名单域名；`public` = 允许任意主机但仍必须是公网 IP；`off` = 不校验（仅排障，危险）。三种策略**都**拒绝回环/私网/链路本地地址并逐跳校验重定向；写错的值退回 `whitelist`。v1.2.1 起校验通过的 IP 会**钉定到实际连接**（Host/SNI/证书校验仍按原主机名），DNS 重绑定窗口关闭 |
 | reader.download_allowed_hosts | str | ftn.qq.com,qfile.qq.com,nt.qq.com.cn,qq.com,weixin.qq.com | URL 下载域名白名单，逗号分隔，后缀匹配（含子域，边界安全：`eviltfn.qq.com` 不匹配 `ftn.qq.com`）。留空 = `whitelist` 下拒绝一切 URL 下载 |
 | reader.download_max_redirects | int | 3 | URL 下载最大重定向跳数，**每一跳重新做域名+地址校验**；0 = 不跟随重定向 |
 | reader.download_allow_private_hosts | bool | false | 允许下载目标解析到内网/回环（v1.2.0）。仅当适配器用本机 HTTP 服务提供文件时才需要，且该主机还必须同时加进白名单；开启等于重新放开对内网的访问能力，默认关闭 |
@@ -127,7 +127,7 @@ pip install python-docx      # 仅 .doc 老格式（建议直接转存 .docx）
 | napcat.http_url | str | http://127.0.0.1:3001 | NapCat OneBot HTTP 服务地址 |
 | napcat.access_token | str | 空 | NapCat HTTP 的 access_token（未设置则留空） |
 | napcat.timeout | float | 15 | HTTP 请求超时（秒） |
-| napcat.verify_ssl | bool | false | HTTPS 时校验证书（本地 http 无需开） |
+| napcat.verify_ssl | bool | **true**（v1.2.1 起） | HTTPS 时校验证书与主机名。默认从 false 翻转为 true：配 https 地址时关闭它等于允许中间人窃听/篡改（含 access_token）。**存量实例的 config.toml 不会自动跟随新默认值**——若你此前配了 https 地址且没动过这项，请手动改回 true 或删掉 config.toml 重新生成；本地 http 地址不受影响 |
 | napcat.cache_dir | str | 空 | 可选：NapCat 文件缓存目录，`get_file` 失败时按文件名+大小在此搜索 |
 
 ### NapCat 兜底（重要）
@@ -201,6 +201,15 @@ python plugins/file-reader/test_file_reader.py
 - **Hook 报 `'ReaderConfig' object has no attribute 'xxx'`**：配置字段按 section 分层，`enabled` 在 `plugin` 段（`self.config.plugin.enabled`），读取参数在 `reader` 段；跨段误访问会直接 AttributeError（v1.0.0 真机踩过，v1.0.1 已修）。
 
 ## 更新日志
+
+### v1.2.1（2026-10-07）市场 review 加固：跨会话兜底收紧 + DNS 重绑定 + verify_ssl 默认值
+
+三条加固全部来自插件中心 AI review（均非阻断项，本轮主动收掉）：
+
+- **search_file 跨会话兜底收紧（隐私向，review 第 1 条）**：旧版 LLM 不传/传错 session_id 时回退「最近有文件入库的会话」——多人群场景下等于把 A 会话上传的文件正文塞进 B 会话的 LLM 上下文，且真机日志证明 Planner 确实经常不传该参数，不是纸上风险。现在 `_resolve_tool_session` 规则改为：显式 session_id 命中直接用；**仅当全局只有一个会话存有文件时**才自动定位（v1.0.15 的单会话场景不回退）；多会话歧义时**拒绝兜底**（fail-closed），返回可执行的指引（提示补传 session_id）并打 WARNING 日志留痕，拒绝路径不泄露任何会话信息。hook 侧 `inject_file_context` 本就是精确匹配注入，不受影响。工具描述同步更新，帮助 LLM 在多会话场景主动带上 session_id。
+- **下载连接钉定，关闭 DNS 重绑定窗口（review 第 2 条）**：旧版 `validate_download_target` 校验时解析一次 DNS，httpx 连接时**再解析一次**——两次解析之间域名可以换 IP；`download_url_policy = public`（README 明写的逃生口）下，攻击者自持 DNS 的域名可以先解析到公网 IP 过检、连接时再解析回内网 IP。现在校验通过的解析结果经 `collect_ips` 带出，实际请求直接连这些已校验 IP（`build_pinned_request`：Host 头/SNI/证书校验仍按原主机名，https 用 httpcore 的 `sni_hostname` 扩展，证书校验不降级），重定向每一跳独立「校验 → 钉定」，多个已校验 IP 只有连接类错误才依次尝试、绝不重新解析。`policy = off` 不解析也就无从钉定，维持旧行为。顺带把阻塞的 `getaddrinfo` 挪进 `asyncio.to_thread`，不再卡事件循环。
+- **napcat.verify_ssl 默认 false → true（review 第 3 条）**：旧默认在 https 地址下会连主机名校验一起关掉（CERT_NONE）。新实例默认开启校验；**存量实例的 config.toml 不会跟随新默认值**，因此启动自检新增一条风险告警：`napcat.verify_ssl=false` 且 `napcat.http_url` 为 https 地址时打 WARNING（与 download 风险配置告警同款机制），提示改用系统信任的证书而不是关校验。
+- 测试：pytest 门禁用例 72 项（新增连接钉定 6 项：`build_pinned_request` 单元契约、collect_ips 拒绝路径不带出 IP、端到端「出站请求打到已校验 IP」、重定向逐跳钉定）；smoke 新增「下载连接钉定」「search_file 跨会话兜底护栏」两项防回归，并把 verify_ssl 告警纳入风险配置告警检查；根套件新增 2a6b（多会话歧义拒绝兜底、拒绝不泄露内容、显式 session_id 各自命中）与 3h/4h/4i。两项修复均做了**反向验证**：还原旧实现后新用例确实 FAIL（钉定还原 → 域名参与连接；旧兜底还原 → LLM 幻觉 session_id 时拿到其他会话内容）。
 
 ### v1.2.0（2026-09-20）下载 SSRF 防护 + 依赖声明修正
 

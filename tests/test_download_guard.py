@@ -17,6 +17,7 @@
 本文件是守护同一契约的 pytest 投影，两者都改才算改完。
 """
 
+import asyncio
 import socket
 import sys
 from pathlib import Path
@@ -24,8 +25,10 @@ from pathlib import Path
 import pytest
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
-if str(PLUGIN_DIR) not in sys.path:
-    sys.path.insert(0, str(PLUGIN_DIR))
+TESTS_DIR = PLUGIN_DIR / "tests"
+for _p in (str(PLUGIN_DIR), str(TESTS_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import plugin as plugin_mod  # noqa: E402
 
@@ -256,3 +259,208 @@ def test_download_url_logging_redacts_query_credentials():
     assert "secret" not in redacted and "deadbeef" not in redacted
     assert "tjc-download.ftn.qq.com/ftn_handler/abc" in redacted
     assert redacted.endswith("?<已隐去>")
+
+
+# ─── 7. 连接钉定（v1.2.1，防 DNS 重绑定） ───────────────────────────
+#
+# review 指出：校验时解析一次 DNS、httpx 连接时**再解析一次**，两次解析之间
+# 存在重绑定窗口——download_url_policy=public 时，攻击者自持 DNS 的域名可以
+# 先解析到公网 IP 过检、连接时再解析回内网 IP。
+# 修复：校验通过的 IP 经 collect_ips 带出，请求 URL 直接换成该 IP
+# （Host 头/SNI/证书校验保留原主机名），连接阶段不再有第二次解析。
+
+def test_build_pinned_request_rewrites_host_keeps_host_header_and_sni():
+    url, extra = plugin_mod.build_pinned_request(
+        "https://tjc-download.ftn.qq.com/ftn_handler/abc?fname=a",
+        "tjc-download.ftn.qq.com",
+        "93.184.216.34",
+    )
+    assert url == "https://93.184.216.34/ftn_handler/abc?fname=a", url
+    assert extra["headers"]["host"] == "tjc-download.ftn.qq.com"
+    # https 必须带 sni_hostname：连 IP 但按原主机名做 TLS，证书校验不降级
+    assert extra["extensions"]["sni_hostname"] == "tjc-download.ftn.qq.com"
+
+
+def test_build_pinned_request_keeps_explicit_port_and_supports_ipv6():
+    url, extra = plugin_mod.build_pinned_request(
+        "http://my-cdn.example:8080/x", "my-cdn.example", "93.184.216.34"
+    )
+    assert url == "http://93.184.216.34:8080/x", url
+    assert extra["headers"]["host"] == "my-cdn.example:8080"
+
+    url6, _extra6 = plugin_mod.build_pinned_request(
+        "http://my-cdn.example/x", "my-cdn.example", "2001:4860:4860::8888"
+    )
+    assert url6 == "http://[2001:4860:4860::8888]/x", url6
+
+
+def test_build_pinned_request_noop_without_ip():
+    """policy=off 不解析、无从钉定——必须原样返回（旧行为）。"""
+    url, extra = plugin_mod.build_pinned_request("http://127.0.0.1:3001/x", "127.0.0.1", None)
+    assert url == "http://127.0.0.1:3001/x"
+    assert extra == {}
+
+
+def test_validate_collects_validated_ips_only_on_success():
+    """collect_ips 只在**校验通过**时带出解析结果；拒绝路径一个 IP 都不能漏出去。"""
+    collected: list[str] = []
+    plugin_mod.validate_download_target(
+        "https://tjc-download.ftn.qq.com/x",
+        policy="whitelist",
+        allowed_hosts=ALLOWED,
+        resolver=_resolver("93.184.216.34", "2001:4860:4860::8888"),
+        collect_ips=collected,
+    )
+    assert collected == ["93.184.216.34", "2001:4860:4860::8888"], collected
+
+    collected_bad: list[str] = []
+    with pytest.raises(plugin_mod._UrlRejectedError) as excinfo:
+        plugin_mod.validate_download_target(
+            "https://tjc-download.ftn.qq.com/x",
+            policy="whitelist",
+            allowed_hosts=ALLOWED,
+            resolver=_resolver("127.0.0.1"),
+            collect_ips=collected_bad,
+        )
+    assert excinfo.value.reason == "non_public_address"
+    assert collected_bad == [], f"拒绝路径不得带出任何 IP: {collected_bad}"
+
+
+class _RecordingStreamResponse:
+    def __init__(self, status_code: int, headers: dict | None = None, body: bytes = b""):
+        self.status_code = status_code
+        self.headers = dict(headers or {})
+        self._body = body
+
+    @property
+    def is_redirect(self) -> bool:
+        return self.status_code in (301, 302, 303, 307, 308) and "location" in self.headers
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    async def aiter_bytes(self, chunk_size: int = 65536):
+        for i in range(0, len(self._body), chunk_size):
+            yield self._body[i : i + chunk_size]
+
+
+class _RecordingClient:
+    """记录 (url, headers, extensions) 的 httpx 替身——断言"请求打到哪个 IP"必须看出站记录。"""
+
+    def __init__(self, routes: dict[str, tuple[int, dict, bytes]]):
+        self.routes = routes
+        self.requests: list[tuple[str, dict, dict]] = []
+
+    def stream(self, method: str, url: str, **kwargs):
+        self.requests.append(
+            (url, dict(kwargs.get("headers") or {}), dict(kwargs.get("extensions") or {}))
+        )
+        status, headers, body = self.routes.get(url, (404, {}, b""))
+        resp = _RecordingStreamResponse(status, headers, body)
+
+        class _Ctx:
+            async def __aenter__(self):
+                return resp
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _make_plugin():
+    """用 fakehost 造一个默认配置的插件实例（不跑完整生命周期，按需 on_load）。"""
+    from fakehost import FakeHost, bind_context, build_context, get_default_config, load_plugin_module
+
+    module = load_plugin_module(PLUGIN_DIR)
+    plugin = module.create_plugin()
+    host = FakeHost("org.mai-mai.file-reader")
+    ctx = build_context("org.mai-mai.file-reader", rpc_call=host.rpc_call)
+    bind_context(plugin, ctx, get_default_config(type(plugin).config_model))
+    return module, plugin
+
+
+def _patch_resolver(plugin, resolver):
+    """在被测模块命名空间替换 resolve_host_ips（load_plugin_module 每次出新模块对象，
+    异常类/全局名都必须从被测方法自己的 __globals__ 取——test_file_reader 踩过的坑）。"""
+    under_test = type(plugin)._download.__globals__
+    original = under_test["resolve_host_ips"]
+    under_test["resolve_host_ips"] = resolver
+    return lambda: under_test.__setitem__("resolve_host_ips", original)
+
+
+def test_download_goes_to_validated_ip_not_hostname():
+    """端到端：出站请求的主机必须是校验时用的那个 IP——域名不参与连接，重绑定窗口关闭。
+
+    白名单条目故意用**域名**（而非 IP 字面量）并打桩 resolve_host_ips：
+    若钉定失效（把原始 URL 直接交给 httpx），请求 URL 会是 cdn.example.com，
+    这条用例就红——"看实际发包记录"的判据才立得住。
+    """
+    module, plugin = _make_plugin()
+
+    async def drive():
+        await plugin.on_load()
+        restore = _patch_resolver(plugin, lambda host, port: ["93.184.216.34"])
+        try:
+            plugin.config.reader.download_url_policy = "whitelist"
+            plugin.config.reader.download_allowed_hosts = "cdn.example.com"
+            client = _RecordingClient({"http://93.184.216.34/f/a.docx": (200, {}, b"PINNED")})
+
+            async def factory():
+                return client
+
+            plugin._get_http_client = factory  # type: ignore[method-assign]
+            data = await plugin._download("http://cdn.example.com/f/a.docx", 4096)
+            assert data == b"PINNED", data
+            assert client.requests, "应当发出一次请求"
+            url, headers, _ext = client.requests[0]
+            assert url == "http://93.184.216.34/f/a.docx", f"请求应钉到已校验 IP: {client.requests}"
+            assert headers.get("host") == "cdn.example.com", f"Host 头应保留原主机名: {headers}"
+        finally:
+            restore()
+            await plugin.on_unload()
+
+    asyncio.run(drive())
+
+
+def test_redirect_hop_is_pinned_to_its_own_validated_ip():
+    """重定向每一跳独立「校验 → 钉定」：第二跳连接的是它自己校验过的 IP。"""
+    module, plugin = _make_plugin()
+
+    def _two_hosts(host, port):
+        # 注意必须返回 **list**：validate 会迭代解析结果逐个判公网，返回字符串会被逐字符拆开
+        return {"cdn.example.com": ["93.184.216.34"], "mirror.example.com": ["8.8.4.4"]}[host]
+
+    async def drive():
+        await plugin.on_load()
+        restore = _patch_resolver(plugin, _two_hosts)
+        try:
+            plugin.config.reader.download_url_policy = "whitelist"
+            plugin.config.reader.download_allowed_hosts = "cdn.example.com,mirror.example.com"
+            plugin.config.reader.download_max_redirects = 2
+            client = _RecordingClient(
+                {
+                    "http://93.184.216.34/old": (302, {"location": "http://mirror.example.com/new"}, b""),
+                    "http://8.8.4.4/new": (200, {}, b"HOP2"),
+                }
+            )
+
+            async def factory():
+                return client
+
+            plugin._get_http_client = factory  # type: ignore[method-assign]
+            data = await plugin._download("http://cdn.example.com/old", 4096)
+            assert data == b"HOP2", data
+            urls = [u for u, _h, _e in client.requests]
+            assert urls == ["http://93.184.216.34/old", "http://8.8.4.4/new"], (
+                f"每一跳都应连各自校验过的 IP: {client.requests}"
+            )
+        finally:
+            restore()
+            await plugin.on_unload()
+
+    asyncio.run(drive())

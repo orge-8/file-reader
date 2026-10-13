@@ -204,6 +204,7 @@ def validate_download_target(
     allowed_hosts: Iterable[str] = (),
     allow_private_hosts: bool = False,
     resolver: Optional[Callable[[str, int], list[str]]] = None,
+    collect_ips: Optional[list[str]] = None,
 ) -> tuple[str, str]:
     """下载前校验目标 URL，返回 (原始 URL, 主机名)；不合规抛 _UrlRejectedError。
 
@@ -214,6 +215,10 @@ def validate_download_target(
       4. 解析主机 → **每个** IP 都必须是公网地址
 
     resolver 可注入（默认 system DNS），便于脱机单测模拟"域名合法但解析到内网"。
+
+    collect_ips（v1.2.1）：传入 list 时，校验通过后把本次依据的解析结果填进去，
+    供调用方把实际连接**钉定**在这些 IP 上——否则 httpx 连接时会再解析一次 DNS，
+    两次解析之间存在 DNS 重绑定窗口（校验看到公网 IP、连接时被换到内网 IP）。
     """
     raw = str(url or "").strip()
     if not raw:
@@ -262,6 +267,9 @@ def validate_download_target(
         if blocked:
             raise _UrlRejectedError("non_public_address", f"{host} → {','.join(blocked)}")
 
+    if collect_ips is not None:
+        collect_ips.extend(ips)
+
     return (raw, host)
 
 
@@ -273,6 +281,37 @@ def redact_url(url: str) -> str:
         return "(unparsable url)"
     tail = "?<已隐去>" if parts.query else ""
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", "")) + tail
+
+
+def build_pinned_request(url: str, host: str, ip: Optional[str]) -> tuple[str, dict[str, Any]]:
+    """把请求钉到已校验的 IP 上（v1.2.1 防 DNS 重绑定）。
+
+    validate_download_target 校验通过的 IP 经 collect_ips 带出后，用本函数生成
+    实际请求参数：URL 主机替换为 IP 字面量，连接不再触发第二次 DNS 解析；
+    同时：
+      - Host 头固定为原主机名（带非默认端口），虚拟主机路由不丢；
+      - https 附加 `sni_hostname` 扩展（httpcore 连 IP、按原主机名做 TLS），
+        证书校验仍针对原主机名，**不降级**；
+      - ip 为 None（policy=off 未解析，无从钉定）时原样返回，维持旧行为。
+
+    返回 (实际请求 URL, 传给 client.stream 的额外 kwargs)。
+    """
+    if not ip:
+        return url, {}
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return url, {}
+    scheme = (parts.scheme or "").lower()
+    netloc = f"[{ip}]" if ":" in ip else ip
+    if port:
+        netloc = f"{netloc}:{port}"
+    pinned = urlunsplit((scheme, netloc, parts.path, parts.query, ""))
+    req_extra: dict[str, Any] = {"headers": {"host": f"{host}:{port}" if port else host}}
+    if scheme == "https":
+        req_extra["extensions"] = {"sni_hostname": host}
+    return pinned, req_extra
 
 
 # ─── 配置模型 ────────────────────────────────────────────────────
@@ -383,7 +422,14 @@ class NapcatConfig(PluginConfigBase):
     http_url: str = Field(default="http://127.0.0.1:3001", description="NapCat OneBot HTTP 服务地址")
     access_token: str = Field(default="", description="NapCat HTTP access_token（未设置则留空）")
     timeout: float = Field(default=15.0, description="HTTP 请求超时（秒）")
-    verify_ssl: bool = Field(default=False, description="HTTPS 时校验证书（本地 http 无需开启）")
+    verify_ssl: bool = Field(
+        default=True,
+        description=(
+            "HTTPS 时校验证书与主机名（v1.2.1 起默认开启）。本地 http 地址不受影响；"
+            "自签证书请优先让系统信任该证书（或加入信任库），关闭此开关等于"
+            "允许中间人窃听/篡改与 NapCat 的全部通信（含 access_token），需自担风险"
+        ),
+    )
     cache_dir: str = Field(
         default="",
         description="可选：NapCat 文件缓存目录，get_file 失败时按文件名+大小在此目录搜索",
@@ -580,6 +626,16 @@ class FileReaderPlugin(MaiBotPlugin):
             if bool(self.config.reader.insecure_download):
                 risky.append(
                     "insecure_download=true（关闭 TLS 证书校验；建议改用 download_ca_bundle 指定代理根证书）"
+                )
+            # v1.2.1（review 项）：verify_ssl=false 在 http 场景无影响，但配了 https
+            # 地址时等于把证书与主机名校验一起关掉（CERT_NONE）。默认值已翻转为
+            # true，但存量实例的 config.toml 不会跟随新默认值——靠这条启动告警兜住。
+            napcat_url = str(self.config.napcat.http_url or "").strip()
+            if napcat_url.lower().startswith("https") and not bool(self.config.napcat.verify_ssl):
+                risky.append(
+                    "napcat.verify_ssl=false 且 napcat.http_url 为 HTTPS 地址"
+                    "（证书与主机名校验全部关闭，与 NapCat 的通信可被中间人窃听/篡改；"
+                    "如因自签证书报错，应让系统信任该证书而不是关校验）"
                 )
             if policy == DOWNLOAD_POLICY_WHITELIST and not hosts:
                 self.ctx.logger.warning(
@@ -1438,7 +1494,7 @@ class FileReaderPlugin(MaiBotPlugin):
         return self._http_client
 
     async def _download(self, url: str, max_bytes: int) -> Optional[bytes]:
-        """流式下载文件（v1.1.0 重写，v1.2.0 加 SSRF 防护 + 逐跳重定向）。
+        """流式下载文件（v1.1.0 重写，v1.2.0 加 SSRF 防护 + 逐跳重定向，v1.2.1 连接钉定）。
 
         v1.1.0 已解决的内存问题：Content-Length 预检 + 边下边累计，超限立即中断。
 
@@ -1449,6 +1505,19 @@ class FileReaderPlugin(MaiBotPlugin):
             169.254.169.254 也会在下一跳被拦下。
           - 失败原因全部落日志（含具体 host），但 URL 的 query 部分打码——
             QQ 文件链接的 query 里带下载凭据。
+
+        v1.2.1 新增（review SSRF 项）：**连接钉定，关闭 DNS 重绑定窗口**。
+        旧版校验时解析一次 DNS，把 URL 交给 httpx 后连接时会**再解析一次**——
+        两次解析之间域名可以换 IP：download_url_policy=public 时，攻击者自持
+        DNS 的域名能先解析到公网 IP 过检、连接时再解析回内网 IP。现在校验通过
+        的解析结果经 collect_ips 带出，实际请求直接连这些 IP（build_pinned_request：
+        Host 头/SNI/证书校验仍按原主机名），重定向每一跳独立「校验 → 钉定」。
+        policy=off 不解析也就无从钉定，维持旧行为按主机名连接。
+
+        连接细节：
+          - 多个已校验 IP 依次尝试，只有连接类错误（ConnectError/ConnectTimeout）
+            才换下一个，绝不重新解析 DNS；
+          - 阻塞的 getaddrinfo 挪进 asyncio.to_thread，不再卡事件循环。
 
         运行机器若存在 TLS MITM 代理（proxy-root-ca.cer），HTTPS 会报
         CERTIFICATE_VERIFY_FAILED；建议配 reader.download_ca_bundle 指向代理根证书
@@ -1472,49 +1541,83 @@ class FileReaderPlugin(MaiBotPlugin):
         try:
             client = await self._get_http_client()
             for hop in range(max_hops + 1):
-                # ① 每一跳都先校验目标（首跳=原始 URL，后续=上一跳的 Location）
-                target, host = validate_download_target(
+                # ① 每一跳都先校验目标（首跳=原始 URL，后续=上一跳的 Location），
+                #    校验依据的解析结果经 collect_ips 带出来，供 ② 钉定连接（v1.2.1）。
+                #    顺带：getaddrinfo 是阻塞调用，挪进线程池不再卡事件循环。
+                resolved: list[str] = []
+                target, host = await asyncio.to_thread(
+                    validate_download_target,
                     current,
                     policy=policy,
                     allowed_hosts=allowed_hosts,
                     allow_private_hosts=allow_private,
+                    collect_ips=resolved,
                 )
-                async with client.stream("GET", target) as resp:
-                    # ② 重定向：手动接管，绝不自动跟随
-                    if resp.is_redirect:
-                        location = resp.headers.get("location")
-                        if not location:
-                            self.ctx.logger.warning(
-                                "[下载拒绝] %s 返回 %s 但没有 Location 头", host, resp.status_code
-                            )
-                            return None
-                        if hop >= max_hops:
-                            self.ctx.logger.warning(
-                                "[下载拒绝] 重定向超过 %d 跳（最后一跳 %s → %s）",
-                                max_hops,
-                                host,
-                                redact_url(location),
-                            )
-                            return None
-                        # 相对 Location 按当前 URL 解析为绝对地址，供下一轮重新校验
-                        current = urljoin(target, location)
-                        self.ctx.logger.info(
-                            "[下载] 第 %d 跳重定向：%s → %s", hop + 1, host, redact_url(current)
-                        )
+                # ② 连接钉定（v1.2.1 防 DNS 重绑定）：只连上面已通过校验的 IP，
+                #    httpx 连接时不再二次解析。多个已校验 IP 依次尝试，**只有连接类
+                #    错误才换下一个，绝不重新解析 DNS**。resolved 为空（policy=off
+                #    不解析，无从钉定）时保持旧行为按主机名连接。
+                candidate_ips: list[Optional[str]] = list(resolved) or [None]
+                next_url: Optional[str] = None
+                result: Optional[bytes] = None
+                connect_err: Optional[Exception] = None
+                for ip in candidate_ips:
+                    req_url, req_extra = build_pinned_request(target, host, ip)
+                    try:
+                        async with client.stream("GET", req_url, **req_extra) as resp:
+                            # ③ 重定向：手动接管，绝不自动跟随
+                            if resp.is_redirect:
+                                location = resp.headers.get("location")
+                                if not location:
+                                    self.ctx.logger.warning(
+                                        "[下载拒绝] %s 返回 %s 但没有 Location 头", host, resp.status_code
+                                    )
+                                    return None
+                                if hop >= max_hops:
+                                    self.ctx.logger.warning(
+                                        "[下载拒绝] 重定向超过 %d 跳（最后一跳 %s → %s）",
+                                        max_hops,
+                                        host,
+                                        redact_url(location),
+                                    )
+                                    return None
+                                # 相对 Location 按当前 URL 解析为绝对地址，供下一轮重新校验
+                                next_url = urljoin(target, location)
+                                self.ctx.logger.info(
+                                    "[下载] 第 %d 跳重定向：%s → %s", hop + 1, host, redact_url(next_url)
+                                )
+                                break
+                            resp.raise_for_status()
+                            # ④ 预检：Content-Length 已超限直接中断（不必开始下载）
+                            cl = resp.headers.get("content-length")
+                            if cl and cl.isdigit() and int(cl) > max_bytes:
+                                raise _DownloadTooLargeError(float(cl))
+                            chunks: list[bytes] = []
+                            total = 0
+                            async for chunk in resp.aiter_bytes(65536):
+                                total += len(chunk)
+                                if total > max_bytes:
+                                    raise _DownloadTooLargeError(float(total))
+                                chunks.append(chunk)
+                            result = b"".join(chunks)
+                            break
+                    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                        # 连接类错误才换下一个已校验 IP；读流/状态码/体积异常不在此列
+                        connect_err = e
                         continue
-                    resp.raise_for_status()
-                    # ③ 预检：Content-Length 已超限直接中断（不必开始下载）
-                    cl = resp.headers.get("content-length")
-                    if cl and cl.isdigit() and int(cl) > max_bytes:
-                        raise _DownloadTooLargeError(float(cl))
-                    chunks: list[bytes] = []
-                    total = 0
-                    async for chunk in resp.aiter_bytes(65536):
-                        total += len(chunk)
-                        if total > max_bytes:
-                            raise _DownloadTooLargeError(float(total))
-                        chunks.append(chunk)
-                    return b"".join(chunks)
+                else:
+                    self.ctx.logger.error(
+                        "下载 %s 失败：%d 个已校验地址均连接失败（%s: %s）",
+                        redact_url(target),
+                        len(candidate_ips),
+                        type(connect_err).__name__ if connect_err else "-",
+                        connect_err or "",
+                    )
+                    return None
+                if next_url is not None:
+                    current = next_url
+                    continue
+                return result
             return None
         except _DownloadTooLargeError:
             raise
@@ -1965,16 +2068,29 @@ class FileReaderPlugin(MaiBotPlugin):
         return True, text, 2
 
     # ─── Tool：手动查询文件内容（供 LLM 主动调用） ────────────────
+    def _has_any_file_session(self) -> bool:
+        """是否存在任何存有文件的会话（仅用于区分报错文案，不暴露会话信息）。"""
+        return any(candidate.files for candidate in self._store._sessions.values())
+
     def _resolve_tool_session(self, session_id: str) -> tuple[Optional[Any], str]:
         """工具调用的会话兜底解析。
 
         真机 18:51 日志教训：Planner 调 search_file 时首次传 session_id=''、
         之后干脆不传——文件 18:51:30 已入库，工具却三次误报「没有文件」。
-        不能指望 LLM 每次都传对 session_id，规则：
+        不能指望 LLM 每次都传对 session_id。规则（v1.2.1 收紧）：
         1) 显式 session_id 且该会话有文件 → 直接用；
-        2) 否则回退「最近有文件入库的会话」（单会话场景必命中，
-           多会话取最近一次文件上传的）。
-        返回 (VectorStore 或 None, 实际采用的 session_id)。
+        2) 否则**仅在全局只有一个会话存有文件时**回退到该会话（单会话场景必命中，
+           v1.0.15 的真机问题不回退）；
+        3) 多个会话都有文件、而本次调用未指明或指错了 session_id → **拒绝兜底**。
+
+        v1.2.1 收紧原因（市场 review 隐私项）：旧版兜底是「最近有文件入库的会话」，
+        多人群场景下 Planner 不传 session_id 时，会把 A 会话上传的文件正文塞进
+        B 会话的 LLM 上下文——真机日志证明 Planner 确实经常不传该参数，不是纸上
+        风险。工具调用链路拿不到当前消息所在的 stream/chat，无法做会话归属校验，
+        所以歧义时宁可如实报告并提示补传 session_id（fail-closed），不猜。
+        hook 侧 inject_file_context 做的是精确匹配注入，不受本问题影响。
+
+        返回 (VectorStore 或 None, 实际采用的 session_id)；None = 没有可用的会话。
 
         v1.0.16 教训：本方法曾插在 @Tool 装饰器与 search_file 定义之间，
         导致 @Tool 把 _resolve_tool_session 注册成了工具本体（真机报
@@ -1985,29 +2101,43 @@ class FileReaderPlugin(MaiBotPlugin):
             for (sid, _cid), candidate in self._store._sessions.items():
                 if sid == session_id and candidate.files:
                     return candidate, session_id
-        best: Optional[Any] = None
-        best_ts = -1.0
-        best_sid = ""
+        # 兜底候选：按 sid 聚合「存有文件」的会话
+        sessions_with_files: dict[str, list[Any]] = {}
         for (sid, _cid), candidate in self._store._sessions.items():
-            if not candidate.files:
-                continue
-            latest = max(e.upload_time for e in candidate.files.values())
-            if latest > best_ts:
-                best_ts = latest
-                best = candidate
-                best_sid = sid
-        if best is not None and session_id and session_id != best_sid:
-            self.ctx.logger.info(
-                "search_file 传入 session_id=%s 无文件，回退到最近入库会话 %s", session_id, best_sid
+            if candidate.files:
+                sessions_with_files.setdefault(sid, []).append(candidate)
+        if not sessions_with_files:
+            return None, ""
+        if len(sessions_with_files) > 1:
+            # 隐私护栏：没有可靠依据判断调用方在哪个会话，回退「最近入库」
+            # 等于把别的会话的文件喂给当前调用方——拒绝并留痕（审计可查）。
+            self.ctx.logger.warning(
+                "search_file 会话兜底被拒：%d 个会话存有已入库文件且本次调用未指明有效 "
+                "session_id，按会话隔离原则不做跨会话回退",
+                len(sessions_with_files),
             )
-        return best, best_sid
+            return None, ""
+        the_sid, stores = next(iter(sessions_with_files.items()))
+        best = max(stores, key=lambda s: max(e.upload_time for e in s.files.values()))
+        if session_id and session_id != the_sid:
+            self.ctx.logger.info(
+                "search_file 传入 session_id=%s 无文件，回退到唯一存有文件的会话 %s",
+                session_id,
+                the_sid,
+            )
+        else:
+            self.ctx.logger.info(
+                "search_file 未收到（有效）session_id，回退到唯一存有文件的会话 %s", the_sid
+            )
+        return best, the_sid
 
     @Tool(
         "search_file",
         description=(
             "在当前会话已上传的文件中检索与问题相关的片段。"
             "当用户上传过文件（PDF/Word/Excel/PPT/代码等）或询问文件内容时调用；"
-            "session_id 可留空，会自动定位最近上传文件的会话。"
+            "仅当只有一个会话存有文件时 session_id 才可留空（自动定位该会话），"
+            "多个会话都有文件时必须传入当前会话的 session_id，否则会拒绝检索以防跨会话串扰。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -2019,7 +2149,10 @@ class FileReaderPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="session_id",
                 param_type=ToolParamType.STRING,
-                description="当前会话 ID（可选，留空时自动定位最近上传文件的会话）",
+                description=(
+                    "当前会话 ID。多个会话存有文件时必传；留空时仅在唯一会话有文件的"
+                    "情况下才会自动定位"
+                ),
                 required=False,
             ),
         ],
@@ -2031,6 +2164,25 @@ class FileReaderPlugin(MaiBotPlugin):
             return {"content": "请提供要检索的问题。"}
         vs, resolved_sid = self._resolve_tool_session(str(session_id or ""))
         if vs is None or not vs.files:
+            # v1.2.1：区分「确实没有文件」与「有文件但拒绝跨会话兜底」，
+            # 给 LLM 可执行的指引（补传 session_id），而不是含糊的"没有文件"。
+            if self._has_any_file_session():
+                if str(session_id or ""):
+                    return {
+                        "content": (
+                            f"会话 {session_id} 下没有已入库的文件。"
+                            "其他会话存有的文件出于会话隔离不会返回；"
+                            "如需检索当前会话的文件，请确认 session_id 是否正确后重试。"
+                        )
+                    }
+                return {
+                    "content": (
+                        "无法确定要检索哪个会话：本插件有多个会话存有已入库文件，"
+                        "而本次调用未提供 session_id。为避免把其他会话的文件内容错误地"
+                        "带入当前对话，本次不做自动定位；请带上当前会话的 session_id "
+                        "重新调用 search_file。"
+                    )
+                }
             return {"content": "当前会话还没有已入库的文件，请先上传文件。"}
 
         # 直注路径（v1.0.14）：小文件直接返回全文，不检索
