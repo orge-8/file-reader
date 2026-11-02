@@ -25,6 +25,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Iterable, Optional
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -53,13 +54,19 @@ from maibot_sdk.types import (  # noqa: E402
 )
 
 from chunker import RecursiveCharacterChunker  # noqa: E402
-from file_parser import describe_supported_types, read_any_file_to_text  # noqa: E402
+from file_parser import describe_supported_types, get_extension, read_any_file_to_text  # noqa: E402
+from lexical_index import apply_relevance_gate, rrf_fuse  # noqa: E402
 from vector_store import SessionStore  # noqa: E402
 
 # v1.1.0：降级文本解析正则提到模块级预编译（每次 hook 现编译是无谓开销）
 _RE_HINT_URL = re.compile(r"链接[:：]\s*(https?://\S+)")
+# v1.3.1：不再用 `\s*[，,]?\s*$` 收尾。Host 1.3.16 起 `[文件]` 纯文本尾部会追加
+# `类型: mime` / `file_ref: xxx`，旧式 `$` 锚定会让 `.+?` 一路吃到行尾，把
+# `附件，大小: 15397，file_ref: 5a1b…` 整串当成文件名（真机实测：扩展名丢失 ⇒
+# 解析器按扩展名分派直接拒收）。改为「名字不含逗号 + 可选大小组 + 其余尾巴一律忽略」。
+# 代价：文件名自身含中文/英文逗号时会被截断（历史版本同样处理不了，非回归）。
 _RE_HINT_NAME = re.compile(
-    r"\[文件\]\s*(?P<name>.+?)(?:\s*[，,]\s*大小[:：]\s*(?P<size>\d+))?\s*[，,]?\s*$"
+    r"\[文件\]\s*(?P<name>[^，,]+?)(?:\s*[，,]\s*大小[:：]\s*(?P<size>\d+))?(?:\s*[，,].*)?$"
 )
 
 
@@ -323,7 +330,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.0.0", description="配置版本")
+    config_version: str = Field(default="1.1.0", description="配置版本（v1.3.0 从 1.0.0 升到 1.1.0：新增混合检索/生命周期/回执三类配置项，不升版这些键不会出现在已部署实例的 config.toml 里）")
 
 
 class ReaderConfig(PluginConfigBase):
@@ -339,8 +346,9 @@ class ReaderConfig(PluginConfigBase):
     chunk_merge_enabled: bool = Field(default=True, description="短碎片合并（v1.0.18 性能优化）：递归切分出的相邻短碎片合并到接近 chunk_size 再成块，块数降至约 1/3，入库向量化耗时同步下降；关闭则回退旧的逐碎片成块行为")
     retrieve_top_k: int = Field(default=6, description="检索返回的相关块数量")
     retrieve_use_matrix: bool = Field(default=True, description="矩阵化检索（v1.0.18 性能优化）：缓存 L2 归一化向量矩阵，查询时一次点积算全库相似度（入库/清理/删文件自动置脏重建）；块数多时检索开销显著下降，结果与逐条余弦一致；异常自动回退旧路径")
-    file_retention_time: int = Field(default=60, description="文件有效时间（分钟）")
-    file_max_rounds: int = Field(default=5, description="文件最大参与轮数")
+    file_retention_time: int = Field(default=60, description="文件有效时间（分钟，自**最后一次被注入**起算，v1.3.0 起为滑动续期）")
+    file_max_rounds: int = Field(default=20, description="文件最大参与轮数（v1.3.0：5→20；只给实际被注入的文件计轮）")
+    file_absolute_ttl: int = Field(default=720, description="文件绝对存活上限（分钟，自入库起算）：无论是否被问到，超过即清理，防文件永久驻留；0 = 不限制")
     cleanup_interval: int = Field(default=5, description="后台清理间隔（分钟）：清理过期文件、回收空会话向量库、裁剪概要冷却表")
     enable_group: bool = Field(default=True, description="是否处理群聊文件")
     download_url_policy: str = Field(
@@ -401,6 +409,17 @@ class ReaderConfig(PluginConfigBase):
     summary_max_chars: int = Field(default=500, description="概要文本的最大长度（字符数）")
     summary_await_on_inject: bool = Field(default=False, description="提问注入时是否同步等待概要生成（v1.0.17 旧行为）：概要缺失时同步调用 llm.generate 会把 BLOCKING hook 卡住数秒；默认 false = 缺失时立即用已有内容检索注入，概要在后台生成、下次提问自然带上")
     summary_retry_interval: float = Field(default=600.0, description="概要生成失败后的冷却秒数：冷却期内不再尝试生成（避免每次提问都撞一次超时）；0 = 不冷却（每次注入都重试）")
+    # ── v1.3.0 混合检索（向量 + BM25，RRF 融合） ──
+    hybrid_retrieve_enabled: bool = Field(default=True, description="BM25 词法检索总开关（v1.3.0）：开启后检索走「向量 + 词法 RRF 融合」，对函数名/报错码/编号这类字面查询显著更准；体感变差可关闭退回纯向量，也可用 /file_bm25 off 运行期关闭")
+    hybrid_candidate_k: int = Field(default=20, description="每路（向量/词法）参与融合的候选数")
+    rrf_k: int = Field(default=60, description="RRF 融合常数（越大排名差异越平缓）")
+    lexical_max_tokens: int = Field(default=2000000, description="单会话词法索引 token 上限：超过即停用该会话的词法检索并退回纯向量（防大文件会话内存膨胀）；0 = 不限制")
+    retrieve_min_score: float = Field(default=0.15, description="向量相关度绝对下限：余弦低于此值的候选在融合前丢弃（只作用于有向量分的候选，纯词法命中不受影响）；0 = 关闭")
+    retrieve_min_ratio: float = Field(default=0.5, description="融合后相对下限：低于 Top1 分数该比例的结果丢弃；0 = 关闭")
+    query_rewrite_enabled: bool = Field(default=True, description="追问改写（v1.3.0）：「那第三章呢」这类指代/短问补回上一问再检索；纯规则实现，不调 LLM（BLOCKING hook 只有 11s 预算）")
+    # ── v1.3.0 生命周期与回执 ──
+    ack_min_chars: int = Field(default=20000, description="大文件入库回执阈值（原文字符数）：达到该值（或处理耗时 ≥ 10s）时发一条中性回执「已读取《X》，共 N 段」，避免用户以为插件没反应；0 = 不发回执")
+    parse_notice_ttl: int = Field(default=600, description="解析失败通知的存活秒数（v1.3.0）：失败原因注入给模型（不发群消息），TTL 内只注入一次")
 
 
 class NapcatConfig(PluginConfigBase):
@@ -499,6 +518,16 @@ class FileReaderPlugin(MaiBotPlugin):
         # v1.1.0：NapCat urllib SSL 上下文缓存（create_default_context 是 ms 级 CPU 调用）
         self._napcat_ssl_ctx: Optional[ssl.SSLContext] = None
         self._napcat_ssl_verify: bool = False
+        # v1.3.0：检索诊断环形缓冲（每会话最近 20 条）——没有 recall@k 评测集时，
+        # 这是唯一能回答「为什么没检索到」的可观测窗口
+        self._retrieval_diag: deque = deque(maxlen=20)
+        # v1.3.0：解析失败通知队列 session_id -> [{name, reason, ts, delivered}]
+        # 失败只告诉模型、不刷群；注入一次即标记 delivered
+        self._file_notices: dict[str, list[dict]] = {}
+        # v1.3.0：BM25 运行期开关（None = 跟随配置；True/False = /file_bm25 强制覆盖）
+        # 为什么需要在代码层再留一道：已部署实例的 config.toml 不会自动补新键，
+        # 只改 Field(default) 对老实例完全无效，体感变差时必须有立刻可用的退路
+        self._hybrid_override: Optional[bool] = None
 
         # 行为自检：确认 chunker / 解析器在进程内可用（runtime-gotchas 5.1 的对策）
         self._run_self_check()
@@ -560,7 +589,6 @@ class FileReaderPlugin(MaiBotPlugin):
                 except OSError:
                     pass
         self._embed_retry_queue = []
-        self._store.save_meta()
         self.ctx.logger.info("文件读取插件已卸载")
 
     def _spawn_bg(self, coro: Any) -> None:
@@ -1106,6 +1134,21 @@ class FileReaderPlugin(MaiBotPlugin):
             return {"name": str(name), "path": str(path)}
         if url:
             return {"name": str(name), "url": str(url)}
+        # v1.3.2：结构化 file 段（SnowLuma Adapter v1.1.10+）只有 file_id/name/size/busid，
+        # **没有任何内容字段**。旧版在这里返回 None，整段被丢弃并打 warning，只能退到
+        # `[文件]` 文本 → `get_msg` 回溯：多一次 RPC，且定位依赖 size 消歧（同名同大小就串档）。
+        # 直接把 file_id 交出去，`_handle_file` 用 `get_file` 一步就能取到本地路径。
+        file_id = seg.get("file_id") or seg.get("id")
+        if file_id:
+            try:
+                size_hint = int(str(seg.get("size") or seg.get("file_size") or 0).strip())
+            except (TypeError, ValueError):
+                size_hint = 0
+            try:
+                busid = int(str(seg.get("busid") or 0).strip())
+            except (TypeError, ValueError):
+                busid = 0
+            return {"name": str(name), "file_id": str(file_id), "busid": busid, "size_hint": size_hint}
         # 无可用内容
         return None
 
@@ -1170,9 +1213,12 @@ class FileReaderPlugin(MaiBotPlugin):
             self.config.reader.retrieve_top_k,
             chunk_merge=bool(self.config.reader.chunk_merge_enabled),
             retrieve_use_matrix=bool(self.config.reader.retrieve_use_matrix),
+            lexical_max_tokens=int(self.config.reader.lexical_max_tokens or 0),
         )
         tmp_path: Optional[str] = None
         queued_for_retry = False  # v1.1.0：入队后临时文件归重试队列持有，finally 不再删
+        started_at = time.time()  # v1.3.0：大文件回执要用到处理耗时
+        napcat_path: Optional[str] = None  # v1.3.1：NapCat 命中的真实路径，用于回填文件名
         # 大小上限提前算好：下载路径在下载前/下载中就要用它做预检（v1.1.0）
         max_bytes = self.config.reader.max_file_size * 1024 * 1024
         try:
@@ -1188,7 +1234,7 @@ class FileReaderPlugin(MaiBotPlugin):
                     await self._reply_error(
                         stream_id,
                         f"⚠️ 文件「{name}」大小约 {e.size_mb:.1f}MB 超过上限 {self.config.reader.max_file_size}MB，已跳过。",
-                        reason="too_large",
+                        reason="too_large", session_id=session_id, file_name=name,
                     )
                     return
                 except _UrlRejectedError as e:
@@ -1197,9 +1243,15 @@ class FileReaderPlugin(MaiBotPlugin):
                     await self._reply_error(
                         stream_id,
                         self._reject_reply_text(name, e),
-                        reason=f"url_rejected:{e.reason}",
+                        reason=f"url_rejected:{e.reason}", session_id=session_id, file_name=name,
                     )
                     return
+            if raw_bytes is None and fdata.get("file_id") and self.config.napcat.enabled:
+                # v1.3.2：结构化 file 段直通（SnowLuma v1.1.10+）。段里只有 file_id，
+                # 直接用 `get_file` 取路径，省掉 `get_msg` 回溯，也不依赖 size 消歧。
+                napcat_path = await asyncio.to_thread(self._napcat_resolve_path, fdata)
+                if napcat_path:
+                    raw_bytes = await asyncio.to_thread(Path(str(napcat_path)).read_bytes)
             if raw_bytes is None and fdata.get("napcat_message_id"):
                 # 适配器降级形态：拿 message_id 回头找 NapCat 要原始文件
                 if not self.config.napcat.enabled:
@@ -1207,25 +1259,25 @@ class FileReaderPlugin(MaiBotPlugin):
                         stream_id,
                         f"⚠️ 文件「{name}」读不到内容：适配器把文件降级成了纯文本，"
                         "请在插件配置里启用「NapCat 兜底」并填好 HTTP 地址与 token。",
-                        reason="napcat_disabled",
+                        reason="napcat_disabled", session_id=session_id, file_name=name,
                     )
                     return
                 raw_bytes, napcat_path = await asyncio.to_thread(self._resolve_via_napcat, fdata)
                 if raw_bytes is None and napcat_path:
                     raw_bytes = await asyncio.to_thread(Path(str(napcat_path)).read_bytes)
             if raw_bytes is None:
-                if fdata.get("napcat_message_id"):
+                if fdata.get("napcat_message_id") or fdata.get("file_id"):
                     await self._reply_error(
                         stream_id,
                         f"⚠️ 文件「{name}」无法读取：NapCat 未返回文件内容"
-                        "（检查 HTTP 服务/token/message_id 是否对得上，或配置 cache_dir）。",
-                        reason="napcat_no_content",
+                        "（检查 HTTP 服务/token/message_id/file_id 是否对得上，或配置 cache_dir）。",
+                        reason="napcat_no_content", session_id=session_id, file_name=name,
                     )
                 else:
                     await self._reply_error(
                         stream_id,
                         f"⚠️ 文件「{name}」无法读取：消息里没有文件内容，也没有可用于回溯的 message_id。",
-                        reason="no_content",
+                        reason="no_content", session_id=session_id, file_name=name,
                     )
                 return
 
@@ -1234,9 +1286,22 @@ class FileReaderPlugin(MaiBotPlugin):
                 await self._reply_error(
                     stream_id,
                     f"⚠️ 文件「{name}」大小 {len(raw_bytes) / 1024 / 1024:.1f}MB 超过上限 {self.config.reader.max_file_size}MB，已跳过。",
-                    reason="too_large",
+                    reason="too_large", session_id=session_id, file_name=name,
                 )
                 return
+
+            # v1.3.1：文件名回填（真机 11-02 21:26 故障）。SnowLuma 适配器 v1.1.10 起把
+            # file 段转成结构化 {name,size,file_id,busid}，而 NapCat 私聊 file 段只有
+            # `file`（真实文件名）没有 `name` ⇒ 适配器落到占位符「附件」；再叠加
+            # Host 1.3.16+ 文本尾部带 `file_ref`，降级解析还会整行吞名。两条路径都会让
+            # 扩展名为空，解析器按扩展名分派直接拒收（"不支持的文件类型: .(无扩展名)"）。
+            # 但 NapCat `get_file` 已返回带真实文件名的路径，用它的 basename 回填最准，
+            # 同时让入库索引 / 回执 / 后续检索都显示真名。
+            if napcat_path:
+                real_name = Path(str(napcat_path)).name
+                if real_name and not get_extension(name) and get_extension(real_name):
+                    self.ctx.logger.info("[napcat] 文件名回填: %r → %r", name, real_name)
+                    name = real_name
 
             # 写临时文件
             suffix = Path(name).suffix or ""
@@ -1277,19 +1342,34 @@ class FileReaderPlugin(MaiBotPlugin):
                 self._ensure_summary_async(entry)
             # v1.0.18 C3：文件变动必须失效注入缓存，否则同一问题会复用旧文件的注入内容
             self._memo_invalidate_session(session_id)
+            # v1.3.0：同名文件这次读成功了，清掉之前留下的失败通知
+            self._clear_notices(session_id, name)
+            # v1.3.0 大文件回执：入库耗时动辄几十秒，全程静默会让用户以为插件没反应。
+            # 只在「真的大」或「真的慢」时发一条中性回执，小文件依旧完全静默。
+            try:
+                ack_min = int(self.config.reader.ack_min_chars or 0)
+            except (TypeError, ValueError):
+                ack_min = 0
+            elapsed = time.time() - started_at
+            if ack_min > 0 and stream_id and (entry.total_chars() >= ack_min or elapsed >= 10.0):
+                await self._reply(stream_id, f"已读取《{name}》，共 {len(entry.chunks)} 段")
             if not self.config.reader.silent_success:
                 await self._reply(
                     stream_id,
                     f"📄 已解析「{name}」，切成 {len(entry.chunks)} 块并向量化。现在可以直接问我文件内容了。",
                 )
         except ValueError as e:
-            await self._reply_error(stream_id, f"⚠️ {e}", reason="value_error")
+            await self._reply_error(stream_id, f"⚠️ {e}", reason="value_error", session_id=session_id, file_name=name)
         except RuntimeError as e:
-            await self._reply_error(stream_id, f"⚠️ {e}", reason="runtime_error")
+            await self._reply_error(stream_id, f"⚠️ {e}", reason="runtime_error", session_id=session_id, file_name=name)
         except Exception as e:  # noqa: BLE001
             self.ctx.logger.error("处理文件 %s 失败: %s", name, e, exc_info=True)
             await self._reply_error(
-                stream_id, f"⚠️ 处理文件「{name}」失败：{type(e).__name__}", reason="exception"
+                stream_id,
+                f"⚠️ 处理文件「{name}」失败：{type(e).__name__}",
+                reason="exception",
+                session_id=session_id,
+                file_name=name,
             )
         finally:
             if tmp_path and not queued_for_retry:
@@ -1372,21 +1452,88 @@ class FileReaderPlugin(MaiBotPlugin):
         return None
 
     @staticmethod
-    def _pick_onebot_file_seg(msg_data: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """从原始事件的 message 段数组里找 file 段（OneBot 形态：{type, data:{...}}）。"""
+    def _pick_onebot_file_segs(msg_data: dict[str, Any]) -> list[dict[str, Any]]:
+        """从原始事件的 message 段数组里取出**全部** file 段（OneBot：{type, data:{...}}）。
+
+        v1.3.0：旧版 `_pick_onebot_file_seg` 只返回第一个 file 段。防抖合并后 N 条
+        `[文件]` 提示共用同一个 message_id（消息体里却是 N 个 file 段），于是 N 个
+        文件全被读成第一个文件的内容、再按各自文件名分别入库——静默串档，且污染检索
+        （库里会出现 N 份「同一份内容 + N 个不同文件名」）。
+        """
         segs = msg_data.get("message")
         if isinstance(msg_data.get("data"), dict) and "message" in msg_data["data"]:
             segs = msg_data["data"]["message"]
         if not isinstance(segs, list):
-            return None
+            return []
+        out: list[dict[str, Any]] = []
         for seg in segs:
             if not isinstance(seg, dict):
                 continue
             if str(seg.get("type", "")).lower() != "file":
                 continue
             data = seg.get("data")
-            return data if isinstance(data, dict) else seg
-        return None
+            out.append(data if isinstance(data, dict) else seg)
+        return out
+
+    @staticmethod
+    def _match_file_seg(
+        segs: list[dict[str, Any]], name: str, size_hint: int = 0
+    ) -> tuple[Optional[dict[str, Any]], str]:
+        """在多个 file 段里挑出与 (文件名, 大小) 对应的那一个。
+
+        返回 `(段, 匹配方式)`，匹配方式 ∈ {name, ambiguous, fallback, none}，
+        由调用方打日志。串档是**静默故障**——不把匹配方式打出来，真机上根本无从排查。
+
+        匹配规则：
+          1. `size_hint` 与段的 `file_size` 都存在且不等 → 排除该段（同名文件靠大小消歧）；
+          2. 文件名按 `Path(x).name.lower()` 精确比较（段里可能是带路径的名字）；
+             候选字段依次取 `file_name` / `name` / `file` / `title`（适配器命名不统一）；
+          3. 唯一命中 → `name`；多个命中 → 取第一个并标 `ambiguous`；
+          4. 名字全未命中但 `size_hint` 唯一命中一个段 → 采用并标 `size`
+             （v1.3.1：适配器占位名「附件」的场景靠这条消歧）；
+          5. 仍无解 → 回退第一个并标 `fallback`（保留旧行为，但可观测）。
+        """
+        if not segs:
+            return None, "none"
+        target = Path(str(name or "")).name.lower()
+        try:
+            hint = int(size_hint or 0)
+        except (TypeError, ValueError):
+            hint = 0
+
+        hits: list[dict[str, Any]] = []
+        sized: list[dict[str, Any]] = []  # 通过 size 过滤的候选（v1.3.1：占位名的消歧依据）
+        for seg in segs:
+            if not isinstance(seg, dict):
+                continue
+            try:
+                seg_size = int(seg.get("file_size") or seg.get("size") or 0)
+            except (TypeError, ValueError):
+                seg_size = 0
+            if hint > 0 and seg_size > 0 and seg_size != hint:
+                continue
+            sized.append(seg)
+            if not target:
+                hits.append(seg)
+                continue
+            for key in ("file_name", "name", "file", "title"):
+                cand = seg.get(key)
+                if not cand:
+                    continue
+                if Path(str(cand)).name.lower() == target:
+                    hits.append(seg)
+                    break
+        if not hits:
+            # v1.3.1：占位名（SnowLuma 把没有 name 的 file 段兜底成「附件」）永远匹配不上
+            # 段内真实文件名，但 size_hint 通常能唯一锁定那一个段 —— 直接采用并标 `size`。
+            # 不这么做的话：单文件消息每次文件都打 fallback WARNING（噪音），
+            # 多文件消息则退回「取第一个」而可能串档。
+            if hint > 0 and len(sized) == 1:
+                return sized[0], "size"
+            return segs[0], "fallback"
+        if len(hits) > 1:
+            return hits[0], "ambiguous"
+        return hits[0], "name"
 
     def _napcat_resolve_path(self, file_seg: dict[str, Any]) -> Optional[str]:
         """file 段 → 本地路径：优先 get_file(file_id)，退化到段内路径。"""
@@ -1431,7 +1578,8 @@ class FileReaderPlugin(MaiBotPlugin):
         name = str(fdata.get("name", ""))
         size_hint = int(fdata.get("size_hint") or 0)
         msg_data = self._napcat_get_msg(fdata.get("napcat_message_id"))
-        file_seg = self._pick_onebot_file_seg(msg_data) if isinstance(msg_data, dict) else None
+        segs = self._pick_onebot_file_segs(msg_data) if isinstance(msg_data, dict) else []
+        file_seg, match_mode = self._match_file_seg(segs, name, size_hint)
         if file_seg is None:
             self.ctx.logger.error(
                 "[napcat] 原始事件里没有 file 段: message_id=%r data_keys=%s",
@@ -1441,6 +1589,15 @@ class FileReaderPlugin(MaiBotPlugin):
             # 原始事件都翻不到时，退到缓存目录
             path = self._search_cache_dir(name, size_hint)
             return (None, path)
+        # v1.3.0：匹配方式必须可见。取错段是静默串档——只在 fallback/ambiguous 时报 WARNING，
+        # 正常命中（name / v1.3.1 新增的 size 消歧）走 INFO，避免日志噪音淹没真正的异常。
+        log_fn = self.ctx.logger.info if match_mode in ("name", "size") else self.ctx.logger.warning
+        log_fn(
+            "[napcat] 文件段匹配: name=%s mode=%s segs=%d",
+            name,
+            match_mode,
+            len(segs),
+        )
         b64 = file_seg.get("base64")
         if b64:
             try:
@@ -1660,11 +1817,41 @@ class FileReaderPlugin(MaiBotPlugin):
         except Exception as e:  # noqa: BLE001
             self.ctx.logger.error("回执发送失败: %s", e)
 
-    async def _reply_error(self, stream_id: str, text: str, *, reason: str) -> None:
+    #: reason → 面向模型的失败原因（v1.3.0：失败要能被模型说清楚，而不是只进日志）
+    _REASON_TEXT = {
+        "too_large": "文件超过大小上限",
+        "napcat_disabled": "适配器把文件降级成了纯文本，且未启用 NapCat 兜底",
+        "napcat_no_content": "NapCat 未返回文件内容",
+        "no_content": "消息里没有文件内容",
+        "embed_failed": "向量化失败",
+        "exception": "处理过程异常",
+    }
+
+    async def _reply_error(
+        self,
+        stream_id: str,
+        text: str,
+        *,
+        reason: str,
+        session_id: str = "",
+        file_name: str = "",
+    ) -> None:
         """错误回执收口（v1.0.20）：silent_errors 开启时只写日志不发群，
-        避免批量发文件时 ⚠️ 刷屏；日志带 reason 便于 /file_status 排查。"""
+        避免批量发文件时 ⚠️ 刷屏；日志带 reason 便于 /file_status 排查。
+
+        v1.3.0：静默模式下失败**仍然要登记模型通知**——旧版失败只写日志，
+        用户和模型都不知道发生过什么，用户追问时模型只能凭空猜。
+        """
         self.ctx.logger.warning("文件处理失败（silent_errors=%s）: %s | %s",
                                 bool(self.config.reader.silent_errors), reason, text)
+        if session_id and file_name and bool(self.config.reader.silent_errors):
+            detail = self._REASON_TEXT.get(reason, "")
+            if reason.startswith("url_rejected"):
+                detail = f"下载被安全策略拒绝（{reason.split(':', 1)[-1]}）"
+            elif not detail:
+                # value_error / runtime_error 的 text 本身就是「⚠️ 具体原因」
+                detail = str(text).lstrip("⚠️ ").strip() or "读取失败"
+            self._add_notice(session_id, file_name, detail)
         if not bool(self.config.reader.silent_errors):
             await self._reply(stream_id, text)
 
@@ -1701,22 +1888,41 @@ class FileReaderPlugin(MaiBotPlugin):
         for key in [k for k in self._inject_memo if k[0] == session_id]:
             self._inject_memo.pop(key, None)
 
-    def _tick_rounds_once(self, vs: Any, query_key: str = "") -> None:
-        """轮数去重（v1.0.18 C3）：同一问题文本在 120s 窗口内只给文件 +1 轮。
+    def _tick_rounds_once(
+        self,
+        vs: Any,
+        query_key: str = "",
+        session_id: str = "",
+        file_names: Optional[list] = None,
+    ) -> bool:
+        """轮数去重（v1.0.18 C3，v1.3.0 修订）：同一会话同一问题在 120s 窗口内只计一轮。
 
-        旧逻辑 hook 与 tool 各 +1、且每次 attempt 都 +1，5 轮配额实际 2-3 轮就用光，
-        文件提前过期 → 用户重发 → 重新 embedding。这里用与 memo 同形的小缓存去重。
+        返回是否真的计了一轮。
+
+        v1.3.0 两处修正：
+          - key 加入 `session_id`：旧 key 不含会话，A 会话问过「总结一下」之后 B
+            会话问同样的话会被误判成"本轮已计数"，轮数不再增长（表现为文件永不过期）；
+          - 只给 `file_names` 里的文件计轮：旧版给会话内**所有**文件 +1，没被问到
+            的文件也跟着提前过期。
+
+        旧逻辑的问题（v1.0.18 已修一半）：hook 与 tool 各 +1、且每次 attempt 都 +1，
+        5 轮配额实际 2-3 轮就用光 → 文件提前过期 → 用户重发 → 重新解析 + 重新 embedding。
         """
-        key = ("__round__", query_key.strip() or str(time.time() // 120))
+        key = ("__round__", session_id, query_key.strip() or str(time.time() // 120))
         item = self._inject_memo.get(key)
         now = time.time()
         if item is not None and now - item[0] < 120:
-            return  # 同一问题本轮已计数
+            return False  # 同一问题本轮已计数
         if len(self._inject_memo) >= 128:
             oldest_key = min(self._inject_memo, key=lambda k: self._inject_memo[k][0])
             self._inject_memo.pop(oldest_key, None)
         self._inject_memo[key] = (now, "")
-        vs.increment_rounds()
+        if file_names:
+            for name in file_names:
+                vs.increment_rounds(name)
+        else:
+            vs.increment_rounds()
+        return True
 
     def _full_text_within_limit(self, vs: Any) -> Optional[str]:
         """直注判定：会话内所有文件全文合计 ≤ direct_inject_max_chars 时返回拼接全文，否则 None。
@@ -1845,6 +2051,182 @@ class FileReaderPlugin(MaiBotPlugin):
             else:
                 self._ensure_summary_async(entry)
 
+    # ─── 混合检索（v1.3.0 批次 2） ──────────────────────────────
+    # 以下都是普通辅助方法：必须排在 inject_file_context 的 @HookHandler 之前
+    # （装饰器只认紧贴其后的 def，插队会让组件静默绑错人）。
+    _RE_REFERENCE = re.compile(r"这|那|它|上面|刚才|前面|该|此|第[一二三四五六七八九十百\d]{1,3}[章节页条]")
+
+    def _hybrid_enabled(self) -> bool:
+        """BM25 总开关：运行期命令（/file_bm25）覆盖优先于配置文件。
+
+        为什么要有运行期覆盖：已部署实例的 config.toml 不会自动补新键，只改
+        Field(default) 对老实例完全无效——体感变差时必须有一条**立刻可用**的退路。
+        """
+        if self._hybrid_override is not None:
+            return bool(self._hybrid_override)
+        return bool(self.config.reader.hybrid_retrieve_enabled)
+
+    @staticmethod
+    def _collect_user_queries(items: list, limit: int = 2) -> list[str]:
+        """按时间顺序取最近 N 条用户文本（用于追问改写）。"""
+        out: list[str] = []
+        for item in reversed(items or []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("item_type") in ("UserMessageItem", "user"):
+                for p in item.get("parts") or []:
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        t = str(p.get("text", "")).strip()
+                        if t:
+                            out.append(t)
+                        break
+            if len(out) >= limit:
+                break
+        out.reverse()
+        return out
+
+    def _rewrite_query(self, items: list, current: str) -> tuple[str, str]:
+        """追问改写：「那第三章呢」→「上一问 + 当前问」。返回 (改写后, 原始)。
+
+        刻意**不调 LLM**：注入 hook 是 BLOCKING 且只有 11s 预算，为改写再搭一次
+        模型调用会把超时风险直接顶满。规则触发的收益已经覆盖了绝大部分追问形态。
+        """
+        cur = str(current or "").strip()
+        if not cur or not bool(self.config.reader.query_rewrite_enabled):
+            return cur, cur
+        prev_queries = self._collect_user_queries(items, limit=2)
+        prev = prev_queries[0] if len(prev_queries) >= 2 else ""
+        if not prev or prev == cur or cur in prev:
+            return cur, cur
+        need = (
+            len(cur) <= 12
+            or bool(self._RE_REFERENCE.search(cur))
+            or (len(cur) <= 20 and cur.endswith(("呢", "吗")))
+        )
+        if not need:
+            return cur, cur
+        return f"{prev} {cur}", cur
+
+    def _record_diag(self, diag: dict) -> None:
+        """记录一条检索诊断（环形缓冲 20 条）。"""
+        try:
+            self._retrieval_diag.append(diag)
+        except Exception:  # noqa: BLE001  诊断绝不能影响主流程
+            pass
+
+    async def _retrieve_hybrid(self, vs: Any, query: str, session_id: str = "") -> tuple[list, dict]:
+        """向量 + 词法 RRF 融合检索。返回 `(hits, diag)`。
+
+        降级矩阵（向量 / 词法）：
+          | 可用 | 可用 | → RRF 融合
+          | 可用 | 停用 | → 纯向量 + 阈值
+          | 失败 | 可用 | → **纯词法**（v1.3.0 新增：embedding 拥塞时代码/报错码类问题仍能答）
+          | 失败 | 停用 | → 空（调用方走概要兜底）
+        """
+        started = time.time()
+        try:
+            cand_k = max(1, int(self.config.reader.hybrid_candidate_k or 20))
+        except (TypeError, ValueError):
+            cand_k = 20
+        try:
+            top_k = max(1, int(self.config.reader.retrieve_top_k or 6))
+        except (TypeError, ValueError):
+            top_k = 6
+
+        use_lexical = self._hybrid_enabled()
+        lexical_hits = vs.search_lexical(query, cand_k) if use_lexical else []
+        qvec = await self._embed_query(query)
+        vector_hits = vs.retrieve(qvec, cand_k) if qvec is not None else []
+
+        if qvec is None:
+            mode = "lexical" if lexical_hits else "unavailable"
+        elif not lexical_hits:
+            mode = "vector"
+        else:
+            mode = "hybrid"
+
+        fused = rrf_fuse(vector_hits, lexical_hits, rrf_k=int(self.config.reader.rrf_k or 60))
+        gated = apply_relevance_gate(
+            fused,
+            min_score=float(self.config.reader.retrieve_min_score or 0.0),
+            min_ratio=float(self.config.reader.retrieve_min_ratio or 0.0),
+        )
+        hits = gated[:top_k]
+
+        sources: dict[str, int] = {}
+        for h in hits:
+            key = str(h.get("source", "?"))
+            sources[key] = sources.get(key, 0) + 1
+        diag = {
+            "ts": time.time(),
+            "session_id": session_id,
+            "query": query,
+            "mode": mode,
+            "vector_candidates": len(vector_hits),
+            "lexical_candidates": len(lexical_hits),
+            "fused": len(fused),
+            "after_gate": len(gated),
+            "kept": len(hits),
+            "top1_score": round(gated[0]["score"], 4) if gated else 0.0,
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "sources": sources,
+        }
+        return hits, diag
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="announce_file_context",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        error_policy=ErrorPolicy.SKIP,
+        timeout_ms=2000,
+    )
+    async def announce_file_context(self, **kwargs: Any) -> dict[str, Any]:
+        """向 Planner 公告「本会话已读入哪些文件」（v1.3.2）。
+
+        真机 11-02 21:39 实测：文件全文已直注 replyer（2264 字）且答得正确，
+        但 Planner 上下文里没有这份内容 —— 它据此判定「模型没读到却编了标题」，
+        触发 `recall_last_message` 撤回重答。**只注入 replyer 会造成两侧信息不对称，
+        Planner 的自我校对反而制造故障。**
+
+        这里只注入一句公告（几十字），**不注入正文**：Planner 只需要知道
+        「内容已有供给」，逐轮 attempt 灌全文会把 token 打爆。
+        """
+        try:
+            session_id = str(kwargs.get("session_id") or "")
+            items = kwargs.get("items")
+            if not session_id or not isinstance(items, list):
+                return {"action": "continue"}
+            if self._already_injected(items):
+                return {"action": "continue"}
+
+            vs = None
+            for (sid, _cid), candidate in self._store._sessions.items():
+                if sid == session_id:
+                    vs = candidate
+                    break
+            if vs is None or not vs.files:
+                return {"action": "continue"}
+
+            names = [str(n) for n in vs.files.keys()]
+            total = sum(int(e.total_chars()) for e in vs.files.values())
+            listed = "、".join(f"《{n}》" for n in names[:3])
+            if len(names) > 3:
+                listed += f" 等 {len(names)} 个"
+            supply = (
+                "全文会在生成回复时自动附上"
+                if self._full_text_within_limit(vs) is not None
+                else "相关片段会在生成回复时自动附上"
+            )
+            text = (
+                f"本会话已读入文件：{listed}（合计约 {total} 字）。{supply}，"
+                "规划阶段不需要再调用文件读取工具；需要精确定位某段时用 search_file。"
+            )
+            return self._inject_items(items, kwargs, text, kind="planner-notice")
+        except Exception as e:  # noqa: BLE001
+            self.ctx.logger.error("向 Planner 公告文件状态失败: %s", e)
+            return {"action": "continue"}
+
     @HookHandler(
         "maisaka.replyer.before_model_request",
         name="inject_file_context",
@@ -1866,6 +2248,14 @@ class FileReaderPlugin(MaiBotPlugin):
             if not session_id or not isinstance(items, list):
                 return {"action": "continue"}
 
+            # v1.3.0：解析失败通知优先处理——即使本会话已经没有文件库，也要让模型
+            # 知道「用户传过文件但没读进来」，否则用户追问时模型只能凭空猜。
+            # silent_errors=false 时失败已经发过群消息了，这里不再重复注入。
+            if bool(self.config.reader.silent_errors):
+                notice_text = self._take_notice(session_id)
+                if notice_text:
+                    return self._inject_items(items, kwargs, notice_text, kind="notice")
+
             # 找当前会话的向量库
             vs = None
             for (sid, _cid), candidate in self._store._sessions.items():
@@ -1875,51 +2265,40 @@ class FileReaderPlugin(MaiBotPlugin):
             if vs is None or not vs.files:
                 return {"action": "continue"}
 
-            marker = self.config.reader.injection_marker
-
-            # 幂等：已有同样标记则跳过（直注 / 检索两条路径共用）
-            # v1.1.0：逐项早退检查，不再把全部 items 文本拼成一个大字符串只为找 marker
-            if any(marker in self._item_text(it) for it in items):
+            # 幂等（v1.3.0）：先看 item_id 前缀——与正文内容解耦，改文案不会破坏幂等
+            # （旧版靠正文里的 marker 判重，marker 被配成空串就变成永不注入）。
+            if self._already_injected(items):
                 return {"action": "continue"}
 
             # 直注路径（v1.0.14）：全文合计 ≤ 阈值 → 不做检索、不调查询 embedding，
             # 直接把文件全文注入。注意 query 为空（如纯表情消息）时也落这里兜底。
             full_text = self._full_text_within_limit(vs)
             if full_text:
-                inject_text = (
-                    f"{marker} 以下是当前会话文件的完整内容（全文直注，无需检索）：\n\n{full_text}"
-                )
-                new_item = self._make_system_item(inject_text)
-                modified = dict(kwargs)
-                modified["items"] = list(items) + [new_item]
-                if "item_schema_version" in kwargs:
-                    modified["item_schema_version"] = kwargs["item_schema_version"]
-                self._tick_rounds_once(vs, "direct-inject")
+                # v1.3.0：事实式文案，不带分数/编号/「供参考」——模型会复述这些元信息
+                inject_text = "以下是本会话已读过的文件内容：\n\n" + full_text
                 self.ctx.logger.info(
                     "文件全文直注（%.0f 字 ≤ 阈值 %d），跳过检索",
                     sum(e.total_chars() for e in vs.files.values()),
                     int(self.config.reader.direct_inject_max_chars),
                 )
-                return {"action": "continue", "modified_kwargs": modified}
+                self._touch_injected(vs, list(vs.files.keys()), session_id, "direct-inject")
+                return self._inject_items(items, kwargs, inject_text, kind="direct")
 
             # 用最近一条用户消息做查询（简化：取最后一条 user item 的文本）
-            query = self._extract_last_user_query(items)
-            if not query:
+            raw_query = self._extract_last_user_query(items)
+            if not raw_query:
                 return {"action": "continue"}
+            query, _original = self._rewrite_query(items, raw_query)
 
             # 注入去重（v1.0.18 C3）：同一会话同一问题 TTL 内直接复用上次注入文本。
             # hook 每次 attempt 都会重跑、Planner 与回复各触发一次——旧幂等只挡 items 内的
             # marker，挡不住跨触发的重复 embedding 与重复检索。
+            # memo key 用改写后的查询：同一句话在不同上下文里检索结果不该共用缓存
             memo_key = query.strip()
             memo_text = self._memo_get(session_id, memo_key)
             if memo_text:
-                new_item = self._make_system_item(memo_text)
-                modified = dict(kwargs)
-                modified["items"] = list(items) + [new_item]
-                if "item_schema_version" in kwargs:
-                    modified["item_schema_version"] = kwargs["item_schema_version"]
                 self.ctx.logger.info("文件注入命中去重缓存（同会话同问题 TTL 内），跳过检索")
-                return {"action": "continue", "modified_kwargs": modified}
+                return self._inject_items(items, kwargs, memo_text, kind="context")
 
             # 大文件概要（v1.0.17）：检索前先确保大文件有概要（异步生成、失败静默），
             # 有概要时即使本次检索无命中也能给 LLM 一个整体认识
@@ -1930,47 +2309,46 @@ class FileReaderPlugin(MaiBotPlugin):
                 if entry.summary
             ]
 
-            qvec = await self._embed_query(query)
-            if qvec is None:
-                if summaries:
-                    # 查询 embedding 失败但概要可用：至少注入概要兜底
-                    parts = [f"{marker} 当前会话文件的概要（检索模型暂不可用，仅提供概要）："]
+            hits, diag = await self._retrieve_hybrid(vs, query, session_id)
+            diag["raw_query"] = _original
+            self._record_diag(diag)
+
+            if not hits:
+                # v1.3.0：**无命中就不再注入**。旧版会用概要顶上，等于给模型一份
+                # 它无法定位、无法引用的内容，反而诱导它编。只有两路检索都不可用
+                # （embedding 失败且词法也不可用）才用概要兜底。
+                if diag["mode"] == "unavailable" and summaries:
+                    parts = ["以下是本会话已读过的文件概要："]
                     for fname, s in summaries:
                         parts.append(f"《{fname}》概要：\n{s}")
                     inject_text = "\n\n".join(parts)
                     self._memo_put(session_id, memo_key, inject_text)
-                    new_item = self._make_system_item(inject_text)
-                    modified = dict(kwargs)
-                    modified["items"] = list(items) + [new_item]
-                    if "item_schema_version" in kwargs:
-                        modified["item_schema_version"] = kwargs["item_schema_version"]
-                    self._tick_rounds_once(vs, memo_key)
-                    return {"action": "continue", "modified_kwargs": modified}
+                    self._touch_injected(vs, [f for f, _ in summaries], session_id, memo_key)
+                    return self._inject_items(items, kwargs, inject_text, kind="summary")
+                # 未命中分支的日志级别不能低于命中分支（否则"没检索到"永远查不出来）
+                self.ctx.logger.warning(
+                    "检索无命中，本次不注入（mode=%s，向量候选=%d，词法候选=%d，融合后=%d）",
+                    diag["mode"],
+                    diag["vector_candidates"],
+                    diag["lexical_candidates"],
+                    diag["after_gate"],
+                )
                 return {"action": "continue"}
 
-            results = vs.retrieve(qvec)
-            if not results and not summaries:
-                return {"action": "continue"}
-
-            # 拼接注入文本：概要在前（v1.0.17），检索片段在后
-            parts = [f"{marker} 以下是当前会话文件的概要与根据用户问题检索到的相关内容（供参考，仅在相关时引用）："]
+            # 拼接注入文本（v1.3.0 去机器味）：不带分数、不带编号、不带「供参考」，
+            # 同一文件的多块合并到同一标题下。
+            parts = ["以下是本会话已读过的文件内容："]
             for fname, s in summaries:
                 parts.append(f"《{fname}》概要：\n{s}")
-            for i, r in enumerate(results, 1):
-                parts.append(f"[{i}] 来源「{r['file_name']}」 相关度 {r['score']:.3f}：\n{r['text']}")
+            by_file: dict[str, list[str]] = {}
+            for h in hits:
+                by_file.setdefault(str(h.get("file_name")), []).append(str(h.get("text", "")))
+            for fname, texts in by_file.items():
+                parts.append(f"《{fname}》\n" + "\n".join(texts))
             inject_text = "\n\n".join(parts)
             self._memo_put(session_id, memo_key, inject_text)
-
-            new_item = self._make_system_item(inject_text)
-            modified = dict(kwargs)
-            modified["items"] = list(items) + [new_item]
-            if "item_schema_version" in kwargs:
-                modified["item_schema_version"] = kwargs["item_schema_version"]
-
-            # 增加轮数（同问题每轮只 +1，hook/tool/attempt 共享去重）
-            self._tick_rounds_once(vs, memo_key)
-
-            return {"action": "continue", "modified_kwargs": modified}
+            self._touch_injected(vs, list(by_file.keys()), session_id, memo_key)
+            return self._inject_items(items, kwargs, inject_text, kind="context")
         except Exception as e:  # noqa: BLE001
             self.ctx.logger.error("注入文件上下文失败: %s", e, exc_info=True)
             return {"action": "continue"}
@@ -2001,19 +2379,108 @@ class FileReaderPlugin(MaiBotPlugin):
         return ""
 
     @staticmethod
-    def _make_system_item(text: str) -> dict[str, Any]:
+    def _make_system_item(text: str, kind: str = "context") -> dict[str, Any]:
+        """构造注入用的 SystemMessageItem。
+
+        v1.3.0：`item_id` 统一带 `file-reader:{kind}:` 前缀。幂等判定改看这个前缀，
+        与正文内容彻底解耦——旧版靠正文里的 marker 判重，marker 被配成空串就变成
+        「永不注入」，改文案也会跟着失效。
+        """
         import datetime
         import uuid
 
         return {
             "item_type": "SystemMessageItem",
             "meta": {
-                "item_id": uuid.uuid4().hex,
+                "item_id": f"file-reader:{kind}:{uuid.uuid4().hex}",
                 "logical_turn_id": None,
                 "timestamp": datetime.datetime.now().isoformat(),
             },
             "parts": [{"type": "text", "text": text}],
         }
+
+    # v1.3.0：search_file 工具返回内容时带的标记（代码层常量，不可配置）。
+    # 工具结果不是 SystemMessageItem，拿不到我们的 item_id 前缀，只能靠它识别
+    # 「模型已经拿到文件内容了」，否则 hook 会紧接着再注入一遍。
+    _TOOL_TEXT_MARK = "【文件检索】"
+
+    @classmethod
+    def _already_injected(cls, items: list) -> bool:
+        """幂等判定：item_id 前缀（本插件注过的）+ 正文标记（工具已给过内容）。"""
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("meta")
+            if isinstance(meta, dict) and str(meta.get("item_id") or "").startswith("file-reader:"):
+                return True
+            if cls._TOOL_TEXT_MARK in cls._item_text(item):
+                return True
+        return False
+
+    @classmethod
+    def _inject_items(cls, items: list, kwargs: dict, text: str, kind: str = "context") -> dict[str, Any]:
+        """统一构造 modified_kwargs（完整回传，不能只回传改动键）。"""
+        modified = dict(kwargs)
+        modified["items"] = list(items) + [cls._make_system_item(text, kind)]
+        if "item_schema_version" in kwargs:
+            modified["item_schema_version"] = kwargs["item_schema_version"]
+        return {"action": "continue", "modified_kwargs": modified}
+
+    def _touch_injected(self, vs: Any, file_names: list, session_id: str, query_key: str) -> None:
+        """只对**实际被注入**的文件滑动续期并计一轮。
+
+        v1.3.0 修正两点：
+          - 旧版 `increment_rounds()` 给会话内**所有**文件加轮，没被问到的文件
+            照样过期；
+          - 轮数去重 key 不含 session_id，两个会话问同一句话会互相抑制。
+        """
+        vs.touch_files(list(file_names))
+        if not self._tick_rounds_once(vs, query_key, session_id=session_id, file_names=file_names):
+            return
+
+    # ─── 解析失败通知（v1.3.0） ──────────────────────────────────
+    def _add_notice(self, session_id: str, name: str, reason: str) -> None:
+        """登记一条解析失败通知：只告诉模型，不发群消息。
+
+        为什么不是发群消息：语气归 persona 管，插件刷群等于替 bot 决定说什么。
+        模型知道「用户传了《x.epub》但读不了」就够了，说不说由它判断。
+        """
+        if not session_id:
+            return
+        notices = self._file_notices.setdefault(session_id, [])
+        # 同名文件重新失败 → 覆盖旧条目（保持 delivered=False，让模型重新知道）
+        for notice in notices:
+            if notice.get("name") == name:
+                notice.update({"reason": reason, "ts": time.time(), "delivered": False})
+                return
+        notices.append({"name": name, "reason": reason, "ts": time.time(), "delivered": False})
+        if len(notices) > 10:  # 单会话上限，防无界增长
+            del notices[0]
+
+    def _take_notice(self, session_id: str) -> str:
+        """取出待投递的失败通知（投递过的不重复），返回注入文案；无则空串。"""
+        notices = self._file_notices.get(session_id) or []
+        if not notices:
+            return ""
+        ttl = max(1, int(self.config.reader.parse_notice_ttl or 600))
+        now = time.time()
+        lines: list[str] = []
+        for notice in notices:
+            if notice.get("delivered") or (now - float(notice.get("ts", 0)) > ttl):
+                continue
+            notice["delivered"] = True
+            lines.append(f"[文件状态] 用户上传了《{notice.get('name')}》，读取失败：{notice.get('reason')}")
+        return "\n".join(lines)
+
+    def _clear_notices(self, session_id: str, name: str = "") -> None:
+        """同名文件成功入库、或 /clear_file 时清掉对应通知。"""
+        if not session_id:
+            return
+        if not name:
+            self._file_notices.pop(session_id, None)
+            return
+        notices = self._file_notices.get(session_id) or []
+        self._file_notices[session_id] = [n for n in notices if n.get("name") != name]
 
     # ─── 命令 ────────────────────────────────────────────────────
     @Command("clear_file", description="清除当前会话已入库的文件", pattern=r"^\s*[/／]\s*(?:clear_file|clean_file|清文件|清理文件)\s*$")
@@ -2029,6 +2496,7 @@ class FileReaderPlugin(MaiBotPlugin):
 
         removed = self._store.drop(session_id)
         self._memo_invalidate_session(session_id)  # v1.0.18 C3：清文件后失效注入缓存
+        self._clear_notices(session_id)  # v1.3.0：连失败通知一起清掉
         text = f"🗑️ 已清除当前会话 {removed} 个文件块。" if removed else "当前会话没有已入库的文件。"
         await self._reply(str(kwargs.get("stream_id", "") or ""), text)
         return True, text, 2 if removed else 0
@@ -2061,11 +2529,97 @@ class FileReaderPlugin(MaiBotPlugin):
             lines.append(
                 f"- 最近文件消息: {hint.get('name')} 大小={hint.get('size')} mid={hint.get('mid')} 阶段={hint.get('stage')}"
             )
+        # v1.3.0 检索诊断：没有 recall@k 评测集时，这是唯一能回答「为什么没检索到」的窗口。
+        # 只输出模式/候选数/分数/耗时，不输出正文。
+        override_note = "（运行期覆盖）" if self._hybrid_override is not None else ""
+        lines.append(
+            f"- 检索模式: {'向量 + 词法(BM25)' if self._hybrid_enabled() else '纯向量'}{override_note}"
+        )
+        total_tokens = 0
+        disabled_reason = ""
+        for candidate in self._store._sessions.values():
+            st = candidate.lexical_state
+            total_tokens += int(st.get("tokens") or 0)
+            if st.get("disabled") and not disabled_reason:
+                disabled_reason = str(st.get("reason") or "")
+        if disabled_reason:
+            lines.append(f"- 词法索引: {total_tokens} tokens（已停用：{disabled_reason}）")
+        else:
+            lines.append(f"- 词法索引: {total_tokens} tokens")
+        if self._retrieval_diag:
+            d = self._retrieval_diag[-1]
+            lines.append(
+                f"- 最近检索: 模式={d['mode']} 向量候选={d['vector_candidates']} "
+                f"词法候选={d['lexical_candidates']} 融合={d['fused']}→过阈={d['after_gate']} "
+                f"Top1={d['top1_score']} 耗时={d['elapsed_ms']}ms 来源={d['sources']}"
+            )
+            raw_q = str(d.get("raw_query") or "")
+            if raw_q and raw_q != str(d.get("query") or ""):
+                lines.append(f"  └ 原始提问: {raw_q[:40]} → 改写: {str(d.get('query'))[:60]}")
+            elif str(d.get("query") or ""):
+                lines.append(f"  └ 查询: {str(d.get('query'))[:60]}")
         text = "\n".join(lines)
         stream_id = str(kwargs.get("stream_id", "") or "")
         if stream_id:
             await self._reply(stream_id, text)
         return True, text, 2
+
+    @Command(
+        "file_bm25",
+        description="运行期开关 BM25 词法检索（v1.3.0 回滚开关）：体感变差时可立即退回纯向量，无需改配置文件",
+        pattern=r"^\s*[/／]\s*(?:file_bm25|词法检索|混合检索)\s*(?P<state>on|off|开|关|status|状态)?\s*$",
+    )
+    async def cmd_bm25(self, **kwargs: Any) -> tuple[bool, str, int]:
+        """BM25 运行期开关。
+
+        为什么命令与配置并存：已部署实例的 config.toml **不会自动补新键**，只改
+        Field(default) 对老实例完全无效（宿主只在 config.toml 不存在时才初始化，
+        config_version 相同时干脆不写回）。真机上发现混合检索变差时，靠配置关不掉，
+        必须有一条立刻生效的退路。这里改的是内存里的覆盖值，重启后回到配置值。
+        """
+        raw = str(self._command_arg(kwargs, "state") or "").strip().lower()
+        if raw in ("off", "关", "false", "0"):
+            self._hybrid_override = False
+            self._inject_memo.clear()  # 检索通路变了，缓存的注入文本必须作废
+            text = "✅ 已关闭 BM25 词法检索，退回纯向量检索（运行期生效，重启后回到配置文件的值）"
+        elif raw in ("on", "开", "true", "1"):
+            self._hybrid_override = True
+            self._inject_memo.clear()
+            text = "✅ 已开启 BM25 词法检索（运行期生效，重启后回到配置文件的值）"
+        else:
+            cfg = bool(self.config.reader.hybrid_retrieve_enabled)
+            effective = self._hybrid_enabled()
+            text = (
+                f"BM25 词法检索：配置={'开' if cfg else '关'}，当前生效={'开' if effective else '关'}"
+                + ("（已被运行期命令覆盖）" if self._hybrid_override is not None else "")
+                + "。用法：/file_bm25 on|off"
+            )
+        stream_id = str(kwargs.get("stream_id", "") or "")
+        if stream_id:
+            await self._reply(stream_id, text)
+        return True, text, 2
+
+    @staticmethod
+    def _command_arg(kwargs: dict, name: str) -> str:
+        """取命令参数：优先用正则命名组（宿主支持时直接传进来），
+        拿不到再从常见消息字段里抠一遍——不同宿主版本传参形态并不统一，
+        命令开关这种「必须能用」的入口不能只赌一种。"""
+        val = kwargs.get(name)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        for key in ("raw_message", "text", "full_text", "content", "message"):
+            raw = kwargs.get(key)
+            if isinstance(raw, dict):
+                for sub in ("text", "raw_message", "processed_plain_text"):
+                    v = raw.get(sub)
+                    if isinstance(v, str) and v.strip():
+                        raw = v
+                        break
+            if isinstance(raw, str) and raw.strip():
+                m = re.search(r"(?:file_bm25|词法检索|混合检索)\s*([A-Za-z\u4e00-\u9fff]+)?", raw)
+                if m:
+                    return str(m.group(1) or "").strip()
+        return ""
 
     # ─── Tool：手动查询文件内容（供 LLM 主动调用） ────────────────
     def _has_any_file_session(self) -> bool:
@@ -2077,11 +2631,16 @@ class FileReaderPlugin(MaiBotPlugin):
 
         真机 18:51 日志教训：Planner 调 search_file 时首次传 session_id=''、
         之后干脆不传——文件 18:51:30 已入库，工具却三次误报「没有文件」。
-        不能指望 LLM 每次都传对 session_id。规则（v1.2.1 收紧）：
-        1) 显式 session_id 且该会话有文件 → 直接用；
+        不能指望 LLM 每次都传对 session_id。规则（v1.2.1 收紧，v1.3.3 接住宿主注入）：
+        1) 显式 session_id（或宿主注入的 stream_id/chat_id）且该会话有文件 → 直接用；
         2) 否则**仅在全局只有一个会话存有文件时**回退到该会话（单会话场景必命中，
            v1.0.15 的真机问题不回退）；
         3) 多个会话都有文件、而本次调用未指明或指错了 session_id → **拒绝兜底**。
+
+        v1.3.3：入参可能来自 `search_file` 接住的 `kwargs["stream_id"]`——那是 Host
+        `_build_tool_context_payload` 按当前执行上下文注入的权威值（= context.stream_id
+        or context.session_id），与 `_store` 的 session_id 同口径，属**已知归属**而非猜测。
+        v1.2.1 收紧时以为「工具调用链路拿不到当前会话」，那个前提在 Host 1.3.x 已不成立。
 
         v1.2.1 收紧原因（市场 review 隐私项）：旧版兜底是「最近有文件入库的会话」，
         多人群场景下 Planner 不传 session_id 时，会把 A 会话上传的文件正文塞进
@@ -2135,9 +2694,8 @@ class FileReaderPlugin(MaiBotPlugin):
         "search_file",
         description=(
             "在当前会话已上传的文件中检索与问题相关的片段。"
-            "当用户上传过文件（PDF/Word/Excel/PPT/代码等）或询问文件内容时调用；"
-            "仅当只有一个会话存有文件时 session_id 才可留空（自动定位该会话），"
-            "多个会话都有文件时必须传入当前会话的 session_id，否则会拒绝检索以防跨会话串扰。"
+            "当用户上传过文件（PDF/Word/Excel/PPT/代码等）或询问文件内容时调用。"
+            "会话归属由宿主自动带入，正常情况下**不需要**传 session_id。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -2149,28 +2707,34 @@ class FileReaderPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="session_id",
                 param_type=ToolParamType.STRING,
-                description=(
-                    "当前会话 ID。多个会话存有文件时必传；留空时仅在唯一会话有文件的"
-                    "情况下才会自动定位"
-                ),
+                description="通常留空（宿主会自动带入当前会话）。仅在需要显式指定其他会话时填写",
                 required=False,
             ),
         ],
     )
     async def search_file(self, query: str, session_id: str = "", **kwargs: Any) -> dict[str, str]:
         """检索并返回相关片段。"""
+        # v1.3.3：接住 Host 注入的权威会话标识。
+        # Host 1.3.x 的 `_build_tool_context_payload`（src/plugin_runtime/component_query.py）
+        # 会往工具参数里补 `stream_id`/`chat_id`（= context.stream_id or context.session_id），
+        # 且只在模型没传同名字段时才补。旧版开头 `del kwargs` 把它一起丢掉，
+        # 于是工具永远拿不到会话 ⇒ 只能靠「全局唯一有文件的会话」兜底；
+        # 一旦群聊与私聊都传过文件，search_file 直接 fail-closed 拒绝（真机 21:53 日志即此状态）。
+        # 这不是猜：值由 Host 按当前执行上下文注入，口径与 `_store` 的 session_id 一致。
+        runtime_sid = str(kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
         del kwargs
         if not query.strip():
             return {"content": "请提供要检索的问题。"}
-        vs, resolved_sid = self._resolve_tool_session(str(session_id or ""))
+        explicit_sid = str(session_id or "").strip()
+        vs, resolved_sid = self._resolve_tool_session(explicit_sid or runtime_sid)
         if vs is None or not vs.files:
             # v1.2.1：区分「确实没有文件」与「有文件但拒绝跨会话兜底」，
             # 给 LLM 可执行的指引（补传 session_id），而不是含糊的"没有文件"。
             if self._has_any_file_session():
-                if str(session_id or ""):
+                if explicit_sid or runtime_sid:
                     return {
                         "content": (
-                            f"会话 {session_id} 下没有已入库的文件。"
+                            f"会话 {explicit_sid or runtime_sid} 下没有已入库的文件。"
                             "其他会话存有的文件出于会话隔离不会返回；"
                             "如需检索当前会话的文件，请确认 session_id 是否正确后重试。"
                         )
@@ -2188,29 +2752,33 @@ class FileReaderPlugin(MaiBotPlugin):
         # 直注路径（v1.0.14）：小文件直接返回全文，不检索
         full_text = self._full_text_within_limit(vs)
         if full_text:
-            self._tick_rounds_once(vs, query)  # v1.0.18 C3：同问题每轮只 +1
+            self._touch_injected(vs, list(vs.files.keys()), resolved_sid, query)
             names = "、".join(vs.files.keys())
-            marker = self.config.reader.injection_marker
             return {
                 "content": (
-                    # v1.0.18 C3：带幂等标记，Planner 拿到全文后 hook 检测到标记即不再重复注入
-                    f"{marker} 当前会话文件较小（≤ {int(self.config.reader.direct_inject_max_chars)} 字），"
+                    # 标记用于让 hook 识别「工具已经把内容给过模型」，不再重复注入
+                    f"{self._TOOL_TEXT_MARK} 当前会话文件较小（≤ {int(self.config.reader.direct_inject_max_chars)} 字），"
+                    # 会话 ID 是给 Planner 的定位信息（多会话场景它要能说清查的是哪个会话），
+                    # 「去机器味」只针对注入给用户对话的 hook 文案，工具返回保留
                     f"直接给出全文（会话 {resolved_sid}，文件：{names}）：\n\n{full_text}"
                 )
             }
 
-        qvec = await self._embed_query(query)
-        if qvec is None:
-            return {"content": "嵌入模型不可用，无法检索。"}
-
-        results = vs.retrieve(qvec)
-        if not results:
+        # v1.3.0：工具侧与 hook 侧走同一套混合检索，避免"工具查得到、注入查不到"
+        hits, diag = await self._retrieve_hybrid(vs, query, resolved_sid)
+        self._record_diag(diag)
+        if not hits:
             return {"content": "未在文件中检索到相关内容。"}
-        marker = self.config.reader.injection_marker
-        parts = [f"{marker} 检索到以下相关片段（会话 {resolved_sid}，已入库文件：{'、'.join(vs.files.keys())}）："]
-        for i, r in enumerate(results, 1):
-            parts.append(f"[{i}]「{r['file_name']}」({r['score']:.3f}):\n{r['text']}")
-        self._tick_rounds_once(vs, query)  # v1.0.18 C3：同问题每轮只 +1
+        parts = [
+            f"{self._TOOL_TEXT_MARK} 检索到以下相关片段"
+            f"（会话 {resolved_sid}，已入库文件：{'、'.join(vs.files.keys())}）："
+        ]
+        by_file: dict[str, list[str]] = {}
+        for h in hits:
+            by_file.setdefault(str(h.get("file_name")), []).append(str(h.get("text", "")))
+        for fname, texts in by_file.items():
+            parts.append(f"《{fname}》\n" + "\n".join(texts))
+        self._touch_injected(vs, list(by_file.keys()), resolved_sid, query)
         return {"content": "\n\n".join(parts)}
 
     # ─── 后台清理循环 ────────────────────────────────────────────
@@ -2221,9 +2789,14 @@ class FileReaderPlugin(MaiBotPlugin):
                     await asyncio.sleep(self.config.reader.cleanup_interval * 60)
                     retention = self.config.reader.file_retention_time * 60
                     max_rounds = self.config.reader.file_max_rounds
+                    # v1.3.0：绝对上限（分钟→秒），防「一直被问到」的文件永久驻留
+                    try:
+                        absolute_ttl = float(self.config.reader.file_absolute_ttl or 0) * 60
+                    except (TypeError, ValueError):
+                        absolute_ttl = 0.0
                     total_removed = 0
                     for (sid, cid), vs in list(self._store._sessions.items()):
-                        removed = vs.cleanup_expired(retention, max_rounds)
+                        removed = vs.cleanup_expired(retention, max_rounds, absolute_ttl)
                         if removed:
                             self._memo_invalidate_session(sid)  # v1.0.18 C3：清理后失效该会话注入缓存
                         total_removed += len(removed)
@@ -2235,7 +2808,6 @@ class FileReaderPlugin(MaiBotPlugin):
                         self.ctx.logger.info("后台清理：移除 %d 个过期文件", total_removed)
                     # v1.1.0：概要失败冷却表随清理周期裁剪——旧版按文件名无界增长
                     self._prune_summary_failed()
-                    self._store.save_meta()
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -162,6 +163,9 @@ async def _test_modules() -> None:
 
     e2 = await vs.add_file("x.txt", "临时内容用于测试时间过期")
     e2.upload_time = time.time() - 7200  # 2 小时前
+    # v1.3.0：过期判定改用 last_used（滑动续期）——只有实际被注入过的文件才刷新它，
+    # 所以"长期没人问"的文件仍然会按 retention 过期。这里两个时间戳一起拨回去。
+    e2.last_used = time.time() - 7200
     removed = vs.cleanup_expired(retention_seconds=60, max_rounds=999)
     assert "x.txt" in removed
     print("[PASS] 时间过期清理")
@@ -200,6 +204,9 @@ async def _test_plugin_hooks() -> None:
     expected_pairs = {
         "on_file_message_early", "on_file_message", "inject_file_context",
         "cmd_clear_file", "cmd_status", "search_file",
+        # v1.3.0：BM25 运行期回滚开关（已部署实例的 config.toml 补不上新键，
+        # 回滚必须有一条代码层入口）
+        "cmd_bm25",
     }
     seen_pairs = set()
     for idx, line in enumerate(lines):
@@ -261,7 +268,7 @@ async def _test_plugin_hooks() -> None:
         "message_info": {
             "additional_config": {},
             "group_info": None,
-            "user_info": {"user_id": "3816023959", "nickname": "狸猫"},
+            "user_info": {"user_id": "1000000001", "nickname": "测试用户"},
         },
         "raw_message": [
             {
@@ -396,7 +403,7 @@ async def _test_plugin_hooks() -> None:
         "platform": "qq",
         "processed_plain_text": f"[文件] 文章.txt，大小: {len(txt_bytes)}",
         "message_id": "123456",
-        "message_info": {"additional_config": {}, "group_info": None, "user_info": {"user_id": "3816023959"}},
+        "message_info": {"additional_config": {}, "group_info": None, "user_info": {"user_id": "1000000001"}},
         "raw_message": [{"type": "text", "data": f"[文件] 文章.txt，大小: {len(txt_bytes)}"}],
     }
     result = await plugin.on_file_message(hook_name="chat.receive.after_process", message=degraded)
@@ -479,6 +486,23 @@ async def _test_plugin_hooks() -> None:
     # 无 [文件] 的消息返回空列表
     assert plugin._parse_file_hints({"processed_plain_text": "普通聊天消息"}) == []
     print("[PASS] 防抖合并消息多文件解析（逐行提取，URL 各自归属）")
+
+    # 1g2b. Host 1.3.16+ 的新 `[文件]` 文本形态（v1.3.1）：
+    # 真机 2026-11-02 21:26:21 私聊实测 `[文件] 附件，大小: 15397，file_ref: 11a7a372…`
+    # 旧正则 `\s*[，,]?\s*$` 锚定行尾 ⇒ `.+?` 一路吃到末尾，把「附件，大小: 15397，
+    # file_ref: …」整串当文件名 ⇒ 扩展名为空 ⇒ "不支持的文件类型: .(无扩展名)"。
+    # 新正则要求名字不含逗号，并用 `(?:\s*[，,].*)?$` 忽略 `类型:` / `file_ref:` 尾巴。
+    sfw_hint = plugin._parse_file_hint(
+        {"processed_plain_text": "[文件] 附件，大小: 15397，file_ref: 11a7a372be1d67d30d3ca274e6eb68c0"}
+    )
+    assert sfw_hint is not None and sfw_hint["name"] == "附件", sfw_hint
+    assert sfw_hint["size_hint"] == 15397, sfw_hint
+    typed_hint = plugin._parse_file_hint(
+        {"processed_plain_text": "[文件] 报告.docx，大小: 9547，类型: application/vnd.openxmlformats-officedocument.wordprocessingml.document，file_ref: abc"}
+    )
+    assert typed_hint is not None and typed_hint["name"] == "报告.docx", typed_hint
+    assert typed_hint["size_hint"] == 9547, typed_hint
+    print("[PASS] 新 [文件] 文本形态（file_ref/类型 尾巴不再吞文件名）")
 
     # 1g3. 多文件端到端：合并消息里每个文件都应各自入库（走 url 下载路径）
     plugin.config.napcat.enabled = False  # 强制走 hint["url"] 下载而非 NapCat 回溯
@@ -723,6 +747,41 @@ async def _test_plugin_hooks() -> None:
     plugin._embed_retry_queue = []
     plugin.config.reader.embed_max_retries = 5
 
+    # 1i4. 文件名回填（v1.3.1，真机 2026-11-02 21:26:24 私聊故障复现）：
+    # 适配器给占位名「附件」，NapCat get_file 返回的路径却带真实文件名。
+    # 旧行为：按「附件」判扩展名 → 空 → "不支持的文件类型: .(无扩展名)"（silent 下只进日志）。
+    # 新行为：用 napcat_path 的 basename 回填，入库名与扩展名都正确。
+    real_dir = tempfile.mkdtemp(prefix="fr-backfill-")
+    real_path = os.path.join(real_dir, "飞天显卡呜呜转神教_白话版.txt")
+    with open(real_path, "w", encoding="utf-8") as fh:
+        fh.write("回填测试内容：显卡转神教，白话版第一段。")
+    orig_resolve = plugin._resolve_via_napcat
+    plugin._resolve_via_napcat = lambda fdata: (None, real_path)  # noqa: ARG005
+    sent_before = len(runner.host.sent_messages)
+    await plugin._handle_file(
+        session_id="backfill-session",
+        conversation_id="backfill-session",
+        stream_id="backfill-session",
+        fdata={"name": "附件", "napcat_message_id": "1556341576"},
+    )
+    await asyncio.sleep(0.05)
+    backfill_replies = [
+        str(m.get("text", ""))
+        for m in runner.host.sent_messages[sent_before:]
+        if m.get("capability") == "send.text" and str(m.get("stream_id")) == "backfill-session"
+    ]
+    assert not any("无扩展名" in r or "不支持的文件类型" in r for r in backfill_replies), (
+        f"文件名回填后不应再报扩展名错误: {backfill_replies}"
+    )
+    vs_backfill = plugin._store._sessions.get(("backfill-session", "backfill-session"))
+    assert vs_backfill is not None, "回填后应正常入库"
+    assert "飞天显卡呜呜转神教_白话版.txt" in vs_backfill.files, (
+        f"入库名应为 NapCat 返回的真实文件名: {list(vs_backfill.files)}"
+    )
+    plugin._resolve_via_napcat = orig_resolve
+    shutil.rmtree(real_dir, ignore_errors=True)
+    print("[PASS] 文件名回填（占位名「附件」→ NapCat 真实文件名，扩展名不再丢失）")
+
     # 1j. embedding 拆批（v1.0.13）：大批量文本按 embed_batch_size 拆分调用，结果正确拼接
     # 真机 15:38 日志教训：38996 字节 docx ≈ 78 块整把一次 RPC 超 30s 上限（与拥塞无关）。
     if "_embed" in plugin.__dict__:
@@ -885,10 +944,42 @@ async def _test_plugin_hooks() -> None:
         for p in (it.get("parts") or [])
         if isinstance(p, dict)
     )
-    assert "全文直注" in injected, f"注入文本应标记全文直注: {injected[:120]}"
+    # v1.3.0：注入文案去机器味，改成事实式开头 + 「全文：」前缀
+    assert "以下是本会话已读过的文件内容" in injected, f"注入文本应有事实式开头: {injected[:120]}"
+    assert "全文：" in injected, f"直注路径应标「全文：」: {injected[:120]}"
     assert "苹果富含维生素C" in injected, f"注入文本应包含文件全文: {injected[:200]}"
     assert inject_embed_calls["n"] == 0, f"直注路径不应调用 embedding，实际 {inject_embed_calls['n']} 次"
     print("[PASS] 全文直注：小文件全文注入（零 embedding 调用，全文完整可见）")
+
+    # 2a1b. Planner 公告（v1.3.2）：真机 11-02 21:39 故障复现——
+    # 全文只注入 replyer，Planner 看不到就判定「模型没读到却编了标题」并触发撤回。
+    # 公告必须是「一句话 + 文件名 + 字数」，且**不含正文**（正文只在 replyer 注，省 token）。
+    planner_items = [
+        {
+            "item_type": "UserMessageItem",
+            "meta": {"item_id": "u-planner", "logical_turn_id": None, "timestamp": "2026-11-02T21:39:00"},
+            "parts": [{"type": "text", "text": "你看看能不能看到内容"}],
+        }
+    ]
+    planner_result = await plugin.announce_file_context(
+        session_id="inject-session", items=planner_items, item_schema_version=1
+    )
+    assert planner_result.get("action") == "continue", planner_result
+    assert "modified_kwargs" in planner_result, f"应注入公告: {planner_result}"
+    notice_items = planner_result["modified_kwargs"]["items"]
+    assert len(notice_items) == len(planner_items) + 1, "应追加一条 SystemMessageItem"
+    notice_meta = notice_items[-1].get("meta") or {}
+    assert str(notice_meta.get("item_id", "")).startswith("file-reader:planner-notice:"), notice_meta
+    notice_text = "".join(p.get("text", "") for p in notice_items[-1].get("parts") or [])
+    assert "营养笔记.txt" in notice_text, f"公告应含文件名: {notice_text}"
+    assert "全文会在生成回复时自动附上" in notice_text, f"小文件应告全文: {notice_text}"
+    assert small_doc not in notice_text, f"公告不得注入正文（省 token）: {notice_text[:160]}"
+    # 幂等：items 里已有 file-reader 前缀时不再重复注入
+    again = await plugin.announce_file_context(
+        session_id="inject-session", items=planner_result["modified_kwargs"]["items"], item_schema_version=1
+    )
+    assert "modified_kwargs" not in again, f"已注入过不应重复: {again}"
+    print("[PASS] Planner 公告：一句话同步文件状态，不重复注入、不含正文")
 
     # 2a2. 超阈值回落检索：全文合计 > 阈值 → 走原 RAG 检索路径（embedding 被调用）
     plugin.config.reader.direct_inject_max_chars = 10  # 故意设极小值迫使回落
@@ -904,8 +995,8 @@ async def _test_plugin_hooks() -> None:
             for p in (it.get("parts") or [])
             if isinstance(p, dict)
         )
-        assert "全文直注" not in fallback_text, "回落路径不应出现直注标记"
-        assert "检索" in fallback_text, f"回落路径应是检索注入: {fallback_text[:120]}"
+        assert "全文：" not in fallback_text, "回落路径不应出现直注标识"
+        assert "以下是本会话已读过的文件内容" in fallback_text, f"回落路径应是检索注入: {fallback_text[:120]}"
     assert inject_embed_calls["n"] >= 1, "回落检索路径应调用 embedding（查询向量化）"
     print("[PASS] 超阈值回落 RAG 检索（触发查询 embedding，注入检索片段）")
 
@@ -918,7 +1009,8 @@ async def _test_plugin_hooks() -> None:
     assert inject_embed_calls["n"] >= 1, "阈值 0 应关闭直注、走检索"
     print("[PASS] 阈值 0 关闭直注（始终检索）")
 
-    # 2a4. 直注幂等：注入项已在 items 里（含 marker）→ 跳过不重复注入
+    # 2a4. 直注幂等：注入项已在 items 里（v1.3.0 靠 item_id 前缀，正文标记只用于
+    # 识别「工具已给过内容」）→ 跳过不重复注入
     plugin.config.reader.direct_inject_max_chars = 6000
     marked_items = list(items) + [
         {
@@ -1012,6 +1104,33 @@ async def _test_plugin_hooks() -> None:
     assert "这是 A 会话的文件内容" in res_a.get("content", ""), f"显式 A 会话 sid 应命中 A: {res_a}"
     res_b = await plugin.search_file(query="隐私内容", session_id="priv-session-b")
     assert "B 会话独有的隐私内容" in res_b.get("content", ""), f"显式 B 会话 sid 应命中 B: {res_b}"
+
+    # 2a4b. v1.3.3：宿主注入 stream_id/chat_id 时不再算「歧义」。
+    # 真机 21:53 日志：search_file 只收到 {'query': ...}（模型不传 session_id），
+    # 插件因此回退到「唯一有文件的会话」；一旦群聊也有文件就会 fail-closed 拒检。
+    # Host 1.3.x 的 _build_tool_context_payload 会补 stream_id/chat_id，插件接住即可。
+    res_host_a = await plugin.search_file(
+        query="A 会话的文件", stream_id="inject-session", chat_id="inject-session"
+    )
+    assert "这是 A 会话的文件内容" in res_host_a.get("content", ""), (
+        f"宿主注入 stream_id 应命中 A 会话: {res_host_a}"
+    )
+    res_host_b = await plugin.search_file(query="隐私内容", stream_id="priv-session-b")
+    assert "B 会话独有的隐私内容" in res_host_b.get("content", ""), (
+        f"宿主注入 stream_id 应命中 B 会话: {res_host_b}"
+    )
+    assert "这是 A 会话的文件内容" not in res_host_b.get("content", ""), (
+        "注入 stream_id=B 时不得串到 A 会话"
+    )
+    # 模型显式传的 session_id 优先于宿主注入值（显式意图不被覆盖）
+    res_explicit_wins = await plugin.search_file(
+        query="A 会话的文件", session_id="inject-session", stream_id="priv-session-b"
+    )
+    assert "这是 A 会话的文件内容" in res_explicit_wins.get("content", ""), (
+        f"显式 session_id 应优先: {res_explicit_wins}"
+    )
+    print("[PASS] search_file 接住宿主注入的 stream_id（显式 session_id 优先，不串会话）")
+
     # 清场：不影响后续用例
     plugin._store.drop("priv-session-b")
     plugin._store.drop("inject-session")
@@ -1034,6 +1153,11 @@ async def _test_plugin_hooks() -> None:
         chunks=[big_doc],
         vectors=[],
     )
+
+    # v1.3.0：检索改为「向量 + 词法 RRF」后，仅有概要、检索无命中时不再注入
+    # （旧版会用概要顶上，等于给模型一份无法引用的内容）。这里让词法索引认识
+    # 这个文件，检索真实命中，从而验证「概要 + 片段」一起注入。
+    vs_sum._lexical.add("长评测.txt", [big_doc])
 
     _orig_llm_generate = plugin.ctx.llm.generate
     gen_calls: list[dict] = []
@@ -1120,6 +1244,9 @@ async def _test_plugin_hooks() -> None:
     # 2b3. 查询 embedding 失败但有概要 → 概要兜底注入
     plugin._inject_memo.clear()  # 场景切换：清掉 2b2 的注入缓存
     vs_sum.files["长评测.txt"].summary = "本文评测了多款产品，分为三个部分。"
+    # v1.3.0：概要兜底只在「两路检索都不可用」时触发——embedding 挂了但词法还能命中，
+    # 就该走纯词法（这是本次新增的收益）。这里把词法索引标为停用，模拟超限/不可用。
+    vs_sum._lexical._disabled = True
     _dead_query_embed_calls = {"n": 0}
 
     async def _dead_query_embed(*args, **kwargs):
@@ -1140,8 +1267,9 @@ async def _test_plugin_hooks() -> None:
         for p in (it.get("parts") or [])
         if isinstance(p, dict)
     )
-    assert "仅提供概要" in dead_injected, f"应走概要兜底文案: {dead_injected[:150]}"
+    assert "已读过的文件概要" in dead_injected, f"应走概要兜底文案: {dead_injected[:150]}"
     assert "本文评测了多款产品" in dead_injected, "兜底注入应含概要正文"
+    vs_sum._lexical._disabled = False  # 恢复，避免影响后续用例
     print("[PASS] 查询 embedding 失败时概要兜底注入（大文件仍可见）")
 
     # 2b4. 小文件（阈值内）不生成概要：直注路径不触发 _ensure_summary
@@ -1356,7 +1484,7 @@ async def _test_plugin_hooks() -> None:
     # 2c4. search_file 输出带幂等标记：hook 检测到标记即跳过重复注入
     plugin._inject_memo.clear()
     tool_out = await plugin.search_file(query="备忘录里有什么待办？", session_id="memo-session")
-    assert plugin.config.reader.injection_marker in tool_out.get("content", ""), (
+    assert plugin._TOOL_TEXT_MARK in tool_out.get("content", ""), (
         f"工具输出应含幂等标记: {tool_out['content'][:100]}"
     )
     # 工具返回的内容拼进 items 后，hook 应检测 marker 并跳过

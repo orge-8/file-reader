@@ -55,11 +55,17 @@ EXPECTED_COMPONENTS = {
     "detect_file_early": ("HOOK_HANDLER", "on_file_message_early"),
     "detect_file": ("HOOK_HANDLER", "on_file_message"),
     "inject_file_context": ("HOOK_HANDLER", "inject_file_context"),
+    # v1.3.2：Planner 侧公告。只注入一句「本会话已读入哪些文件」，不注入正文。
+    # 不加这条 → Planner 看不到文件状态，会把自己答对的内容误判为幻觉并触发撤回。
+    "announce_file_context": ("HOOK_HANDLER", "announce_file_context"),
     # ── Tool
     "search_file": ("TOOL", "search_file"),
     # ── Command（组件名 ASCII，用户敲的是 pattern 里的中文，所以方法名 != 组件名）
     "file_status": ("COMMAND", "cmd_status"),
     "clear_file": ("COMMAND", "cmd_clear_file"),
+    # v1.3.0：BM25 运行期回滚开关。已部署实例的 config.toml 不会自动补新键，
+    # 只改 Field(default) 对老实例无效，所以回滚能力必须在代码层有一个命令入口。
+    "file_bm25": ("COMMAND", "cmd_bm25"),
 }
 
 #: manifest 里必须声明的运行时依赖。pdfminer.six 是 review 项：

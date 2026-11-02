@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 import time
 from dataclasses import dataclass, field
@@ -31,22 +30,57 @@ class FileEntry:
     # numpy 不可用或转换失败时保持 List[List[float]]，两条路径下游均兼容。
     vectors: Any = field(default_factory=list)
     upload_time: float = field(default_factory=time.time)
+    # v1.3.0：滑动续期——只有**实际被注入**的文件才刷新这个时间戳。
+    # 旧版按 upload_time 判过期，长文档聊到第 6 轮文件就消失，用户只能重发
+    # （重发的代价是重新解析 + 重新 embedding，远高于多留一会儿的内存）。
+    last_used: float = field(default=0.0)
     rounds: int = 0
     summary: str = ""  # 大文件 LLM 概要（v1.0.17）；空 = 未生成或生成失败
     # 原始解析文本长度（v1.0.18）：分块合并带 overlap 后 join(chunks) 会膨胀约 20%，
     # 直注/概要阈值判定必须用原文长度；0 = 旧数据无该字段，回退 sum(len(chunks))
     source_chars: int = 0
+    # 分块重叠长度（v1.3.4）：full_text() 拼全文时按它去重。
+    # 真机 22:04 实测：5875 字的 docx 直注后多出约 1400 字重复段（15 块 × overlap 100），
+    # 模型在思考里直接写出「文档有重复/损坏段落」——不是解析坏了，是拼接坏了。
+    chunk_overlap: int = 0
     # 全文拼接缓存（v1.1.0）：直注/概要取样每次都要 join(chunks)，缓存一次免重复拼接
     _full_text_cache: str = field(default="", repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.last_used:
+            self.last_used = self.upload_time
 
     def total_chars(self) -> int:
         """原文长度：优先 source_chars，旧数据回退分块拼接长度。"""
         return self.source_chars if self.source_chars > 0 else len(self.full_text())
 
     def full_text(self) -> str:
-        """分块拼接全文（缓存）。chunks 入库后不变，缓存安全。"""
-        if not self._full_text_cache and self.chunks:
+        """分块拼接全文（缓存）。chunks 入库后不变，缓存安全。
+
+        v1.3.4：按 `chunk_overlap` 去掉相邻块的重叠。旧实现是 `"".join(chunks)`，
+        每相邻两块的 overlap 被重复拼一次；真机 22:04 日志里 15 块 / 5875 字的 docx
+        注入后多出约 1400 字重复段，模型据此认为「原文有小量重复与损坏」。
+
+        用「最长重叠搜索」而不是固定切掉 N 个字符：`chunk_merge` 开启时块边界并非
+        严格等距，固定切法会切掉正文。搜索上限取 `chunk_overlap`，找不到重叠就不切。
+        """
+        if self._full_text_cache or not self.chunks:
+            return self._full_text_cache
+        if len(self.chunks) == 1 or self.chunk_overlap <= 0:
             self._full_text_cache = "".join(self.chunks)
+            return self._full_text_cache
+        parts: list[str] = [self.chunks[0]]
+        tail = self.chunks[0]
+        for chunk in self.chunks[1:]:
+            limit = min(int(self.chunk_overlap), len(tail), len(chunk))
+            cut = 0
+            for k in range(limit, 0, -1):
+                if tail.endswith(chunk[:k]):
+                    cut = k
+                    break
+            parts.append(chunk[cut:])
+            tail = chunk
+        self._full_text_cache = "".join(parts)
         return self._full_text_cache
 
 
@@ -80,14 +114,18 @@ class VectorStore:
         retrieve_top_k: int = 5,
         chunk_merge: bool = True,
         retrieve_use_matrix: bool = False,
+        lexical_max_tokens: int = 0,
     ) -> None:
         # 延迟导入 chunker，避免与 plugin.py 的 sys.path 处理耦合
         from chunker import RecursiveCharacterChunker
+        from lexical_index import LexicalIndex
 
         self._embed_fn = embed_fn
         self._chunker = RecursiveCharacterChunker(chunk_size, chunk_overlap, merge=chunk_merge)
         self.retrieve_top_k = retrieve_top_k
         self.retrieve_use_matrix = retrieve_use_matrix  # v1.0.18 C5：矩阵化检索开关
+        # v1.3.0：词法（BM25）索引，与向量检索做 RRF 融合；0 = 不设上限
+        self._lexical = LexicalIndex(max_tokens=lexical_max_tokens)
         self._files: dict[str, FileEntry] = {}
         # 矩阵缓存（C5）：L2 归一化后的全库向量矩阵 + (file_name, chunk_index, text) 索引表
         self._mat_cache: Any = None
@@ -97,9 +135,6 @@ class VectorStore:
     @property
     def files(self) -> dict[str, FileEntry]:
         return self._files
-
-    def list_files(self) -> List[str]:
-        return list(self._files.keys())
 
     def total_chunks(self) -> int:
         return sum(len(f.chunks) for f in self._files.values())
@@ -126,9 +161,18 @@ class VectorStore:
                 pass
 
         # v1.0.18：记录原文长度（overlap 合并会让 join(chunks) 膨胀，阈值判定要用原文长度）
-        entry = FileEntry(file_name=file_name, chunks=chunks, vectors=vectors, source_chars=len(content))
+        # v1.3.4：同时记住 overlap，供 full_text() 拼全文时去重（否则注入内容重复）
+        entry = FileEntry(
+            file_name=file_name,
+            chunks=chunks,
+            vectors=vectors,
+            source_chars=len(content),
+            chunk_overlap=int(getattr(self._chunker, "chunk_overlap", 0) or 0),
+        )
         self._files[file_name] = entry
         self._mat_cache = None  # 置脏：下次检索重建矩阵
+        # v1.3.0：词法索引增量登记（分词是 CPU 密集，同样进线程）
+        await asyncio.to_thread(self._lexical.add, file_name, chunks)
         return entry
 
     async def _embed(self, texts: List[str]) -> List[List[float]]:
@@ -260,27 +304,70 @@ class VectorStore:
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:k]
 
-    def cleanup_expired(self, retention_seconds: float, max_rounds: int) -> List[str]:
-        """清理过期文件（时间超限或轮数超限）。返回被清理的文件名。"""
+    def cleanup_expired(
+        self,
+        retention_seconds: float,
+        max_rounds: int,
+        absolute_ttl_seconds: float = 0.0,
+    ) -> List[str]:
+        """清理过期文件。返回被清理的文件名。
+
+        v1.3.0：过期条件三条取其一——
+          1. `now - last_used > retention`（滑动续期，只有被注入过的文件才续）
+          2. `rounds >= max_rounds`
+          3. `now - upload_time > absolute_ttl`（绝对上限，防文件永久驻留）
+        """
         now = time.time()
         removed = []
         for fname in list(self._files.keys()):
             entry = self._files[fname]
-            expired_time = (now - entry.upload_time) > retention_seconds
+            expired_time = (now - entry.last_used) > retention_seconds
             expired_rounds = entry.rounds >= max_rounds
-            if expired_time or expired_rounds:
+            expired_abs = bool(absolute_ttl_seconds) and (now - entry.upload_time) > absolute_ttl_seconds
+            if expired_time or expired_rounds or expired_abs:
                 del self._files[fname]
+                self._lexical.remove_file(fname)
                 removed.append(fname)
         if removed:
             self._mat_cache = None  # 置脏：下次检索重建矩阵
         return removed
 
     def increment_rounds(self, file_name: Optional[str] = None) -> None:
-        """给单个或全部文件增加使用轮数。"""
+        """给单个或全部文件增加使用轮数。
+
+        v1.3.0：调用方应传 `file_name`——只给**实际被注入**的文件计轮，
+        否则没被问到的文件也会跟着过期。
+        """
         names = [file_name] if file_name else list(self._files.keys())
         for n in names:
             if n in self._files:
                 self._files[n].rounds += 1
+
+    def touch_files(self, file_names: List[str]) -> None:
+        """滑动续期：刷新 `last_used`（仅对实际被注入的文件调用）。"""
+        now = time.time()
+        for n in file_names:
+            entry = self._files.get(n)
+            if entry is not None:
+                entry.last_used = now
+
+    # ── 词法检索（v1.3.0） ──────────────────────────────────────
+    def search_lexical(self, query: str, k: Optional[int] = None) -> List[dict]:
+        """BM25 检索。索引停用/空库时返回 []（调用方据此降级）。"""
+        try:
+            return self._lexical.search(query, k or self.retrieve_top_k)
+        except Exception:  # noqa: BLE001  词法检索是增强路径，绝不能影响主流程
+            return []
+
+    @property
+    def lexical_state(self) -> dict:
+        """词法索引状态（供 /file_status 诊断）。"""
+        return {
+            "tokens": self._lexical.token_count,
+            "docs": self._lexical.doc_count,
+            "disabled": self._lexical.disabled,
+            "reason": self._lexical.disable_reason,
+        }
 
 
 class SessionStore:
@@ -304,6 +391,7 @@ class SessionStore:
         retrieve_top_k: int,
         chunk_merge: bool = True,
         retrieve_use_matrix: bool = False,
+        lexical_max_tokens: int = 0,
     ) -> VectorStore:
         k = self.key(session_id, conversation_id)
         if k not in self._sessions:
@@ -314,6 +402,7 @@ class SessionStore:
                 retrieve_top_k,
                 chunk_merge=chunk_merge,
                 retrieve_use_matrix=retrieve_use_matrix,
+                lexical_max_tokens=lexical_max_tokens,
             )
         return self._sessions[k]
 
@@ -330,36 +419,3 @@ class SessionStore:
                 removed += self._sessions[k].total_chunks()
                 del self._sessions[k]
         return removed
-
-    def list_sessions(self) -> List[tuple[str, str]]:
-        return list(self._sessions.keys())
-
-    # ── 可选落盘（JSON，便于跨重启恢复元数据，向量不落盘以免过大） ──
-    def _meta_path(self) -> Path:
-        return self.data_dir / "sessions_meta.json"
-
-    def save_meta(self) -> None:
-        meta = {
-            f"{sid}\x1f{cid}": {
-                "file_count": len(vs.files),
-                "chunks": vs.total_chunks(),
-                "files": [
-                    {"name": fn, "rounds": e.rounds, "upload_time": e.upload_time}
-                    for fn, e in vs.files.items()
-                ],
-            }
-            for (sid, cid), vs in self._sessions.items()
-        }
-        try:
-            self._meta_path().write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
-        except OSError:
-            pass
-
-    def load_meta(self) -> dict:
-        p = self._meta_path()
-        if not p.exists():
-            return {}
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}

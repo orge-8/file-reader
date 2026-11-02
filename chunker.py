@@ -40,18 +40,48 @@ class RecursiveCharacterChunker:
         self.merge = bool(merge)
 
     def _split_text(self, text: str, seps: List[str]) -> List[str]:
-        """递归切分：按第一个能命中的分隔符切，保留分隔符，避免把连续文本拆成单字符。"""
+        """递归切分：按第一个能命中的分隔符切，**分隔符附着在前一片段末尾**。
+
+        v1.3.0 修复：旧实现 `text.split(sep)` 切完直接丢掉分隔符，递归也不拼回，
+        `"你好。世界"` 变成 `"你好世界"`、段落换行全部消失——注入给模型的文本没有
+        标点与分段，代码/表格最严重。这个 bug 不报错、不少块，只能靠
+        `join(chunks) == 原文` 的等价性断言发现。
+
+        两个关键约束：
+        - 递归必须传 `seps[i + 1:]`：片段末尾带了刚用过的分隔符，继续传全量 seps
+          会在「片段 + 分隔符」上再次按同一分隔符命中，导致无限递归。
+        - 空片段（连续分隔符）直接跳过：允许丢掉多余分隔符，但不能为了保留它
+          产出纯空白块。
+        """
         if not text:
             return []
         if len(text) <= self.chunk_size:
             return [text]
-        for sep in seps:
-            if sep and sep in text:
-                parts = text.split(sep)
-                out: List[str] = []
-                for part in parts:
-                    out.extend(self._split_text(part, seps))
-                return out
+        for i, sep in enumerate(seps):
+            if not sep or sep not in text:
+                continue
+            parts = text.split(sep)
+            last = len(parts) - 1
+            # 连续分隔符（"\n\n\n"、缩进空格）会产生空片段。空片段本身不入库，
+            # 但它代表的分隔符必须并进相邻片段——否则段落空行与代码缩进照样丢失。
+            merged: List[str] = []
+            pending = ""
+            for j, part in enumerate(parts):
+                tail = sep if j < last else ""
+                if part == "":
+                    if merged:
+                        merged[-1] = merged[-1] + tail
+                    else:
+                        pending = pending + tail
+                    continue
+                if pending:
+                    part = pending + part
+                    pending = ""
+                merged.append(part + tail)
+            out: List[str] = []
+            for piece in merged:
+                out.extend(self._split_text(piece, seps[i + 1 :]))
+            return out
         # 所有分隔符都不命中（无空格无标点的连续文本）：硬切
         return self._hard_split(text)
 
@@ -95,7 +125,7 @@ class RecursiveCharacterChunker:
                 buf = piece
                 continue
             if len(buf) + len(piece) <= self.chunk_size:
-                buf += piece  # 保序拼接；碎片自带分隔符后缀，不额外插入
+                buf += piece  # 保序拼接；v1.3.0 起碎片**确实**自带分隔符后缀，不额外插入
                 continue
             out.append(buf)
             # 新块以旧块尾部 overlap 字符开头，避免语义断裂
@@ -114,5 +144,18 @@ class RecursiveCharacterChunker:
             return []
         if len(text) <= self.chunk_size:
             return [text]
-        pieces = [c for c in self._split_text(text, list(_DEFAULT_SEPARATORS)) if c.strip()]
-        return self._pack(pieces)
+        pieces = self._split_text(text, list(_DEFAULT_SEPARATORS))
+        # v1.3.0：纯空白片段（段落空行、缩进残留）**并入相邻块**而不是丢弃。
+        # 旧版 `if c.strip()` 会把 "\n\n" 整段扔掉——分隔符保留做得再对，
+        # 到这里照样把段落与缩进结构丢光。放不下的空白片段才丢弃（宁可少一个空行，
+        # 也不产出超长块）。
+        normalized: List[str] = []
+        for piece in pieces:
+            if not piece:
+                continue
+            if piece.strip():
+                normalized.append(piece)
+                continue
+            if normalized and len(normalized[-1]) + len(piece) <= self.chunk_size:
+                normalized[-1] = normalized[-1] + piece
+        return self._pack(normalized)

@@ -1,19 +1,27 @@
 # 文件读取（File Reader）
 
-MaiBot 插件：解析 QQ 群/私聊上传的文件，分块向量化后按语义检索，把最相关内容注入 LLM 上下文，实现低开销的文件问答。
+MaiBot 插件：解析 QQ 群/私聊上传的文件，分块后做「向量 + BM25 词法」混合检索（RRF 融合），把最相关内容注入 LLM 上下文，实现低开销的文件问答。
 
 > 参考 [astrbot_plugin_file_reader_pro](https://github.com/zz6zz666/astrbot_plugin_file_reader_pro) 移植。AstrBot 版依赖其内置的 `FaissVecDB` / `RerankProvider`，MaiBot 无这些组件，故本插件改用 **numpy 余弦相似度自实现向量库** + MaiBot 原生 **`llm.embed`** 能力 + **`before_model_request` hook** 注入。
 
 ## 工作原理
 
 ```
-[文件] → 解析(file_parser) → 递归分块(chunker) → 向量化(llm.embed) → 会话级向量库(vector_store)
-[提问] → 语义检索 Top-K → 注入 LLM 上下文(before_model_request hook)
+[文件] → 解析(file_parser) → 递归分块(chunker) → 向量化(llm.embed) + BM25 索引(lexical_index) → 会话级库(vector_store)
+[提问] → 追问改写 → 向量检索 + 词法检索 → RRF 融合 → 相关度闸门 → 注入 LLM 上下文(before_model_request hook)
 ```
 
 - 按 `(session_id, conversation_id)` 隔离，不同会话/对话的文件互不串扰。
-- 文件有效时间（默认 60 分钟）+ 最大参与轮数（默认 5 轮）双条件过期，后台自动清理。
-- 注入带幂等标记，重试不叠加；hook 全部 `ErrorPolicy.SKIP`，插件出错不阻断聊天。
+- **混合检索**（v1.3.0）：向量负责「意思相近」，BM25 负责「字面命中」（函数名、报错码、编号、专有名词）。
+  两路分数量纲不同（余弦 0~1 vs BM25 无界），用 RRF（倒数排名融合，k=60）合并排名而不是加权求和。
+  一路不可用时自动降级：embedding 挂了还能走纯词法，词法超限就退回纯向量。
+- **追问改写**（v1.3.0）：「那第三章呢」这类短问/指代问会自动拼上上一问再检索，纯规则实现不调 LLM
+  （注入 hook 是 BLOCKING，只有 11s 预算）。
+- **滑动续期**（v1.3.0）：有效期从**最后一次被注入**起算，且只给实际被问到的文件计轮；
+  另设绝对上限（默认 12 小时）防止文件永久驻留。长文档不再聊到第 6 轮就消失。
+- **没读到就说没读到**：解析失败不刷群，只把原因注入给模型（由 persona 决定说不说、怎么说）；
+  检索无命中时不注入任何内容（旧版会拿概要顶上，反而诱导模型编）。
+- 注入用 `item_id` 前缀判幂等，重试不叠加；hook 全部 `ErrorPolicy.SKIP`，插件出错不阻断聊天。
 
 ## 安装
 
@@ -40,10 +48,19 @@ MaiBot 插件：解析 QQ 群/私聊上传的文件，分块向量化后按语�
 **可选手工安装**（缺失时全部有降级路径，不影响插件加载与其它格式）：
 
 ```bash
-pip install chardet          # txt 编码探测；缺失时退回多编码轮询猜测
+pip install chardet          # txt 编码探测；缺失时退回多编码轮询猜测（utf-8 → gb18030 → utf-16）
+pip install docx2txt         # docx 兜底：标准库 zip+XML 是主路径，它只在主路径解析为空时补位
+pip install python-pptx      # pptx 兜底：同上
 pip install pandas openpyxl  # 仅 .xls / .ods 老表格格式（xlsx/csv 已零依赖）
-pip install python-docx      # 仅 .doc 老格式（建议直接转存 .docx）
 ```
+
+> 这些包**刻意不写进 manifest 的 `dependencies`**：`pandas` 随宿主基线安装（MaiBot 的
+> `pyproject.toml` 已含 `pandas>=2.3.1`），其余三个都是「标准库主路径失败后才补位」的兜底，
+> 写进 dependencies 会让每次部署多装若干重依赖，而收益只体现在边缘格式上。
+> 全部按 try-import 处理，缺失时只在对应格式退化，不阻断加载。
+>
+> `.doc` / `.xls` / `.ppt` 旧版二进制格式不做解析（`file_parser.RECOGNIZED_UNSUPPORTED`），
+> 收到时会给模型明确原因并建议另存为新格式，不会静默失败。
 
 ## 下载安全策略（v1.2.0）
 
@@ -97,8 +114,9 @@ pip install python-docx      # 仅 .doc 老格式（建议直接转存 .docx）
 | reader.chunk_merge_enabled | bool | true | 短碎片合并（v1.0.18）：相邻短碎片合并到接近 chunk_size 再成块，块数降至约 1/3，入库向量化耗时同步下降；关闭回退旧逐碎片成块 |
 | reader.retrieve_top_k | int | 6 | 检索返回的相关块数量 |
 | reader.retrieve_use_matrix | bool | true | 矩阵化检索（v1.0.18）：缓存 L2 归一化向量矩阵，查询时一次点积算全库相似度（入库/清理自动置脏重建）；块数多时检索开销显著下降；异常自动回退逐条余弦 |
-| reader.file_retention_time | int | 60 | 文件有效时间（分钟） |
-| reader.file_max_rounds | int | 5 | 文件最大参与轮数 |
+| reader.file_retention_time | int | 60 | 文件有效时间（分钟）。**v1.3.0 起为滑动续期**：从最后一次被注入起算，没人问就会正常过期 |
+| reader.file_max_rounds | int | **20**（v1.3.0，旧版 5） | 文件最大参与轮数，**只给实际被注入的文件计轮**。⚠️ 已部署实例的 config.toml 会保留旧值 5，需手动改或删掉重新生成 |
+| reader.file_absolute_ttl | int | 720 | 文件绝对存活上限（分钟，自入库起算）：一直被问到的文件也不能永久驻留；0 = 不限制 |
 | reader.cleanup_interval | int | 5 | 后台清理间隔（分钟）；同时负责回收空会话向量库与裁剪概要冷却表（v1.1.0） |
 | reader.enable_group | bool | true | 是否处理群聊文件 |
 | reader.download_url_policy | str | whitelist | URL 下载校验策略（v1.2.0）：`whitelist` = 只允许白名单域名；`public` = 允许任意主机但仍必须是公网 IP；`off` = 不校验（仅排障，危险）。三种策略**都**拒绝回环/私网/链路本地地址并逐跳校验重定向；写错的值退回 `whitelist`。v1.2.1 起校验通过的 IP 会**钉定到实际连接**（Host/SNI/证书校验仍按原主机名），DNS 重绑定窗口关闭 |
@@ -107,7 +125,7 @@ pip install python-docx      # 仅 .doc 老格式（建议直接转存 .docx）
 | reader.download_allow_private_hosts | bool | false | 允许下载目标解析到内网/回环（v1.2.0）。仅当适配器用本机 HTTP 服务提供文件时才需要，且该主机还必须同时加进白名单；开启等于重新放开对内网的访问能力，默认关闭 |
 | reader.download_ca_bundle | str | （空） | 自定义 CA 证书路径（PEM）。运行机器有 TLS MITM 代理时指向代理根证书即可**保持证书校验开启**，优先用这个而不是 insecure_download |
 | reader.insecure_download | bool | false | 下载文件时跳过 SSL 证书校验（内网 MITM 代理环境用，见常见问题）。优先改用 `download_ca_bundle`；开启后白名单之外仍是拒绝的，但对该域名不再把关证书 |
-| reader.injection_marker | str | 【文件检索】 | 注入文本的幂等标记 |
+| reader.injection_marker | str | 【文件检索】 | **已废弃（v1.3.0，保留字段仅为兼容旧 config.toml）**。幂等判定改看注入项的 `item_id` 前缀，与正文内容解耦——旧版靠正文 marker 判重，marker 被清空就变成永不注入 |
 | reader.silent_success | bool | true | 文件入库成功后保持静默（不发回执，日志仍记录）；设为 false 恢复「已解析 N 块」回执 |
 | reader.silent_errors | bool | true | 错误回执静默（v1.0.20）：文件处理失败（不支持的类型/下载失败/超限/embedding 失败/重试耗尽等）只写日志、不发群消息；设为 false 恢复 ⚠️ 错误回执 |
 | reader.embed_retry_interval | float | 2.0 | 嵌入失败后台重试间隔（分钟）；入库时 embedding 超时会先进后台队列定时重试 |
@@ -123,6 +141,15 @@ pip install python-docx      # 仅 .doc 老格式（建议直接转存 .docx）
 | reader.summary_max_chars | int | 500 | 概要文本的最大长度（字符数） |
 | reader.summary_await_on_inject | bool | false | 提问注入时是否同步等待概要生成（v1.0.17 旧行为）；默认 false = 概要后台生成、不阻塞注入，下次提问自然带上 |
 | reader.summary_retry_interval | float | 600.0 | 概要生成失败后的冷却秒数：冷却期内不再尝试生成（避免每次提问都撞一次超时）；0 = 不冷却 |
+| reader.hybrid_retrieve_enabled | bool | true | BM25 词法检索总开关（v1.3.0）。开启后检索走「向量 + 词法 RRF 融合」，对函数名/报错码/编号这类字面查询显著更准；体感变差可关闭退回纯向量，**或直接用 `/file_bm25 off`** |
+| reader.hybrid_candidate_k | int | 20 | 每路（向量/词法）参与融合的候选数 |
+| reader.rrf_k | int | 60 | RRF 融合常数（越大排名差异越平缓） |
+| reader.lexical_max_tokens | int | 2000000 | 单会话词法索引 token 上限：超过即停用该会话的词法检索并退回纯向量（防大文件会话内存膨胀），原因在 `/file_status` 可见；0 = 不限制 |
+| reader.retrieve_min_score | float | 0.15 | 向量相关度绝对下限：余弦低于此值的候选在融合前丢弃。只作用于**有向量分**的候选，纯词法命中不受影响；0 = 关闭 |
+| reader.retrieve_min_ratio | float | 0.5 | 融合后相对下限：低于 Top1 分数该比例的结果丢弃；0 = 关闭 |
+| reader.query_rewrite_enabled | bool | true | 追问改写（v1.3.0）：短问/指代问自动拼上上一问再检索；纯规则，不调 LLM |
+| reader.ack_min_chars | int | 20000 | 大文件入库回执阈值（原文字符数）：达到该值（或处理耗时 ≥ 10s）时回一条中性「已读取《X》，共 N 段」；0 = 不发 |
+| reader.parse_notice_ttl | int | 600 | 解析失败通知的存活秒数（v1.3.0）：失败原因注入给模型（不发群消息），TTL 内只注入一次 |
 | **napcat.enabled** | bool | false | **启用 NapCat HTTP 兜底取文件**（见下，QQ 发文件必须开） |
 | napcat.http_url | str | http://127.0.0.1:3001 | NapCat OneBot HTTP 服务地址 |
 | napcat.access_token | str | 空 | NapCat HTTP 的 access_token（未设置则留空） |
@@ -149,7 +176,8 @@ file 段的 `file_id` → `get_file` 换本地路径 → 读盘解析。任一�
 | 命令 | 说明 |
 |---|---|
 | `/clear_file` 或 `/clean_file` | 清除当前会话所有已入库文件 |
-| `/file_status` | 查看插件状态（库规模/嵌入模型可用性/配置） |
+| `/file_status` | 查看插件状态（库规模/嵌入模型可用性/配置/**最近一次检索诊断**：模式、候选数、Top1 分数、耗时） |
+| `/file_bm25 on\|off` | **v1.3.0 回滚开关**：运行期开关 BM25 词法检索，立刻生效、无需重启；不加参数则查看当前状态。重启后回到配置文件的值 |
 
 ## 使用
 
@@ -158,13 +186,29 @@ file 段的 `file_id` → `get_file` 换本地路径 → 读盘解析。任一�
 
 ## 支持的文件类型
 
-- 文档：`pdf` `docx` `doc` `rtf` `odt`
-- 表格：`xlsx` `xls` `ods` `csv`
-- 演示：`pptx` `ppt` `odp`
+**真支持（零依赖）**
+
+- 文档：`pdf`（需 pdfminer.six，已在 manifest 声明）`docx` `odt` `epub` `eml`
+- 表格：`xlsx` `ods` `csv`
+- 演示：`pptx` `odp`
+- 网页/笔记本：`html` `htm`（去标签，跳过 script/style）`ipynb`（取 cells，跳过 outputs）
+- 压缩：`gz`（解压后按内层扩展名递归解析）
 - 代码：`py` `java` `cpp` `c` `h` `hpp` `cs` `js` `ts` `php` `rb` `go` `rs` `swift` `kt` `scala` `sh` `bash` `ps1` `bat` `cmd`
-- 标记：`md` `markdown` `html` `htm` `xml` `json` `yaml` `yml`
+- 标记：`md` `markdown` `xml` `json` `yaml` `yml`
 - 配置：`ini` `cfg` `conf` `properties` `env` `toml`
-- 其他：`sql` `txt` `log` `lock` `gitignore` `url` `webloc`
+- 其他：`sql` `txt` `log` `lock` `gitignore` `url` `webloc` `srt` `vtt` `ass` `tex` `rst` `bib`
+
+**条件支持**
+
+- `xls`：旧版二进制需 `pandas` + `xlrd`；扩展名写错（其实是 xlsx）时按内容嗅探正常解析。
+
+**可识别但不支持**（会给出明确原因，不再输出乱码）
+
+- `doc` `ppt`：旧版二进制 Office → 提示另存为 docx/pptx。
+- `rtf`：读出来是控制字乱码 → 提示另存为 docx/txt。
+
+**扩展名不可信时按内容判断**：插件会嗅探文件内容（PDF/OLE/RTF 魔数、ZIP 内的 `mimetype` 与 OOXML 目录结构）。
+改名的 docx（`.bin`）、转发后丢失扩展名的文件都能正确识别——只读中央目录，不解压正文。
 
 ## 自检 / 测试
 
@@ -172,21 +216,21 @@ file 段的 `file_id` → `get_file` 换本地路径 → 读盘解析。任一�
 # 结构自检
 python tools/check_plugin.py plugins/file-reader
 
-# 冒烟测试（FakeHost 完整生命周期，9 项：组件清单 / manifest 一致性 / SSRF 守卫 / 卸载收尾）
+# 冒烟测试（FakeHost 完整生命周期，11 项：组件清单 / manifest 一致性 / SSRF 守卫 / 卸载收尾）
 python plugins/file-reader/tests/smoke_test.py
 
-# 下载安全守卫（pytest，60 项参数化用例，门禁里的 pytest 步骤跑的就是它）
+# pytest（168 项：下载安全守卫 + 分块 / 词法 / 注入 / 格式解析，门禁里的 pytest 步骤跑的就是它）
 python -m pytest -q plugins/file-reader/tests
 
-# 功能自测（解析→分块→向量化→检索→清理 + hook 直调，66 项，用伪 embedding 不依赖真模型）
+# 功能自测（解析→分块→向量化→检索→清理 + hook 直调，71 项，用伪 embedding 不依赖真模型）
 python plugins/file-reader/test_file_reader.py
 ```
 
 > ⚠️ **`run_gates.py` 的 pytest 步骤只收集 `tests/` 目录**。综合功能自测
-> `test_file_reader.py` 位于**插件根目录**，门禁**看不到它**——改完功能必须手工跑一次，
+> `test_file_reader.py`位于**插件根目录**，门禁**看不到它**——改完功能必须手工跑一次，
 > 并确认退出码为 0。v1.1.0 就是因为只信了门禁的"全绿"，把已经变红的自测和 SSRF 问题
 > 一起带进了提交（当时门禁只跑 `check_plugin`，冒烟与 pytest 都是缺席状态）。
-> 现在 `tests/` 下已有冒烟与 pytest 用例，但**根目录那 66 项仍不在门禁范围内**。
+> 现在 `tests/` 下已有冒烟与 pytest 用例，但**根目录那 71 项仍不在门禁范围内**。
 
 ## 常见问题
 
@@ -199,233 +243,21 @@ python plugins/file-reader/test_file_reader.py
 - **文件「没有下载：文件链接不在允许下载的域名白名单内」**（v1.2.0）：URL 来源的文件被安全策略拦下了，日志里会有 `[下载拒绝] URL 未通过安全校验（<原因>）`。若你的环境用的是非 QQ 的适配器/CDN，把它的域名加进 `reader.download_allowed_hosts`（逗号分隔，后缀匹配）；确需放开任意公网主机可改 `download_url_policy = public`（仍会拒绝内网地址）。
 - **想让本机适配器的 HTTP 文件服务被读**（如文件 URL 指向 `127.0.0.1`）：需**同时**满足两个条件——把该主机加进 `download_allowed_hosts`，并设 `download_allow_private_hosts = true`。注意这等于重新放开对内网的访问能力，请确认你真的需要。
 - **Hook 报 `'ReaderConfig' object has no attribute 'xxx'`**：配置字段按 section 分层，`enabled` 在 `plugin` 段（`self.config.plugin.enabled`），读取参数在 `reader` 段；跨段误访问会直接 AttributeError（v1.0.0 真机踩过，v1.0.1 已修）。
+- **旧版 `.doc` / `.ppt` 为什么读不了**（v1.3.0）：它们是 OLE 二进制格式，解析需要 LibreOffice/antiword 级外部依赖，不适合塞进插件子进程。现在插件会识别 OLE 魔数并**明确提示**「请另存为 docx/pptx」，而不是丢一个 `缺少 python-docx` 的莫名错误或一堆乱码。
+- **`.rtf` 为什么被移出支持列表**（v1.3.0）：旧版按纯文本读，解析出来全是 `\rtf1\ansi` 控制字——既占 token 又毫无信息。现在直接提示另存为 docx/txt。
+- **`.odt` / `.ods` / `.odp` 现在能读了**（v1.3.0）：旧版分别走纯文本 / pandas / pptx 解析器（后者结构完全不同，必然失败）。现在用 `zipfile` + `ElementTree` 直接解 `content.xml`，零依赖。
+- **检索感觉不如以前**（v1.3.0 混合检索）：先试 `/file_bm25 off` 退回纯向量——立刻生效、不用重启、不用改配置。确认是配置问题再动 `reader.hybrid_retrieve_enabled`。想调松紧用 `retrieve_min_score`（绝对下限）/ `retrieve_min_ratio`（相对 Top1）。
+- **升级后 `/file_status` 里看不到新配置项**：宿主的 `config.toml` 只在文件**不存在**时生成，之后只会补新增字段、**已存在字段的值一律保留**。所以 `file_max_rounds` 若想用新的 20，需要手动改 `config.toml` 或删掉它重新生成（删前记得抄下 `admin_ids` 之类的现值）。
+- **文件聊着聊着就没了**：v1.3.0 起有效期按「最后一次被注入」滑计算，并新增绝对上限 `file_absolute_ttl`（默认 720 分钟）。若确实需要更久，调大这两项；`file_max_rounds` 也要一起看（默认 20 轮，只给实际被问到的文件计轮）。
 
-## 更新日志
-
-### v1.2.1（2026-10-07）市场 review 加固：跨会话兜底收紧 + DNS 重绑定 + verify_ssl 默认值
-
-三条加固全部来自插件中心 AI review（均非阻断项，本轮主动收掉）：
-
-- **search_file 跨会话兜底收紧（隐私向，review 第 1 条）**：旧版 LLM 不传/传错 session_id 时回退「最近有文件入库的会话」——多人群场景下等于把 A 会话上传的文件正文塞进 B 会话的 LLM 上下文，且真机日志证明 Planner 确实经常不传该参数，不是纸上风险。现在 `_resolve_tool_session` 规则改为：显式 session_id 命中直接用；**仅当全局只有一个会话存有文件时**才自动定位（v1.0.15 的单会话场景不回退）；多会话歧义时**拒绝兜底**（fail-closed），返回可执行的指引（提示补传 session_id）并打 WARNING 日志留痕，拒绝路径不泄露任何会话信息。hook 侧 `inject_file_context` 本就是精确匹配注入，不受影响。工具描述同步更新，帮助 LLM 在多会话场景主动带上 session_id。
-- **下载连接钉定，关闭 DNS 重绑定窗口（review 第 2 条）**：旧版 `validate_download_target` 校验时解析一次 DNS，httpx 连接时**再解析一次**——两次解析之间域名可以换 IP；`download_url_policy = public`（README 明写的逃生口）下，攻击者自持 DNS 的域名可以先解析到公网 IP 过检、连接时再解析回内网 IP。现在校验通过的解析结果经 `collect_ips` 带出，实际请求直接连这些已校验 IP（`build_pinned_request`：Host 头/SNI/证书校验仍按原主机名，https 用 httpcore 的 `sni_hostname` 扩展，证书校验不降级），重定向每一跳独立「校验 → 钉定」，多个已校验 IP 只有连接类错误才依次尝试、绝不重新解析。`policy = off` 不解析也就无从钉定，维持旧行为。顺带把阻塞的 `getaddrinfo` 挪进 `asyncio.to_thread`，不再卡事件循环。
-- **napcat.verify_ssl 默认 false → true（review 第 3 条）**：旧默认在 https 地址下会连主机名校验一起关掉（CERT_NONE）。新实例默认开启校验；**存量实例的 config.toml 不会跟随新默认值**，因此启动自检新增一条风险告警：`napcat.verify_ssl=false` 且 `napcat.http_url` 为 https 地址时打 WARNING（与 download 风险配置告警同款机制），提示改用系统信任的证书而不是关校验。
-- 测试：pytest 门禁用例 72 项（新增连接钉定 6 项：`build_pinned_request` 单元契约、collect_ips 拒绝路径不带出 IP、端到端「出站请求打到已校验 IP」、重定向逐跳钉定）；smoke 新增「下载连接钉定」「search_file 跨会话兜底护栏」两项防回归，并把 verify_ssl 告警纳入风险配置告警检查；根套件新增 2a6b（多会话歧义拒绝兜底、拒绝不泄露内容、显式 session_id 各自命中）与 3h/4h/4i。两项修复均做了**反向验证**：还原旧实现后新用例确实 FAIL（钉定还原 → 域名参与连接；旧兜底还原 → LLM 幻觉 session_id 时拿到其他会话内容）。
-
-### v1.2.0（2026-09-20）下载 SSRF 防护 + 依赖声明修正
-
-针对插件市场 review 的三条阻断项与一条提醒：
-
-- **【安全·阻断】URL 下载加白名单与地址校验（SSRF）**。旧版 `_download` 对 URL 不做任何域名或目标地址校验：
-  而该 URL 来自消息正文（`_parse_file_hints` 从 `链接: ...` 抠出来），等于任何群成员都能
-  让插件去 GET `http://127.0.0.1:...` 或 `http://169.254.169.254/latest/meta-data` 并把响应解析进上下文。
-  现新增模块级校验层，下载前必过：协议（仅 http/https）→ 拒绝内嵌凭据 → 域名后缀白名单
-  → **解析后每个 IP 必须为公网**。默认白名单为 QQ 文件域，**只比域名字符串挡不住**
-  `http://2130706433/`、`http://0x7f000001/`、`http://127.0.0.1.nip.io/` 这类写法，所以校验落在解析结果上。
-  新增配置：`download_url_policy` / `download_allowed_hosts` / `download_max_redirects` /
-  `download_allow_private_hosts`（详见「下载安全策略」一节）。
-- **【安全】重定向逐跳校验**。httpx 自动跟随关闭，改为手动逐跳：每一跳重新过完整校验，
-  跳数受 `download_max_redirects` 限制——否则白名单域名 302 到内网即可绕过。
-  副作用是修复了旧版「QQ 链接 302 时下载直接失败」的行为。
-- **【安全】`insecure_download` 不再是绕开 TLS 的唯一手段**。新增 `download_ca_bundle`：
-  指向 MITM 代理根证书即可保持证书校验开启（更推荐）。启动自检会把
-  `insecure_download` / `download_allow_private_hosts` / `policy=off` 这些风险配置
-  以 `[自检][安全] 风险配置：...` 显式打日志。
-- **【安全】下载日志脱敏**：QQ 下载链接 query 带凭据，日志只留 scheme+host+path。
-- **【阻断】manifest `urls.repository` 修正**为实际仓库 `github.com/orge-8/file-reader`
-  （旧值误写为 `maibot-file-reader`）。
-- **【阻断】manifest 补声明 `pdfminer.six`**：PDF 无标准库解析路径，缺库时只报「缺少依赖」，
-  而描述里 PDF 是核心能力——属功能与声明不符，现作为必需依赖由 manifest 声明。
-- **【修复】两处测试用例缺陷**（v1.1.0 自测里就存在，是它掩盖了上面的问题）：
-  - `1j2 拆批部分失败` 用例引用了未定义的 `batch_seq`，首次调用即抛 `NameError`，
-    于是"第 1 批失败 → 整单返回空"也满足断言 `result == {}`，**用例本身完全没验证到目标场景**。
-    已改为按批内容区分失败批，并反查模拟调用序列 `["a","d","d"]` 锁死"第 2 批重试全失败"。
-  - `1g3 多文件端到端` 用固定 `await asyncio.sleep(0.5)` 等并发后台任务，属竞态（偶发误报少文件）。
-    已改为轮询等待条件成立。
-- **【修复】`is_public_ip` 不能只依赖 `is_global`**：CPython 的 IPv4 `is_global` 不把组播
-  `224.0.0.0/4` 算作非公网（实测返回 True），已显式叠加 `is_multicast`/`is_reserved`/
-  `is_link_local`/`is_loopback`/`is_private`/`is_unspecified` 判定（由新增测试抓出）。
-- 新增 15 条 SSRF 回归用例，含"白名单域名被 302 到云元数据后 **169.254.169.254 从未被请求**"
-  与"首跳即被拒时零请求发出"两条以"实际发包记录"为证据的断言。
-- **补齐测试基建，让门禁不再是假绿**（v1.1.0 门禁只跑了 `check_plugin` 一项，
-  冒烟与 pytest 都是缺席状态，所以"全绿"毫无意义）：
-  - 新增 `tests/smoke_test.py`（9 项）与 `tests/fakehost.py`：装入插件跑完整生命周期，
-    覆盖组件清单（数量/类型/处理器名，专抓装饰器绑错人）、manifest 一致性、
-    SSRF 守卫、风险配置告警、卸载收尾、hook 只读性、命令回执。
-  - 新增 `tests/test_download_guard.py`（60 项参数化用例）：把下载安全契约做成
-    门禁能跑到的一份，含"解析结果而非域名字符串""混合 DNS 结果也拒""非法策略退回 whitelist"。
-  - 门禁结果从 `PASS 1 SKIP 0 FAIL 0`（假绿）变为 `PASS 3 SKIP 0 FAIL 0`。
-  - 另修：`tests/smoke_test.py` 里日志断言的 `_LogCapture` 曾把 `getMessage()` 二次格式化，
-    退化成未填参的模板文本，导致告警断言永远不匹配（自测写错，非产品缺陷）。
-
-### v1.1.0（2026-09-07）性能与内存专项优化
-
-审计报告见 `PERF_AUDIT.md`（11 项），本版全部修复：
-
-**事件循环阻塞（P0）**
-- **本地路径读文件进线程**：`_handle_file` 里 `Path.read_bytes()`（含 NapCat 落盘路径分支）是同步 IO，100MB 级文件会冻结整个事件循环（所有聊天/hook 全停顿）；现包 `asyncio.to_thread`，与解析路径行为对齐。
-- **分块进线程**：递归分块是 CPU 密集任务（百万字文本可达秒级），`VectorStore.add_file` 的 `chunker.chunk()` 同样包 `to_thread`。
-- **下载流式化 + 双重预检**：Content-Length 超限直接中断（不开始下载）；流式边下边累计，超限立即抛 `_DownloadTooLargeError`——旧版 `resp.content` 全量入内存且大小检查在下载完成之后，超限文件也先全下（瞬时内存 2~3 倍文件大小）。超限回执措辞不变。
-- **httpx AsyncClient 单例**：连接池复用，免每次下载新建 client + SSL 上下文；`insecure_download` 配置变化时自动重建。
-
-**内存无界增长（P1）**
-- **空会话回收**：文件全过期后，(session_id, conversation_id) → 空 VectorStore 壳永久驻留（每群/每人一个）；清理循环现 `drop` 空库。
-- **后台任务句柄注册表**：`create_task` 裸调只靠事件循环弱引用持有（有 GC 提前回收风险），且进行中的下载/解析/概要任务在 `on_unload` 后泄漏、插件重载后仍写旧 store；现统一走 `_spawn_bg()` 注册，卸载时全部取消并等待收尾。
-- **重试队列不再持有全文**：条目从「解析全文」（可达数 MB × 最长 1 小时驻留）改为「临时文件路径」，重试到期时重新读取解析；成功/放弃/覆盖/on_unload 时均删除临时文件；临时文件丢失（系统清 temp）时明确提示重发。
-
-**内存占用与计算效率（P2）**
-- **向量统一 float32 ndarray**：入库后 `List[List[float]]`（Python float 每维 ~32B）转 `np.float32` 单块数组，内存约降 8 倍；矩阵构建/余弦直接复用；无 numpy 时自动回退列表。
-- **检索 Top-K 用 argpartition**：O(N log N) 全排序 → O(N) 选 K 再排序；库大时有感。
-- **注入幂等检查早退**：逐项检查 marker 即停，不再把全部上下文 items 拼成大字符串。
-- **直注/概要全文缓存**：`FileEntry.full_text()` 缓存 join 结果，memo 未命中时不再每次 hook 重新拼接。
-- **概要 pending 键修正**：`id(entry)` → `file_name`——CPython 下 entry 释放后 id 可能被新对象复用，理论上误判 in-flight 导致某文件概要永不生成。
-- **概要冷却表裁剪**：`_summary_failed_ts` 24h 过期 + 总量封顶 256，随清理周期执行。
-- **正则预编译**：降级文本解析 2 个正则、OOXML 前缀修正 3 个正则提到模块级。
-- **NapCat SSL 上下文缓存**：`ssl.create_default_context()` 是 ms 级 CPU 调用，旧版每次 `_napcat_post` 新建；现实例级缓存（verify_ssl 变化时重建）。
-
-**依赖与配置**
-- **manifest 补声明 `httpx>=0.24`**：URL 下载路径的必需依赖，旧版漏声明——真机未装 httpx 时下载功能直接废掉。
-- **`max_file_size` 默认 100 → 30MB**：与流式预检配合，内存峰值可控；大内存机器可调回。
-- **`cleanup_interval` 默认 15 → 5 分钟**：过期文件最长多驻留时间同步下降；空会话回收/冷却表裁剪也挂在这个周期上。
-
-### v1.0.20（2026-09-04）错误回执静默
-
-- **新增 `silent_errors` 配置（默认 true）**：文件处理失败（不支持的类型、下载失败、超限、embedding 失败/重试耗尽、NapCat 未启用等）不再发送 ⚠️ 错误回执到群，只写 `logger.warning` 日志；需要恢复错误回执时设为 `false`。
-- **收口方法**：新增 `_reply_error(stream_id, text, *, reason)` 统一处理所有错误回执点，所有错误路径替换为 `_reply_error`，受 `silent_errors` 开关控制。
-- **测试**：新增 silent_errors 静默测试（默认静默不回执，开关关闭恢复 ⚠️ 提示）+ 6 处既有测试适配（临时 `silent_errors = False` 验证错误回执可见性），53/53 PASS + GATE PASS。
-
-### v1.0.19（2026-09-03）防抖合并消息多文件修复
-
-- **修复：message-debounce-cn 防抖合并消息里只有第一个文件被处理**（真机 09-03 10:49 日志）：防抖插件会把连续多条文件消息合并成一条（最多观测到 14 个文件合并成 1 条），文本含多行 `[文件] xxx，大小: N，链接: https://...`；旧版 `re.search` 只取第一个 `[文件]`，其余文件全部静默丢弃——批量发 20 个文件只有 3~4 个入库，且无任何报错。
-- **修复方案**：新增 `_parse_file_hints`（复数）逐行解析全部 `[文件]` 行，每行独立摘出自己的下载链接（URL 各自归属，不再只认第一个）；`_detect_file` 对所有解析出的文件各自入库。单文件旧语义经 `_parse_file_hint` 兼容保留。
-- **测试**：新增防抖合并 3 行解析（文件名/大小/URL 逐行正确）+ 多文件端到端入库（各自走 URL 下载）2 个用例，52/52 PASS + GATE PASS。
-
-### v1.0.18（2026-09-02）性能优化专项
-
-五项优化（C1–C5），全部带独立开关可回滚旧行为；回归 49/49 PASS + GATE PASS。
-
-- **C1 分块合并**（`chunk_merge_enabled`，默认开）：递归切分出的相邻短碎片合并到接近 `chunk_size` 再成块，块数降至约 1/3，入库向量化耗时同步下降；`FileEntry` 新增 `source_chars` 记录原文长度，直注/概要阈值判定不再被 overlap 膨胀误导。
-- **C2 embedding 并发提速**（`embed_concurrency` + `embed_batch_size`）：入库拆批后多批并发调用 `llm.embed`（默认并发 2），`embed_batch_size` 默认 16 → 64；新增 `query_embed_timeout`（默认 8s）——提问时查询 embedding 仅单次调用、超时立即降级概要兜底不重试，避免拥塞期把用户卡在请求模型之前。
-- **C3 注入 memo 去重**（`inject_memo_enabled` / `inject_memo_ttl`）：同一会话同一问题在 TTL（默认 90s）内直接复用上次注入文本，零 embedding、零检索；hook 检索路径与 search_file 工具输出共享幂等标记，互不重复注入；文件入库、清文件、会话清理时自动失效。
-- **C3 轮数去重**：`_tick_rounds_once` 按（问题，120s 窗口）计数，同问题跨 hook/tool/attempt 多次触发只算 1 轮——修复 5 轮配额被双触发减半的问题。
-- **C4 概要异步化**（`summary_await_on_inject`，默认 false）：提问注入不再同步等待概要生成（旧行为会把 BLOCKING hook 卡住数秒），概要在后台生成、下次提问自然带上；`id(entry)` in-flight 去重防止重复起任务；`summary_retry_interval`（默认 600s）失败冷却，避免每次提问都撞一次超时；入库预热与懒生成共用同一入口。
-- **C5 矩阵化检索**（`retrieve_use_matrix`，默认开）：缓存 L2 归一化向量矩阵，查询时一次点积算全库相似度；入库/清理/删文件自动置脏重建；块数多时检索开销显著下降，结果与逐条余弦一致，异常自动回退旧路径。
-- **测试**：42 → 49 用例，新增异步概要（不阻塞/in-flight 去重/失败冷却）、注入 memo（去重/失效/轮数去重/tool 标记）、矩阵检索（一致性/置脏/回退）等；新增 2b5 前排空后台任务等时序隔离措施。
-
-### v1.0.17（2026-09-02）
-
-- **大文件 LLM 概要注入**：全文超 `direct_inject_max_chars` 的文件，入库后用 `llm.generate` 生成一段概要（`FileEntry.summary` 缓存），注入上下文时概要附在检索片段之前——LLM 对大文件先有整体认识，再按需引用检索片段，缓解「只看到零散 chunk 不知道文件在讲什么」的问题。
-- **概要取样策略**：源文本超 `summary_source_chars`（默认 12000 字）时按头/中/尾三段均匀取样拼接，控制摘要调用的 token 开销。
-- **入库后后台预热**：大文件入库成功即 `asyncio.create_task` 预生成概要，不阻塞回执；注入时若发现还没生成会懒生成兜底（`_ensure_summary`）。
-- **降级链路**：生成失败/异常一律静默降级，检索与注入不受影响；查询 embedding 失败但有概要时至少注入概要兜底；检索无命中但有概要时也注入概要。
-- **manifest 变更**：capabilities 新增 `llm.generate` 声明——**真机部署时 `_manifest.json` 必须同步替换**（capabilities 变更不热更新，需完整重启）。
-
-### v1.0.16（2026-09-02）
-
-- **修复 search_file 装饰器错绑（真机 19:15 日志，v1.0.15 回归）**：v1.0.15 把辅助方法 `_resolve_tool_session` 插在了 `@Tool` 装饰器与 `search_file` 定义之间——装饰器绑定的是紧随其后的函数，导致 search_file 工具被注册到辅助方法上，真机每次调用报 `unexpected keyword argument 'query'`。本地测试是直调方法所以没暴露。已把辅助方法移到装饰器之前，并同类排查出 v1.0.14 的 `@HookHandler` 与 `inject_file_context` 之间也插了 `_full_text_within_limit`（同一错误模式），一并修复。
-- **新增装饰器绑定回归测试**：静态检查全部 6 处 `@Tool/@HookHandler/@Command` 装饰器-函数配对，辅助方法误插装饰器后立即 FAIL——本地即可拦截此类「直调测不出、真机必炸」的错误。
-- 回归 32/32 PASS，GATE PASS。
-
-### v1.0.15（2026-09-02）
-
-- **search_file 会话兜底（真机 18:51 日志修复）**：狸猫私聊场景——文件 18:51:30 已成功入库（81 块），但 Planner 三次调用 `search_file` 全部返回「当前会话还没有已入库的文件」。日志显示第一次调用传了 `session_id=''`、之后干脆不传——不能指望 LLM 每次都传对参数。现在 `_resolve_tool_session` 兜底：显式 session_id 命中直接用；否则自动定位「最近有文件入库的会话」（单会话场景必命中，多会话取最近上传的）；库为空时仍如实报告。工具描述同步注明「session_id 可留空」，返回结果携带实际会话 ID 与文件名清单，帮助 LLM 后续调用对齐。
-- 回归 31/31 PASS（新增「空/错 session_id 兜底定位、空库如实报告」用例）。
-
-### v1.0.14（2026-09-02）
-
-- **小文件全文直注**：新增 `reader.direct_inject_max_chars`（默认 6000 字）——会话内所有文件解析后全文合计不超过该值时，注入 hook 跳过 RAG 检索，**直接把文件全文注入 LLM 上下文**。小文件不再被 Top-K 检索截断丢内容，且完全绕开查询 embedding 调用（拥塞期查询也可能超时，直注路径零 RPC）；`search_file` 工具同步受益，小文件直接返回全文。超过阈值回落原检索路径，`0` 可关闭直注。
-- `/file_status` 新增「全文直注阈值」行。
-- 回归 30/30 PASS（新增直注命中、超阈值回落、阈值 0 关闭、幂等标记、search_file 全文 5 个用例）。
-
-### v1.0.13（2026-09-02）
-
-- **embedding 大批量拆批调用（关键修复）**：真机 15:38 日志对比发现——黄石区 docx（38996 字节 ≈ 78 块）从 14:05 起**每次**都 30s 超时，而同期 A_Memorix / 表达向量的嵌入都成功；根因不只是拥塞，而是**把 78 块塞进一次 `llm.embed` RPC，单次调用本身就撞 cap.call 30s 上限**。现在按 `reader.embed_batch_size`（默认 16）拆批逐个调用再拼回结果，每次 RPC 远低于上限；某批失败则整单返回空（不拼残缺向量），由既有后台队列重试机制兜底。拆批进度有 INFO 日志。
-- 回归 25/25 PASS（新增「10 条拆 4+4+2 三批合并」「拆批部分失败整单返回空」两用例）。
-
-### v1.0.12（2026-09-02）
-
-- **`embed_max_retries` 默认 10 → 30**：真机 15:00–15:20 日志显示 embedding 拥塞实际由宿主 LLM（LongCat-2.0）长调用拖垮事件循环引起，持续远超 10 次 × 2 分钟窗口；默认提到 30 次 ≈ 覆盖 1 小时拥塞。
-- **max_retries 改为重试时实时读配置**：原先入队时把上限写死进条目，热调配置对已排队文件无效；现在每次重试实时读 `reader.embed_max_retries`，热改配置立即生效（正在排队的文件也能受益）。
-- 回归 23/23 PASS（新增「max_retries 实时读配置」用例）。
-- 另：真机日志确认 v1.0.11 的准确回执与队列重试节奏（约 3.5 分钟/轮）均按设计工作，bot 未再出现「链接超时」错误归因。
-
-### v1.0.11（2026-09-02）
-
-- **embedding 后台重试队列**：真机 14:27 日志显示 embedding 服务拥塞可持久超过 v1.0.10 的 6s 退避窗口（3 次尝试全撞 30s 超时），文件最终未入库。现在入库失败时把已解析文本放入内存队列，后台任务每 20s 扫描、按 `reader.embed_retry_interval`（默认 2 分钟）节奏自动重试，最多 `reader.embed_max_retries`（默认 10）次；成功后按 `silent_success` 决定是否回执，对用户基本透明。重试期间无需重发文件。
-- **失败回执措辞修正**：原「⚠️ embedding 返回为空」会让 bot 之后从空检索结果瞎猜成「链接拉取超时」（真机 14:28 回复踩到）；改为「⚠️ 文件已收到、内容也读出来了，但嵌入模型暂时无响应，我会每隔 N 分钟自动重试入库」，bot 有据可依。
-- `/file_status` 新增「⏳ 待重试入库」行（队列数量与文件名/已重试次数）；同名文件重复失败只保留一条队列记录（覆盖）。
-- 回归 22/22 PASS（新增「失败入队+准确回执」「重试入库成功」「同名覆盖」三用例）。
-
-### v1.0.10（2026-09-02）
-
-- **embedding 自动重试**：`llm.embed` 失败时自动重试 2 次（退避 2s/4s），对瞬时拥塞（真机 14:05 日志：cap.call 30s 超时，同期 A_Memorix 也故障）基本免疫；重试过程有 WARNING 日志，耗尽后仍失败才报「embedding 返回为空」。`/file_status` 的嵌入模型状态在单次成功后即恢复「正常」。
-- 回归 19/19 PASS（新增「重试后成功」「重试耗尽」两用例，用超时注入验证调用次数与状态翻转）+ GATE PASS。
-
-### v1.0.9（2026-09-02）
-
-- **新增 `reader.silent_success`（默认 true）**：文件入库成功后不再发送「📄 已解析…」回执，保持静默（日志仍记录 `已入库文件 xxx：N 块`）；解析失败/依赖缺失等错误提示照常发送。需要恢复成功回执时把 `reader.silent_success` 设为 `false`。
-- 回归 17/17 PASS（新增静默模式用例）+ GATE PASS。
-
-### v1.0.8（2026-09-02）
-
-- **修复群聊文件消息解析失败**：群聊降级文本带下载链接尾巴（`[文件] x.docx，大小: 9547，链接: https://tjc-download.ftn.qq.com/...`），长 URL 被吞进文件名导致「不支持的文件类型: .(无扩展名)」（真机 13:27 日志踩到）。解析器先摘出链接再匹配文件名，URL 内部逗号保留完整。
-- **新增下载兜底**：群聊形态的纯文本自带 QQ 文件下载链接，hint 解析出 url 后 `_handle_file` 优先走 HTTP 下载（受 `reader.insecure_download` 控制），NapCat 回溯降为第二道兜底。
-- 回归 16/16 PASS（新增「群聊降级形态解析」用例）+ GATE PASS。
-
-### v1.0.7（2026-09-02）
-
-- **Office 三件套零依赖解析**：docx / xlsx / pptx 本质是 zip + XML，改用标准库 `zipfile` + `ElementTree` 直接解析（docx 按段落收集 `w:t` 含页眉页脚；xlsx 解析 sharedStrings + 多 sheet；pptx 按幻灯片顺序），**docx2txt / python-pptx / pandas 不再是 docx/xlsx/pptx/csv 的必要依赖**——真机不用再找插件子进程的 python.exe 装库，本地与真机行为一致。第三方库仅作兜底（结果为空或异常时自动重试）。
-- XML 容错：部分 OOXML 写入器引用 `r:` 等前缀却不声明（`unbound prefix`），自动降级为本地名匹配重试。
-- csv 改用标准库 `csv` 模块（原依赖 pandas）。
-- 回归 15/15 PASS + GATE PASS。
-
-### v1.0.6（2026-09-02）
-
-- **新增 NapCat HTTP 兜底（文件读取的关键路径）**：真机证实 napcat-adapter 在 `chat.receive.before_process` **之前**就已把 file 段降级成 `[文件] xxx.docx，大小: N` 纯文本，hook 层拿不到任何文件本体。改为从降级文本解析文件名、取 `message_id`，再调 NapCat `get_msg` → `get_file` 拿回原始文件。
-- 新增 `napcat` 配置段（enabled / http_url / access_token / timeout / verify_ssl / cache_dir）；`cache_dir` 为 `get_file` 失败时的目录兜底（按文件名+大小精确匹配）。
-- 用标准库 `urllib` 实现 HTTP 客户端（不新增依赖），同步调用包 `asyncio.to_thread` 避免阻塞事件循环。
-- 诊断增强：诊断行加 `mid=`（message_id，回溯 NapCat 的关键）；`/file_status` 新增「NapCat 兜底」状态行与「最近文件消息」（名称/大小/mid/阶段），便于核对回溯是否对得上。
-- 未启用兜底时给出可操作回执（提示去开 `napcat.enabled`），不再静默失败。
-- 修复文件名解析正则：非贪婪 `(.+?)` 未锚定会把「文章.txt」截成「文」——已用 `$` 锚定，测试覆盖。
-- 回归 14/14 PASS（新增「NapCat 兜底取文件」与「未启用时的可操作提示」两个用例）+ GATE PASS。
-
-### v1.0.5（2026-09-02）
-
-- 修复诊断采样缺陷：v1.0.4 的「每阶段一次性」诊断会被第一条普通文本消息消耗，导致文件消息的载荷结构采不到（真机 12:36 日志踩到）。改为**疑似文件消息（`[文件]` 标记或含 file 段）每阶段最多打 5 条完整结构**，普通消息仍只打一行。
-- 段 `data` 非 dict 时打印类型与值（此前一律显示 `-`，看不出 text 段到底存了什么）；诊断行增加 `plain=` 纯文本预览。
-- 日志格式：`[诊断] file hook[before|after][FILE|msg] 触发: ...`。
-
-### v1.0.4（2026-09-02）
-
-- **新增 `chat.receive.before_process` hook（detect_file_early）**：v1.0.3 诊断证实 after_process 阶段文件已被宿主转成文本描述（`raw=list[text(-)]`）拿不到文件本体；官方事件管线中 before_process 在 `SessionMessage.process()` 之前触发，raw_message 仍可能是原始消息段——文件提取改由该阶段承担。
-- 双阶段共用提取逻辑 + **10 秒去重**（key = session_id:文件名），同一文件在 before/after 各被看到一次也只处理一次。
-- 诊断日志分阶段输出（`[诊断] file hook[before|after] 首次触发`），一次部署即可对比两阶段载荷结构。
-
-### v1.0.3（2026-09-02）
-
-- **适配 napcat 真机载荷**（v1.0.2 诊断日志实测采集）：`raw_message` 本身是消息段数组（list），直接扫描其中的 file 段——此前只处理 dict 形态导致提取不到；`session_id`/`stream_id` 从 `message.session_id` 顶层取（hook kwargs 无 session_id）；`message_info` 的 `user_info`/`group_info` 嵌套结构适配。
-- 诊断日志增强：`raw_message` 为 list 时打印每段的 `type` 与 `data` 键名，后续字段适配无需再猜。
-- 测试新增 napcat 真机形态回归用例（raw_message=list + message_info 嵌套 + kwargs 无 session_id）。
-- 注意：解析 docx 需要 `docx2txt`（`pip install docx2txt`），真机未装时收到文件会提示安装。
-
-### v1.0.2（2026-09-02）
-
-- 诊断日志增强：`[诊断] file hook 首次触发` 移至 hook 入口最前（插件停用/载荷异常时也会留派发证据），新增 `message_type` 字段；`plugin.enabled=false` 时补一行提示。日志里出现该行 = 插件已加载且 hook 已派发；缺失 = 插件未加载或 hook 未派发。
-- 排障指引：若文件消息进来后无任何 file-reader 日志，先发 `/file_status` 验证插件是否加载（无响应即未加载，查启动日志）。
-
-### v1.0.1（2026-09-02）
-
-- 修复真机 `AttributeError: 'ReaderConfig' object has no attribute 'enabled'`：`on_file_message` 中误从 `reader` 段访问 `enabled`，改为正确的 `plugin` 段。
-- 新增首次触发一次性诊断日志（`[诊断] file hook 首次触发: ...`），用于采集真机消息载荷的实际字段结构。
-- 增强 OneBot 段兼容：`{"type": "file", "data": {...}}` 嵌套形态、`raw_message.message` 数组、扩展字段名（file_id/filename/title 等）。
-- 新增 `reader.insecure_download` 配置项，应对 MITM 代理环境下的证书校验失败。
-- 测试增强：新增 hook 直调回归用例（`test_file_reader.py`），拦截配置误访问类错误。
+> **版本细节见 [CHANGELOG.md](CHANGELOG.md)** —— 本文件只写「怎么装、怎么配、怎么排障」。
 
 ## 与 AstrBot 原版的差异
 
 | 能力 | AstrBot 原版 | 本 MaiBot 版 |
 |---|---|---|
 | 向量库 | FaissVecDB | numpy 余弦相似度（自实现） |
-| 重排序 | RerankProvider | 无（仅余弦 Top-K） |
+| 重排序 | RerankProvider | 无（宿主只提供 `llm.embed`，无 rerank 能力）；改用 **BM25 词法 + RRF 融合** 补字面召回 |
 | 嵌入 | embedding_provider | `llm.embed` 能力 |
 | 注入 | on_llm_request | `before_model_request` hook（items） |
 | 文件获取 | `item.get_file()` | 入站消息 file/attachment 段；适配器降级时走 NapCat HTTP `get_msg`/`get_file` 回溯 |

@@ -17,10 +17,14 @@ from __future__ import annotations
 
 import csv as _csv_mod
 import io
+import logging
 import os
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Optional
+
+_LOGGER = logging.getLogger(__name__)
 
 # ─── 可选依赖（try-import，缺失则降级） ──────────────────────────
 try:
@@ -47,11 +51,6 @@ try:
     from pptx import Presentation  # type: ignore
 except ImportError:  # pragma: no cover
     Presentation = None
-
-try:
-    from docx import Document  # type: ignore
-except ImportError:  # pragma: no cover
-    Document = None
 
 
 # ─── 扩展名 → 处理函数映射 ────────────────────────────────────────
@@ -235,22 +234,6 @@ def _parse_office(stdlib_fn: Callable[[str], str], third_party: Optional[Callabl
     raise RuntimeError(f"{label} 解析失败：{'；'.join(errors)}。文件可能是加密/损坏/纯图片扫描件")
 
 
-def _pdf_from_stdlib(path: str) -> str:
-    """标准库 PDF 兜底：只支持未压缩文本流的简单 PDF，尽力而为。"""
-    raw = _read_txt(path)
-    # 提取文本流里括号字面量（简单启发式，对压缩 PDF 无效）
-    chunks = re.findall(r"\((?:[^()\\]|\\.)*\)", raw)
-    texts = []
-    for c in chunks:
-        s = c[1:-1]
-        s = re.sub(r"\\([()\\])", r"\1", s)
-        # 只保留含可读字符的片段
-        cleaned = "".join(ch if 32 <= ord(ch) < 127 or "\u4e00" <= ch <= "\u9fff" else " " for ch in s).strip()
-        if len(cleaned) >= 4 and any(ch.isalnum() for ch in cleaned):
-            texts.append(cleaned)
-    return "\n".join(texts)
-
-
 def _pd_read_excel_all(path: str) -> str:
     """pandas 兜底：读全部 sheet。"""
     sheets = pd.read_excel(path, sheet_name=None)
@@ -258,6 +241,429 @@ def _pd_read_excel_all(path: str) -> str:
     for name, df in sheets.items():
         parts.append(f"=== {name} ===\n{df.to_string(index=False)}")
     return "\n\n".join(parts)
+
+
+# ─── v1.3.0 新增格式（全部零依赖） ──────────────────────────────
+# ODF 家族（odt/ods/odp）此前是**假支持**：odt 走 _read_txt 读成 zip 乱码、
+# ods 走 pandas、odp 走 pptx 解析器（结构完全不同，必然失败）。这里用 zipfile +
+# ElementTree 直解，与其它 OOXML 解析器同一套路。
+_NS_ODF_TEXT = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+_NS_ODF_TABLE = "urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+_NS_ODF_DRAW = "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+_NS_ODF_OFFICE = "urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+
+# 老二进制 Office（doc/xls/ppt）的 OLE 复合文档魔数
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _is_ole(path: str) -> bool:
+    """是否 OLE 复合文档（旧版二进制 Office）。"""
+    try:
+        with open(path, "rb") as f:
+            return f.read(8) == _OLE_MAGIC
+    except OSError:
+        return False
+
+
+def _odf_collect(node, t: str, buf: list[str]) -> None:
+    """递归收集文本：tab → \\t，line-break → \\n，s（空格）按 c 属性展开。
+
+    递归而不是 `node.iter()`：ElementTree 把「标签之间的文字」放在 `.text` / `.tail`，
+    只遍历子孙会漏掉节点自身的 text（`<text:p>正文</text:p>` 的文字就在 p.text 上）。
+    """
+    if node.text:
+        buf.append(node.text)
+    for child in node:
+        tag = child.tag
+        if tag == t + "tab":
+            buf.append("\t")
+        elif tag == t + "line-break":
+            buf.append("\n")
+        elif tag == t + "s":
+            try:
+                buf.append(" " * max(1, int(child.get(t + "c") or 1)))
+            except (TypeError, ValueError):
+                buf.append(" ")
+        else:
+            _odf_collect(child, t, buf)
+        if child.tail:
+            buf.append(child.tail)
+
+
+def _odf_para_text(node, t: str) -> str:
+    """ODF 段落 → 纯文本。"""
+    buf: list[str] = []
+    _odf_collect(node, t, buf)
+    return "".join(buf).strip()
+
+
+def _odf_from_zip(path: str, kind: str) -> str:
+    """标准库解析 ODF：content.xml 一个文件就装下了正文、表格与幻灯片。"""
+    import zipfile
+
+    t = "{%s}" % _NS_ODF_TEXT
+    tb = "{%s}" % _NS_ODF_TABLE
+    dr = "{%s}" % _NS_ODF_DRAW
+    of = "{%s}" % _NS_ODF_OFFICE
+
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+        if "content.xml" not in names:
+            raise RuntimeError("找不到 content.xml，可能不是有效的 ODF 文件")
+        root = _parse_xml(zf.read("content.xml"))
+
+    if kind == "ods":
+        blocks: list[str] = []
+        for table in root.iter(tb + "table"):
+            title = table.get(tb + "name") or ""
+            rows: list[str] = []
+            for row in table.iter(tb + "table-row"):
+                cells: list[str] = []
+                for cell in row.iter(tb + "table-cell"):
+                    txt = " ".join(_odf_para_text(p, t) for p in cell.iter(t + "p")).strip()
+                    if not txt:
+                        val = cell.get(of + "value")
+                        txt = "" if val is None else str(val)
+                    cells.append(txt)
+                if any(cells):
+                    rows.append("\t".join(cells))
+            if rows:
+                blocks.append(f"=== {title or 'Sheet'} ===\n" + "\n".join(rows))
+        if not blocks:
+            raise RuntimeError("ODS 里没有可读取的表格内容（可能是空的或纯图片）")
+        return "\n\n".join(blocks)
+
+    if kind == "odp":
+        out: list[str] = []
+        for i, page in enumerate(root.iter(dr + "page"), 1):
+            texts = [
+                line
+                for line in (_odf_para_text(p, t) for p in page.iter(t + "p"))
+                if line
+            ]
+            if texts:
+                out.append(f"=== 幻灯片 {i} ===\n" + "\n".join(texts))
+        if not out:
+            raise RuntimeError("ODP 里没有可读取的文本（可能是纯图片幻灯片）")
+        return "\n\n".join(out)
+
+    # odt：段落/标题按文档顺序；表格单独成块（表格内的段落不再重复输出）
+    inside_table = set()
+    for cell in root.iter(tb + "table-cell"):
+        for p in cell.iter(t + "p"):
+            inside_table.add(id(p))
+    lines: list[str] = []
+    for node in root.iter():
+        if node.tag in (t + "h", t + "p") and id(node) not in inside_table:
+            line = _odf_para_text(node, t)
+            if line:
+                lines.append(line)
+    for table in root.iter(tb + "table"):
+        rows = []
+        for row in table.iter(tb + "table-row"):
+            cells = []
+            for cell in row.iter(tb + "table-cell"):
+                txt = " ".join(_odf_para_text(p, t) for p in cell.iter(t + "p")).strip()
+                if not txt:
+                    val = cell.get(of + "value")
+                    txt = "" if val is None else str(val)
+                cells.append(txt)
+            if any(cells):
+                rows.append("\t".join(cells))
+        if rows:
+            lines.append("\n".join(rows))
+    if not lines:
+        raise RuntimeError("ODT 里没有可读取的文本（可能是加密、损坏或纯图片）")
+    return "\n".join(lines)
+
+
+class _TextHTMLParser(HTMLParser):
+    """HTML → 文本：跳过 script/style/noscript/svg，块级标签补换行。"""
+
+    _SKIP = {"script", "style", "noscript", "svg", "head"}
+    _BLOCK = {"p", "div", "li", "tr", "br", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "table"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):  # noqa: D102
+        if tag in self._SKIP:
+            self._skip_depth += 1
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):  # noqa: D102
+        if tag in self._SKIP:
+            if self._skip_depth:
+                self._skip_depth -= 1
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):  # noqa: D102
+        if not self._skip_depth and data.strip():
+            self.parts.append(data.strip())
+
+
+def _html_to_text(raw: str) -> str:
+    """HTML 去标签。script/style 内容不得进入上下文（占 token 且毫无信息）。"""
+    parser = _TextHTMLParser()
+    try:
+        parser.feed(raw)
+        parser.close()
+    except Exception:  # noqa: BLE001  畸形 HTML 退回粗暴去标签
+        return re.sub(r"<[^>]+>", " ", raw)
+    text = "".join(parser.parts)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*", "\n\n", text)
+    return text.strip()
+
+
+def _read_html(path: str) -> str:
+    """html/htm：此前按原文入库，脚本与样式会吃掉大量 token。"""
+    text = _html_to_text(_read_txt(path))
+    if not text.strip():
+        raise RuntimeError("HTML 里没有可读取的正文（可能是纯脚本页面）")
+    return text
+
+
+def _read_epub(path: str) -> str:
+    """epub：container.xml → OPF spine 顺序 → XHTML 去标签。"""
+    import zipfile
+
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+        opf_path = None
+        if "META-INF/container.xml" in names:
+            root = _parse_xml(zf.read("META-INF/container.xml"))
+            for node in root.iter():
+                if str(node.tag).endswith("rootfile"):
+                    opf_path = node.get("full-path")
+                    break
+        if not opf_path:
+            opf_path = next((n for n in names if n.endswith(".opf")), None)
+        if not opf_path:
+            raise RuntimeError("找不到 OPF 描述文件，可能不是有效的 epub")
+
+        opf_root = _parse_xml(zf.read(opf_path))
+        base = opf_path.rsplit("/", 1)[0] + "/" if "/" in opf_path else ""
+
+        manifest: dict[str, tuple[str, str]] = {}
+        for node in opf_root.iter():
+            if str(node.tag).endswith("item"):
+                manifest[node.get("id") or ""] = (node.get("href") or "", node.get("media-type") or "")
+        spine: list[tuple[str, str]] = []
+        for node in opf_root.iter():
+            if str(node.tag).endswith("itemref"):
+                item = manifest.get(node.get("idref") or "")
+                if item:
+                    spine.append(item)
+        if not spine:
+            spine = [v for v in manifest.values() if "html" in v[1] or v[0].endswith((".xhtml", ".html"))]
+
+        out: list[str] = []
+        total = 0
+        for href, _mt in spine:
+            if len(out) >= 200 or total > 2_000_000:  # 上限：文档 200 个 / 正文 200 万字
+                break
+            target = (base + href if base else href).split("#")[0]
+            if target not in names:
+                tail = href.split("/")[-1]
+                target = next((n for n in names if n.endswith(tail)), "")
+                if not target:
+                    continue
+            try:
+                text = _html_to_text(zf.read(target).decode("utf-8", errors="replace"))
+            except Exception:  # noqa: BLE001
+                continue
+            if text.strip():
+                out.append(text)
+                total += len(text)
+        if not out:
+            raise RuntimeError("epub 里没有可读取的正文（可能是加密或异常结构）")
+        return "\n\n".join(out)
+
+
+def _read_ipynb(path: str) -> str:
+    """ipynb：此前按 JSON 原文入库，outputs 里的 base64 图片会把分块撑爆。"""
+    import json
+
+    try:
+        data = json.loads(_read_txt(path))
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"ipynb 不是合法 JSON：{e}") from e
+    cells = data.get("cells") or []
+    out: list[str] = []
+    for cell in cells:
+        if not isinstance(cell, dict):
+            continue
+        src = cell.get("source") or []
+        text = "".join(src) if isinstance(src, list) else str(src)
+        if not text.strip():
+            continue  # 跳过 outputs：base64 图片/HTML 表格对检索是纯噪音
+        tag = "[code]" if cell.get("cell_type") == "code" else "[md]"
+        out.append(f"{tag} {text.strip()}")
+    if not out:
+        raise RuntimeError("ipynb 里没有单元格内容")
+    return "\n\n".join(out)
+
+
+def _read_eml(path: str) -> str:
+    """eml：优先 text/plain，回退 html 去标签。"""
+    import email
+    from email import policy
+
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as e:
+        raise RuntimeError(f"读取邮件失败：{e}") from e
+    if len(raw) > 20 * 1024 * 1024:
+        raise RuntimeError("邮件超过 20MB，已跳过")
+    msg = email.message_from_bytes(raw, policy=policy.default)
+    subject = str(msg.get("Subject") or "")
+    body_plain = ""
+    body_html = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_maintype() != "text":
+                continue
+            try:
+                content = part.get_content()
+            except Exception:  # noqa: BLE001
+                continue
+            if part.get_content_subtype() == "plain" and not body_plain:
+                body_plain = str(content)
+            elif part.get_content_subtype() == "html" and not body_html:
+                body_html = str(content)
+    else:
+        try:
+            content = str(msg.get_content())
+        except Exception:  # noqa: BLE001
+            content = ""
+        if msg.get_content_subtype() == "html":
+            body_html = content
+        else:
+            body_plain = content
+    body = body_plain.strip() or _html_to_text(body_html).strip()
+    if not body:
+        raise RuntimeError("邮件里没有可读取的正文")
+    return (f"主题：{subject}\n\n{body}" if subject else body)
+
+
+def _read_gz(path: str) -> str:
+    """gz：解压到临时文件，按内层扩展名递归解析（防 zip/gz bomb：解压后仍受 max_file_size 约束）。"""
+    import gzip
+    import shutil
+    import tempfile
+
+    inner = Path(path).name
+    if inner.lower().endswith(".gz"):
+        inner = inner[:-3]
+    fd, tmp_path = tempfile.mkstemp(suffix=Path(inner).suffix or "")
+    try:
+        with os.fdopen(fd, "wb") as out_f:
+            with gzip.open(path, "rb") as src:
+                shutil.copyfileobj(src, out_f, length=1024 * 256)
+        return read_any_file_to_text(tmp_path, inner)
+    except OSError as e:
+        raise RuntimeError(f"gzip 解压失败：{e}") from e
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _read_legacy_office(path: str, kind: str) -> str:
+    """老二进制 Office（doc/ppt）：是 OLE 就给准确提示，不是就按内容试 OOXML。
+
+    为什么不静默失败：旧版把 .doc 丢给 python-docx，报的是「缺少依赖 python-docx」
+    或一堆 XML 解析异常，用户（和模型）完全看不懂。真正的原因是**格式不支持**，
+    必须直说，并给出可执行动作（另存为 .docx）。
+    """
+    if _is_ole(path):
+        raise RuntimeError(
+            f"这是旧版二进制 Office 格式（.{kind}），本插件无法直接解析，请另存为 .{kind}x 后重发"
+        )
+    sniffed, _basis = detect_format(path)
+    if sniffed == "docx":
+        return _read_docx(path)
+    if sniffed == "pptx":
+        return _read_pptx(path)
+    if sniffed == "xlsx":
+        return _read_excel(path)
+    raise RuntimeError(
+        f"无法解析 .{kind} 文件：内容既不是可解析的 Office 开放格式包，也读不出文本，"
+        f"建议另存为 .{kind}x 或 .txt 后重发"
+    )
+
+
+def _read_xls(path: str) -> str:
+    """xls：OLE 二进制需 pandas + xlrd；不是 OLE 说明只是扩展名错，按内容解析。"""
+    if _is_ole(path):
+        if pd is None:
+            raise RuntimeError("旧版二进制 .xls 需要 pandas + xlrd，请另存为 .xlsx / .csv 后重发")
+        try:
+            return _pd_read_excel_all(path)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"旧版二进制 .xls 解析失败（{e}），建议另存为 .xlsx / .csv 后重发") from e
+    sniffed, _basis = detect_format(path)
+    if sniffed == "xlsx":
+        return _read_excel(path)
+    raise RuntimeError("无法解析 .xls：不是有效的 Excel 包，建议另存为 .xlsx / .csv 后重发")
+
+
+def detect_format(path: str) -> tuple[str, str]:
+    """内容嗅探：返回 `(格式名, 依据)`，无法识别返回 `("", "")`。
+
+    安全性：只读文件头 8 字节与 ZIP 的**中央目录**，最多额外读 `mimetype`
+    （一个几十字节的小文件），绝不解压正文。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return "", ""
+    if head.startswith(b"%PDF-"):
+        return "pdf", "magic"
+    if head.startswith(b"{\\rtf"):
+        return "rtf", "magic"
+    if head == _OLE_MAGIC:
+        return "ole", "magic"
+    if head.startswith(b"PK\x03\x04"):
+        import zipfile
+
+        try:
+            with zipfile.ZipFile(path) as zf:
+                names = zf.namelist()
+                if "mimetype" in names:
+                    mime = zf.read("mimetype").decode("ascii", errors="ignore").strip()
+                    mapping = {
+                        "application/epub+zip": "epub",
+                        "application/vnd.oasis.opendocument.text": "odt",
+                        "application/vnd.oasis.opendocument.spreadsheet": "ods",
+                        "application/vnd.oasis.opendocument.presentation": "odp",
+                    }
+                    if mime in mapping:
+                        return mapping[mime], "mimetype"
+                if "word/document.xml" in names:
+                    return "docx", "zip"
+                if any(n.startswith("ppt/slides/") for n in names):
+                    return "pptx", "zip"
+                if any(n.startswith("xl/worksheets/") for n in names):
+                    return "xlsx", "zip"
+                if "content.xml" in names:
+                    return "odt", "zip"
+        except (zipfile.BadZipFile, OSError):
+            return "", ""
+    return "", ""
+
+
+# 识别但没有（或不值得）解析器的格式：给出**准确原因**而不是乱码
+RECOGNIZED_UNSUPPORTED: dict[str, str] = {
+    "rtf": "RTF 暂不支持（读出来是控制字乱码），请另存为 .docx 或 .txt 后重发",
+}
 
 
 # ─── 扩展名 → 处理函数（原映射表，函数体改为标准库优先） ────────────
@@ -270,17 +676,6 @@ def _read_pdf(path: str) -> str:
 def _read_docx(path: str) -> str:
     """docx = zip + XML，标准库直解；docx2txt 仅作兜底（不再必装）。"""
     return _parse_office(_docx_from_zip, docx2txt.process if docx2txt else None, "docx", path)
-
-
-def _read_doc(path: str) -> str:
-    # .doc 老格式：尝试用 python-docx 转换（实际 python-docx 不支持 .doc，做降级提示）
-    if Document is None:
-        raise RuntimeError("缺少依赖 python-docx，请安装：pip install python-docx")
-    try:
-        doc = Document(path)
-        return "\n".join(p.text for p in doc.paragraphs)
-    except Exception as e:  # .doc 二进制老格式，python-docx 无法解析
-        raise RuntimeError(f".doc 老格式暂不支持直接解析（{e}），建议转为 .docx 后重传") from e
 
 
 def _read_excel(path: str) -> str:
@@ -324,18 +719,21 @@ SUPPORTED_EXTENSIONS: dict[str, Callable[[str], str]] = {
     # 文档
     "pdf": _read_pdf,
     "docx": _read_docx,
-    "doc": _read_doc,
-    "rtf": _read_txt,
-    "odt": _read_txt,
+    # v1.3.0：doc/ppt 不再"假装支持"——先判 OLE，是就给准确提示，不是就按内容试 OOXML
+    "doc": lambda p: _read_legacy_office(p, "doc"),
+    # v1.3.0：rtf 移出支持列表（旧版走 _read_txt，读出来全是控制字乱码）
+    "odt": lambda p: _odf_from_zip(p, "odt"),
+    "epub": _read_epub,
+    "eml": _read_eml,
     # 表格
     "xlsx": _read_excel,
-    "xls": _read_excel,
-    "ods": _read_excel,
+    "xls": _read_xls,
+    "ods": lambda p: _odf_from_zip(p, "ods"),
     "csv": _read_csv,
     # 演示
     "pptx": _read_pptx,
-    "ppt": _read_pptx,
-    "odp": _read_pptx,
+    "ppt": lambda p: _read_legacy_office(p, "ppt"),
+    "odp": lambda p: _odf_from_zip(p, "odp"),
     # 代码
     "py": _read_txt,
     "java": _read_txt,
@@ -361,10 +759,13 @@ SUPPORTED_EXTENSIONS: dict[str, Callable[[str], str]] = {
     # 标记
     "md": _read_txt,
     "markdown": _read_txt,
-    "html": _read_txt,
-    "htm": _read_txt,
+    # v1.3.0：html/htm 去标签（旧版原文入库，脚本样式吃掉大量 token）
+    "html": _read_html,
+    "htm": _read_html,
     "xml": _read_txt,
     "json": _read_txt,
+    # v1.3.0：ipynb 走结构化解析，跳过 outputs（base64 图片会把分块撑爆）
+    "ipynb": _read_ipynb,
     "yaml": _read_txt,
     "yml": _read_txt,
     # 配置
@@ -382,6 +783,14 @@ SUPPORTED_EXTENSIONS: dict[str, Callable[[str], str]] = {
     "gitignore": _read_txt,
     "url": _read_txt,
     "webloc": _read_txt,
+    # v1.3.0 新增：字幕 / 排版 / 参考文献 / 压缩包
+    "srt": _read_txt,
+    "vtt": _read_txt,
+    "ass": _read_txt,
+    "tex": _read_txt,
+    "rst": _read_txt,
+    "bib": _read_txt,
+    "gz": _read_gz,
 }
 
 
@@ -413,7 +822,33 @@ def read_any_file_to_text(file_path: str, file_name: str = "") -> str:
     if not path.exists():
         raise ValueError(f"文件不存在: {file_path}")
 
-    ext = get_extension(file_name or path.name)
+    name = file_name or path.name
+    ext = get_extension(name)
+    sniffed, basis = detect_format(str(path))
+
+    # ① 能识别但明确不支持的：给**准确原因**，不要让模型对着乱码猜
+    if ext in RECOGNIZED_UNSUPPORTED:
+        raise ValueError(f"{RECOGNIZED_UNSUPPORTED[ext]}（{name}）")
+    if sniffed == "rtf":
+        raise ValueError(f"{RECOGNIZED_UNSUPPORTED['rtf']}（{name}）")
+    if sniffed == "ole" and ext not in ("doc", "xls", "ppt"):
+        raise ValueError(
+            f"这是旧版二进制 Office 格式（doc/xls/ppt），本插件无法直接解析，"
+            f"请另存为 docx/xlsx/pptx 后重发（{name}）"
+        )
+
+    # ② 扩展名不可信（转发/改名/无扩展名）时以内容嗅探为准
+    if not ext:
+        if sniffed and sniffed in SUPPORTED_EXTENSIONS:
+            ext = sniffed
+        else:
+            raise ValueError(f"无法识别文件格式（无扩展名且内容嗅探未命中）：{name}")
+    elif sniffed and sniffed in SUPPORTED_EXTENSIONS and sniffed != ext:
+        _LOGGER.info(
+            "扩展名 .%s 与内容嗅探 %s(%s) 冲突，以内容为准: %s", ext, sniffed, basis, name
+        )
+        ext = sniffed
+
     handler = SUPPORTED_EXTENSIONS.get(ext)
     if handler is None:
         raise ValueError(f"不支持的文件类型: .{ext or '(无扩展名)'}")
@@ -422,7 +857,13 @@ def read_any_file_to_text(file_path: str, file_name: str = "") -> str:
 
 
 def describe_supported_types() -> str:
-    """供状态命令 / 提示使用。"""
-    return "pdf/docx/doc/rtf/odt, xlsx/xls/ods/csv, pptx/ppt/odp, " \
-           "代码(py/java/cpp/js/ts/go/rs/sh/bat...), md/html/xml/json/yaml, " \
-           "ini/env/toml, txt/log/sql 等"
+    """供状态命令 / 提示使用。
+
+    v1.3.0 重写：旧版把 doc/rtf/ppt/odt/ods/odp 都列进"支持"，实际多半读不出来，
+    /file_status 与 README 两边还不一致。现在只写**真能读**的。
+    """
+    return (
+        "pdf/docx/odt/epub/eml, xlsx/ods/csv, pptx/odp, html/ipynb/gz, "
+        "代码与文本(py/java/cpp/js/ts/go/rs/sh/md/json/yaml/txt/srt/xml...), "
+        "ini/env/toml/log/sql"
+    )
