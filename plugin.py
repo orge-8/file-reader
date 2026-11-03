@@ -418,7 +418,7 @@ class ReaderConfig(PluginConfigBase):
     retrieve_min_ratio: float = Field(default=0.5, description="融合后相对下限：低于 Top1 分数该比例的结果丢弃；0 = 关闭")
     query_rewrite_enabled: bool = Field(default=True, description="追问改写（v1.3.0）：「那第三章呢」这类指代/短问补回上一问再检索；纯规则实现，不调 LLM（BLOCKING hook 只有 11s 预算）")
     # ── v1.3.0 生命周期与回执 ──
-    ack_min_chars: int = Field(default=20000, description="大文件入库回执阈值（原文字符数）：达到该值（或处理耗时 ≥ 10s）时发一条中性回执「已读取《X》，共 N 段」，避免用户以为插件没反应；0 = 不发回执")
+    ack_min_chars: int = Field(default=0, description="入库回执阈值（原文字符数，0 = 不发回执，默认关闭）：仅在超大文件确实需要露头时开启，达到该值（或处理耗时 ≥ 30s）会额外发一条「已读取《X》，共 N 段」。注意这条是插件直接发出的独立消息，会与人格化回复并列出现")
     parse_notice_ttl: int = Field(default=600, description="解析失败通知的存活秒数（v1.3.0）：失败原因注入给模型（不发群消息），TTL 内只注入一次")
 
 
@@ -491,8 +491,20 @@ class FileReaderPlugin(MaiBotPlugin):
         self._cleanup_task: Optional[asyncio.Task] = None
         self._embedding_ok = True
         self._embedding_err = ""
-        # 双 hook（before/after）去重：key = f"{session_id}:{file_name}" -> 上次处理时刻
+        # 双 hook（before/after）去重：key = f"{session_id}:{file_id 或 file_name}" -> 上次处理时刻
         self._recent_file_keys: dict[str, float] = {}
+        # v1.3.9：正在解析/向量化的文件（token -> {session_id, name, started_at}），
+        # 只用于向 Planner 公告状态。长解析期间 store 里没有任何文件，Planner 只能靠猜，
+        # 真机 11-03 的情况就是它直接断言「群文件我这边读不到」。有这条状态它能知道
+        # 「文件正在处理」，回话时就不会说死。
+        self._parsing: dict[int, dict[str, Any]] = {}
+        self._parse_seq: int = 0
+        # v1.3.8：正在处理中的会话键 (session_id, conversation_id) -> 并发计数。清理循环必须跳过它们，
+        # 否则「解析/向量化耗时 > cleanup_interval」时，空壳会被 drop，而 _handle_file
+        # 仍持有该 VectorStore 引用并往里写——日志显示入库成功，store 里却什么都没有。
+        # 用计数而不是 set：防抖合并会把同一条消息里的 N 个文件并发丢进来，
+        # 若用 set，先完成的任务会把 key 抹掉，剩下的文件又失去保护。
+        self._inflight: dict[tuple[str, str], int] = {}
         # 最近一次"被降级成纯文本"的文件消息留档（供 /file_status 排查）
         self._last_file_hint: dict[str, Any] = {}
         # embedding 失败重试队列（v1.0.11）：[{session_id, conversation_id, stream_id, name, tmp_path, attempts, next_ts}]
@@ -893,11 +905,18 @@ class FileReaderPlugin(MaiBotPlugin):
         conversation_id = str(kwargs.get("session_id") or session_id)
         stream_id = str(self._pick_stream_id(message, kwargs) or "")
 
-        # 去重：同一 session 同名文件 10 秒内只处理一次（before/after 双 hook 各看到一次）
+        # 去重：同一 session 同一文件 10 秒内只处理一次
+        # （before/after 双 hook 各看到一次；同群同一文件还会以「真实 file 段 + 群文件上传通知」
+        #   两条消息出现，也必须合并成一次）
         now = time.time()
         to_handle: list[dict[str, Any]] = []
         for fdata in files:
-            key = f"{session_id}:{fdata.get('name', '')}"
+            # v1.3.8：优先按 file_id 去重。真机 11-03 15:21 事故：真实 file 段的 name 是占位符
+            # 「附件」，而 `[事件-群文件上传]` 通知带真名「奶蛙学 必修第一册.pdf」——按 name
+            # 去重时两者不同名，双双通过，于是同一个 19MB PDF 被解析两遍、embedding 两遍、
+            # 群里连收两条「已读取《…》」。file_id 才是同一文件的稳定标识。
+            ident = str(fdata.get("file_id") or "").strip() or str(fdata.get("name", ""))
+            key = f"{session_id}:{ident}"
             last = self._recent_file_keys.get(key, 0.0)
             if now - last < 10.0:
                 continue
@@ -1197,14 +1216,16 @@ class FileReaderPlugin(MaiBotPlugin):
                         return str(gi[key])
         return ""
 
-    async def _handle_file(self, session_id: str, conversation_id: str, stream_id: str, fdata: dict[str, Any]) -> None:
-        """后台：写临时文件 → 解析 → 向量化 → 落库 → 回执。
+    def _get_vs(self, session_id: str, conversation_id: str) -> Any:
+        """按当前配置取（或建）会话向量库。
 
-        embedding 失败（真机 14:27 日志：服务拥塞持续超 6s 退避窗口）时：
-        已解析文本放入后台重试队列，由 _retry_loop 定时重试入库，对用户透明。
+        v1.3.8：单独抽出来，让调用方能把「创建」推迟到真正要写数据的那一刻。
+        旧版在 `_handle_file` **开头**就 get_or_create，于是解析期间 store 里挂着一个
+        空 VectorStore；清理循环（cleanup_interval=5min）看到 `not vs.files` 就 drop，
+        之后 `add_file` 写进的是脱管对象 —— 真机 11-03 15:21 的 19MB PDF 正是如此：
+        解析跑了 26 分钟，日志打「已入库 182 块」，`search_file` 却报「没有已入库的文件」。
         """
-        name = str(fdata.get("name", "unnamed_file"))
-        vs = self._store.get_or_create(
+        return self._store.get_or_create(
             session_id,
             conversation_id,
             self._embed,
@@ -1215,6 +1236,48 @@ class FileReaderPlugin(MaiBotPlugin):
             retrieve_use_matrix=bool(self.config.reader.retrieve_use_matrix),
             lexical_max_tokens=int(self.config.reader.lexical_max_tokens or 0),
         )
+
+    def _reassert_vs(self, session_id: str, conversation_id: str, vs: Any) -> None:
+        """入库完成后确保这个 VectorStore 仍挂在 store 上（v1.3.8 兜底）。
+
+        正常路径下 `_get_vs` 就在 add 之前调用、且有 `_inflight` 保护，不会脱管；
+        但 on_unload/重载期间仍可能出现「写入成功、store 已换新」。此时把已含文件的
+        实例挂回去，比让用户重发一遍 26 分钟的解析要划算。
+        """
+        key = self._store.key(session_id, conversation_id)
+        current = self._store._sessions.get(key)
+        if current is vs:
+            return
+        if current is not None and getattr(current, "files", None):
+            # 已被别的任务写了更新的实例，不覆盖
+            return
+        self._store._sessions[key] = vs
+        self.ctx.logger.warning(
+            "[v1.3.8] 会话 %s 的向量库在入库期间被回收，已挂回（文件 %d 个）",
+            session_id, len(getattr(vs, "files", {}) or {}),
+        )
+
+    async def _handle_file(self, session_id: str, conversation_id: str, stream_id: str, fdata: dict[str, Any]) -> None:
+        """后台：写临时文件 → 解析 → 向量化 → 落库 → 回执。
+
+        embedding 失败（真机 14:27 日志：服务拥塞持续超 6s 退避窗口）时：
+        已解析文本放入后台重试队列，由 _retry_loop 定时重试入库，对用户透明。
+        """
+        name = str(fdata.get("name", "unnamed_file"))
+        # v1.3.8：先把会话键登记为 in-flight，清理循环会跳过它（见 _cleanup_once）；
+        # 向量库推迟到 add 之前才创建（_get_vs），彻底消除「解析期间挂着空壳」的窗口。
+        inflight_key = self._store.key(session_id, conversation_id)
+        self._inflight[inflight_key] = self._inflight.get(inflight_key, 0) + 1
+        # v1.3.9：登记「正在解析」状态，供 Planner 公告使用；name 可能在 napcat 回填后变真名，
+        # 所以持有 record 引用、就地更新（公告读到的是当时最新的名字）。
+        self._parse_seq += 1
+        parse_token = self._parse_seq
+        parse_record: dict[str, Any] = {
+            "session_id": session_id,
+            "name": name,
+            "started_at": time.time(),
+        }
+        self._parsing[parse_token] = parse_record
         tmp_path: Optional[str] = None
         queued_for_retry = False  # v1.1.0：入队后临时文件归重试队列持有，finally 不再删
         started_at = time.time()  # v1.3.0：大文件回执要用到处理耗时
@@ -1302,6 +1365,7 @@ class FileReaderPlugin(MaiBotPlugin):
                 if real_name and not get_extension(name) and get_extension(real_name):
                     self.ctx.logger.info("[napcat] 文件名回填: %r → %r", name, real_name)
                     name = real_name
+                    parse_record["name"] = name  # v1.3.9：让 Planner 公告显示真名
 
             # 写临时文件
             suffix = Path(name).suffix or ""
@@ -1315,6 +1379,8 @@ class FileReaderPlugin(MaiBotPlugin):
             text = await asyncio.to_thread(read_any_file_to_text, tmp_path, name)
 
             # 向量化 + 入库
+            # v1.3.8：向量库在这里才创建（解析可能耗时几十分钟，早创建只会留一个空壳给清理循环回收）
+            vs = self._get_vs(session_id, conversation_id)
             try:
                 entry = await vs.add_file(name, text)
             except RuntimeError as e:
@@ -1331,6 +1397,8 @@ class FileReaderPlugin(MaiBotPlugin):
                 len(entry.chunks),
                 session_id,
             )
+            # v1.3.8：入库成功后确认该向量库仍挂在 store 上（极端情况下被回收/替换则挂回）
+            self._reassert_vs(session_id, conversation_id, vs)
             # v1.0.17：大文件后台预热概要（不阻塞回执；注入时 _ensure_summary 也会懒生成，这里只是让首次提问即命中）
             # v1.0.18 C4：改走 _ensure_summary_async（in-flight 去重 + 失败冷却），注入触发时不会重复起任务
             # v1.0.18 C1：阈值判定用 entry.total_chars()（原文长度），overlap 合并会让 join(chunks) 膨胀
@@ -1344,14 +1412,16 @@ class FileReaderPlugin(MaiBotPlugin):
             self._memo_invalidate_session(session_id)
             # v1.3.0：同名文件这次读成功了，清掉之前留下的失败通知
             self._clear_notices(session_id, name)
-            # v1.3.0 大文件回执：入库耗时动辄几十秒，全程静默会让用户以为插件没反应。
-            # 只在「真的大」或「真的慢」时发一条中性回执，小文件依旧完全静默。
+            # v1.3.7：默认关闭（ack_min_chars=0）。这条是插件直发的独立消息，会与人格化回复
+            # 并列出现在聊天里（真机 22:10 日志：先是「已读取《VoidMeleeAura.cs》，共 60 段」，
+            # 随后才是模型自己的答复），对人格驱动场景是纯噪音。保留为可选开关，
+            # 且耗时兜底从 10s 提到 30s——10s 太容易触发（21KB 的 .cs 因 60 次 embedding 就超了）。
             try:
                 ack_min = int(self.config.reader.ack_min_chars or 0)
             except (TypeError, ValueError):
                 ack_min = 0
             elapsed = time.time() - started_at
-            if ack_min > 0 and stream_id and (entry.total_chars() >= ack_min or elapsed >= 10.0):
+            if ack_min > 0 and stream_id and (entry.total_chars() >= ack_min or elapsed >= 30.0):
                 await self._reply(stream_id, f"已读取《{name}》，共 {len(entry.chunks)} 段")
             if not self.config.reader.silent_success:
                 await self._reply(
@@ -1372,6 +1442,14 @@ class FileReaderPlugin(MaiBotPlugin):
                 file_name=name,
             )
         finally:
+            # v1.3.8：无论成功/失败/提前返回，都要解除 in-flight 保护，否则清理循环会永久跳过该会话
+            left = self._inflight.get(inflight_key, 1) - 1
+            if left > 0:
+                self._inflight[inflight_key] = left
+            else:
+                self._inflight.pop(inflight_key, None)
+            # v1.3.9：解析结束（成功/失败/入重试队列）都要撤掉「正在解析」状态
+            self._parsing.pop(parse_token, None)
             if tmp_path and not queued_for_retry:
                 try:
                     os.remove(tmp_path)
@@ -2173,6 +2251,40 @@ class FileReaderPlugin(MaiBotPlugin):
         }
         return hits, diag
 
+    def _parsing_for(self, session_id: str) -> list[dict[str, Any]]:
+        """取该会话正在解析的文件记录（v1.3.9）。
+
+        顺带裁剪异常陈旧条目：任务正常结束会在 finally 里 pop，能留下的只有
+        「进程异常/取消路径漏掉」的情况；超过 3 小时视为泄漏，删掉并告警，
+        否则公告会永远说「正在解析」。
+        """
+        if not self._parsing:
+            return []
+        now = time.time()
+        for token, rec in list(self._parsing.items()):
+            if now - float(rec.get("started_at") or 0) > 3 * 3600:
+                self._parsing.pop(token, None)
+                self.ctx.logger.warning(
+                    "[v1.3.9] 清理陈旧的「正在解析」记录：%s（session=%s）",
+                    rec.get("name"), rec.get("session_id"),
+                )
+        return [rec for rec in self._parsing.values() if rec.get("session_id") == session_id]
+
+    @staticmethod
+    def _parsing_notice(records: list[dict[str, Any]]) -> str:
+        """把「正在解析」状态拼成一句给 Planner 的公告（几十字，不注正文）。"""
+        names = "、".join(f"《{str(r.get('name') or '未命名')}》" for r in records[:3])
+        if len(records) > 3:
+            names += f" 等 {len(records)} 个"
+        waited = max(0, int(time.time() - min(float(r.get("started_at") or 0) for r in records)))
+        # 60 秒以内说秒，超过说分钟——26 分钟的解析说「1560 秒」没有信息量
+        span = f"{waited} 秒" if waited < 90 else f"{waited // 60} 分钟"
+        return (
+            f"{names} 正在解析入库（已等待约 {span}），当前还检索不到内容。"
+            "这不等于文件读不到：不要断言内容缺失，也不要重复调用文件读取工具；"
+            "需要回应时说明还在读、稍后再问即可。"
+        )
+
     @HookHandler(
         "maisaka.planner.before_request",
         name="announce_file_context",
@@ -2182,7 +2294,7 @@ class FileReaderPlugin(MaiBotPlugin):
         timeout_ms=2000,
     )
     async def announce_file_context(self, **kwargs: Any) -> dict[str, Any]:
-        """向 Planner 公告「本会话已读入哪些文件」（v1.3.2）。
+        """向 Planner 公告「本会话文件状态」（v1.3.2 / v1.3.9）。
 
         真机 11-02 21:39 实测：文件全文已直注 replyer（2264 字）且答得正确，
         但 Planner 上下文里没有这份内容 —— 它据此判定「模型没读到却编了标题」，
@@ -2191,6 +2303,10 @@ class FileReaderPlugin(MaiBotPlugin):
 
         这里只注入一句公告（几十字），**不注入正文**：Planner 只需要知道
         「内容已有供给」，逐轮 attempt 灌全文会把 token 打爆。
+
+        v1.3.9 补另一种状态：「已经收到、但还在解析」。真机 11-03 那个 19MB PDF
+        解析了 26 分钟，这段时间 store 里空无一物，Planner 只能断言「群文件我读不到」，
+        然后绕去联网搜索。有了这条状态它至少知道该说「还在读」。
         """
         try:
             session_id = str(kwargs.get("session_id") or "")
@@ -2205,24 +2321,32 @@ class FileReaderPlugin(MaiBotPlugin):
                 if sid == session_id:
                     vs = candidate
                     break
-            if vs is None or not vs.files:
+            # v1.3.9：把「正在解析」也算作一种可用状态——否则长解析期间这里直接 return，
+            # Planner 对文件一无所知（真机 11-03 就是这样绕去联网搜索的）。
+            parsing = self._parsing_for(session_id)
+            has_files = vs is not None and bool(vs.files)
+            if not has_files and not parsing:
                 return {"action": "continue"}
 
-            names = [str(n) for n in vs.files.keys()]
-            total = sum(int(e.total_chars()) for e in vs.files.values())
-            listed = "、".join(f"《{n}》" for n in names[:3])
-            if len(names) > 3:
-                listed += f" 等 {len(names)} 个"
-            supply = (
-                "全文会在生成回复时自动附上"
-                if self._full_text_within_limit(vs) is not None
-                else "相关片段会在生成回复时自动附上"
-            )
-            text = (
-                f"本会话已读入文件：{listed}（合计约 {total} 字）。{supply}，"
-                "规划阶段不需要再调用文件读取工具；需要精确定位某段时用 search_file。"
-            )
-            return self._inject_items(items, kwargs, text, kind="planner-notice")
+            parts: list[str] = []
+            if has_files:
+                names = [str(n) for n in vs.files.keys()]
+                total = sum(int(e.total_chars()) for e in vs.files.values())
+                listed = "、".join(f"《{n}》" for n in names[:3])
+                if len(names) > 3:
+                    listed += f" 等 {len(names)} 个"
+                supply = (
+                    "全文会在生成回复时自动附上"
+                    if self._full_text_within_limit(vs) is not None
+                    else "相关片段会在生成回复时自动附上"
+                )
+                parts.append(
+                    f"本会话已读入文件：{listed}（合计约 {total} 字）。{supply}，"
+                    "规划阶段不需要再调用文件读取工具；需要精确定位某段时用 search_file。"
+                )
+            if parsing:
+                parts.append(self._parsing_notice(parsing))
+            return self._inject_items(items, kwargs, "".join(parts), kind="planner-notice")
         except Exception as e:  # noqa: BLE001
             self.ctx.logger.error("向 Planner 公告文件状态失败: %s", e)
             return {"action": "continue"}
@@ -2524,6 +2648,16 @@ class FileReaderPlugin(MaiBotPlugin):
         if self._embed_retry_queue:
             names = "、".join(f"{item['name']}(第{item['attempts']}次)" for item in self._embed_retry_queue[:5])
             lines.append(f"- ⏳ 待重试入库: {len(self._embed_retry_queue)} 个 — {names}")
+        # v1.3.9：解析中的文件单独列出来。长解析期间「已入库文件 = 0」很容易被误读成文件丢了，
+        # 这一行直接回答「是不是还在处理」。
+        if self._parsing:
+            now = time.time()
+            items = sorted(self._parsing.values(), key=lambda r: float(r.get("started_at") or 0))
+            shown = "、".join(
+                f"《{rec.get('name')}》(已等 {int(now - float(rec.get('started_at') or now))}s)"
+                for rec in items[:5]
+            )
+            lines.append(f"- ⏳ 解析中: {len(items)} 个 — {shown}")
         hint = getattr(self, "_last_file_hint", {}) or {}
         if hint:
             lines.append(
@@ -2782,32 +2916,44 @@ class FileReaderPlugin(MaiBotPlugin):
         return {"content": "\n\n".join(parts)}
 
     # ─── 后台清理循环 ────────────────────────────────────────────
+    def _cleanup_once(self) -> int:
+        """执行一轮清理，返回移除的文件数（抽出来便于单测直接调用，v1.3.8）。"""
+        retention = self.config.reader.file_retention_time * 60
+        max_rounds = self.config.reader.file_max_rounds
+        # v1.3.0：绝对上限（分钟→秒），防「一直被问到」的文件永久驻留
+        try:
+            absolute_ttl = float(self.config.reader.file_absolute_ttl or 0) * 60
+        except (TypeError, ValueError):
+            absolute_ttl = 0.0
+        total_removed = 0
+        in_flight = set(self._inflight)  # v1.3.8：快照，避免迭代中被改（dict 取键，计数>0 即保护）
+        for (sid, cid), vs in list(self._store._sessions.items()):
+            if (sid, cid) in in_flight:
+                # v1.3.8：正在解析/向量化的会话不参与清理与空壳回收。
+                # 真机 11-03 15:21 事故：19MB PDF 解析 26 分钟，期间空 VectorStore
+                # 被这里 drop，add_file 写进脱管对象 ⇒ 日志「已入库 182 块」但
+                # search_file 报「没有已入库的文件」，且因为 total_removed==0 全程无日志。
+                continue
+            removed = vs.cleanup_expired(retention, max_rounds, absolute_ttl)
+            if removed:
+                self._memo_invalidate_session(sid)  # v1.0.18 C3：清理后失效该会话注入缓存
+            total_removed += len(removed)
+            # v1.1.0：文件清空后回收空会话壳——旧版 (sid,cid)→空 VectorStore 永久驻留，
+            # 长期运行的 bot 会话数无界增长
+            if not vs.files:
+                self._store.drop(sid, cid)
+        if total_removed:
+            self.ctx.logger.info("后台清理：移除 %d 个过期文件", total_removed)
+        # v1.1.0：概要失败冷却表随清理周期裁剪——旧版按文件名无界增长
+        self._prune_summary_failed()
+        return total_removed
+
     async def _start_cleanup_loop(self) -> None:
         async def loop() -> None:
             while True:
                 try:
                     await asyncio.sleep(self.config.reader.cleanup_interval * 60)
-                    retention = self.config.reader.file_retention_time * 60
-                    max_rounds = self.config.reader.file_max_rounds
-                    # v1.3.0：绝对上限（分钟→秒），防「一直被问到」的文件永久驻留
-                    try:
-                        absolute_ttl = float(self.config.reader.file_absolute_ttl or 0) * 60
-                    except (TypeError, ValueError):
-                        absolute_ttl = 0.0
-                    total_removed = 0
-                    for (sid, cid), vs in list(self._store._sessions.items()):
-                        removed = vs.cleanup_expired(retention, max_rounds, absolute_ttl)
-                        if removed:
-                            self._memo_invalidate_session(sid)  # v1.0.18 C3：清理后失效该会话注入缓存
-                        total_removed += len(removed)
-                        # v1.1.0：文件清空后回收空会话壳——旧版 (sid,cid)→空 VectorStore 永久驻留，
-                        # 长期运行的 bot 会话数无界增长
-                        if not vs.files:
-                            self._store.drop(sid, cid)
-                    if total_removed:
-                        self.ctx.logger.info("后台清理：移除 %d 个过期文件", total_removed)
-                    # v1.1.0：概要失败冷却表随清理周期裁剪——旧版按文件名无界增长
-                    self._prune_summary_failed()
+                    self._cleanup_once()
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001

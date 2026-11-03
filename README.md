@@ -148,7 +148,7 @@ pip install pandas openpyxl  # 仅 .xls / .ods 老表格格式（xlsx/csv 已零
 | reader.retrieve_min_score | float | 0.15 | 向量相关度绝对下限：余弦低于此值的候选在融合前丢弃。只作用于**有向量分**的候选，纯词法命中不受影响；0 = 关闭 |
 | reader.retrieve_min_ratio | float | 0.5 | 融合后相对下限：低于 Top1 分数该比例的结果丢弃；0 = 关闭 |
 | reader.query_rewrite_enabled | bool | true | 追问改写（v1.3.0）：短问/指代问自动拼上上一问再检索；纯规则，不调 LLM |
-| reader.ack_min_chars | int | 20000 | 大文件入库回执阈值（原文字符数）：达到该值（或处理耗时 ≥ 10s）时回一条中性「已读取《X》，共 N 段」；0 = 不发 |
+| reader.ack_min_chars | int | 0 | 入库回执阈值（原文字符数），**默认 0 = 不发**：仅在超大文件确实需要露头时 >0，达到该值（或处理耗时 ≥ 30s）会额外发一条「已读取《X》，共 N 段」。⚠️ 这条是插件直发的独立消息，会与人格化回复并列出现 |
 | reader.parse_notice_ttl | int | 600 | 解析失败通知的存活秒数（v1.3.0）：失败原因注入给模型（不发群消息），TTL 内只注入一次 |
 | **napcat.enabled** | bool | false | **启用 NapCat HTTP 兜底取文件**（见下，QQ 发文件必须开） |
 | napcat.http_url | str | http://127.0.0.1:3001 | NapCat OneBot HTTP 服务地址 |
