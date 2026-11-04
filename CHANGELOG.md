@@ -8,6 +8,7 @@ README 只保留「原理 / 安装 / 配置 / 命令 / 安全策略 / 常见问�
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
+| v1.4.0 | 2026-11-04 | 读取提速专项：PDF 换 pypdfium2（3.6×）+ 分块 1024/128 + 双触发去重 + 重发缓存 + 分段耗时日志 |
 | v1.3.9 | 2026-11-03 | Planner 公告补「正在解析」状态（长解析期间不再被当成读不到） |
 | v1.3.8 | 2026-11-03 | 长解析期间空会话壳被清理回收（文件「入库成功」却检索不到）+ 同一文件被处理两遍 |
 | v1.3.7 | 2026-11-03 | 入库回执默认关闭（不再直发「已读取《X》，共 N 段」） |
@@ -285,7 +286,64 @@ README 只保留「原理 / 安装 / 配置 / 命令 / 安全策略 / 常见问�
 - **napcat.verify_ssl 默认 false → true（review 第 3 条）**：旧默认在 https 地址下会连主机名校验一起关掉（CERT_NONE）。新实例默认开启校验；**存量实例的 config.toml 不会跟随新默认值**，因此启动自检新增一条风险告警：`napcat.verify_ssl=false` 且 `napcat.http_url` 为 https 地址时打 WARNING（与 download 风险配置告警同款机制），提示改用系统信任的证书而不是关校验。
 - 测试：pytest 门禁用例 72 项（新增连接钉定 6 项：`build_pinned_request` 单元契约、collect_ips 拒绝路径不带出 IP、端到端「出站请求打到已校验 IP」、重定向逐跳钉定）；smoke 新增「下载连接钉定」「search_file 跨会话兜底护栏」两项防回归，并把 verify_ssl 告警纳入风险配置告警检查；根套件新增 2a6b（多会话歧义拒绝兜底、拒绝不泄露内容、显式 session_id 各自命中）与 3h/4h/4i。两项修复均做了**反向验证**：还原旧实现后新用例确实 FAIL（钉定还原 → 域名参与连接；旧兜底还原 → LLM 幻觉 session_id 时拿到其他会话内容）。
 
+## v1.4.0（2026-11-04）读取提速专项（方案 A0–A5 全量落地）
+
+> 施工蓝图：`docs/perf-plan.md`。基线 v1.3.9；真机证据来自 11-03 15:21~15:48「鸟の小窝」19MB PDF 事故。
+
+### 六项改动
+
+| 项 | 改动 | 真机/本机效果 |
+|---|---|---|
+| A0 | `_handle_file` 用 `perf_counter` 包住取字节 / 解析 / 分块 / embedding / 词法索引五段，入库后打一条汇总日志；`VectorStore.add_file` 新增 `timing` 出参 | 26min 级空窗从「不可归因」变成「一眼看出卡在哪段」 |
+| A1 | 新增插件实例级 `_file_inflight` 注册表（键 = `session\|file_id` > `url` > `(name,size)`，取到 NapCat 真实路径后再补一道 `path:` 强身份），检查与登记在同一段同步代码内完成 | 同一文件并发双触发只解析 1 次、embedding 只跑 1 次（旧版 `_recent_file_keys` 是 check-then-act，两任务同时通过） |
+| A2 | PDF 引擎改为 `pypdfium2` 优先 + `pdfminer` 兜底，新增 `reader.pdf_max_pages`（默认 500）；纯扫描件直接给准确原因，不再让 pdfminer 白跑 | 18.4MB/141 页教材 **4.01s → 1.12s**；解析期 main loop 最大滞后 **59ms → 21ms**（C 扩展释放 GIL） |
+| A3 | 默认分块 `512/100` → `1024/128` | 52 万字日志 **1351 块/22 批 → 591 块/10 批**；教材 PDF 179 块/3 批 → 81 块/2 批 |
+| A4 | `_read_txt` 走 UTF-8 快路径，`chardet` 只探前 64KB | 31MB 日志编码探测 **0.22s → 0.03s**（UTF-8 命中时零探测） |
+| A5 | 会话内 sha256 重发缓存（`_hash_index`，不落盘），命中即 `touch_files` 复用 | 同会话重发同一文件：回执秒回、零解析、零 embedding |
+
+### 关键实现细节
+
+- **A1 为什么不用旧去重**：`_recent_file_keys` 的「查时刻 → 写时刻」中间没有原子性，双 hook 并发进入时两个任务都能通过。新注册表登记的是 `asyncio.Task` 本身，`finally` 里按「键仍指向自己」撤销，不会误删后到任务的新登记。
+- **A2 的空文本语义**：pypdfium2 解析成功但提取不到文字 ⇒ **直接报「可能是扫描件/图片型 PDF」**，不再降级 pdfminer（那只会再白跑几分钟拿到同样的空）。只有**引擎异常**才降级。双引擎都失败时报错信息带两边各自的原因。
+- **A2 的提示通道**：解析器需要回话（「共 N 页、只读前 M 页」）但 `SUPPORTED_EXTENSIONS` 的签名是 `Callable[[str], str]`，加参数会破坏扩展名分派表。改用 `ContextVar` + `collect_parse_notes`：`asyncio.to_thread` 会复制上下文，并发文件互不串台（有专门用例验证）。
+- **A5 的边界**（D5）：只做**会话内、不持久化**。跨会话复用有侧信道语义（B 会话能感知「此文件被处理过」），持久化则要引入缓存目录管理。`/clear_file`、清理循环回收会话、文件过期三条路径都会让对应键失效。
+
+### 配置变更
+
+| 配置 | 变更 | 说明 |
+|---|---|---|
+| `plugin.config_version` | 1.1.0 → **1.2.0** | 新增 `pdf_max_pages`，不 bump 旧实例的 config.toml 里不会出现该键 |
+| `reader.chunk_size` | **512 → 1024** | 已部署实例的 config.toml 会保留旧值 512；想吃到提速需手动改或删掉重新生成 |
+| `reader.chunk_overlap` | **100 → 128** | 同上 |
+| `reader.pdf_max_pages` | 新增 500 | 0 = 不限制 |
+
+### 依赖变更
+
+- `_manifest.json` 新增 `pypdfium2 >=4.30`（BSD-3，预编译轮子，无 AGPL 冲突）。安装失败/缺轮子时 try-import 自动落回 pdfminer，行为与 v1.3.9 完全一致，无新故障面。
+
+### 顺带修掉的测试债（不是代码回归）
+
+- 根套件 `test_file_reader.py` 的装饰器配对白名单停留在 v1.3.0，缺 `announce_file_context`（v1.3.2 新增）——该 assert 一直红着，导致后面 3 条用例从未跑到。
+- 白名单修好后暴露两处**测试内状态泄漏**：1g/1h 把 `napcat.enabled` 置 False 未恢复（1i4 回填用例因此走不到取字节）；1i 系列把 `ctx.llm.embed` 换成恒失败桩后未恢复（1i4 在取字节之后才失败，报错误导）。
+- 矩阵检索清理用例：Windows `time.time()` 分辨率 15.6ms，入库与清理落在同一 tick 时 `retention=0` 不成立 ⇒ 偶发不清理。用例改为显式推进一个 tick，**不改产品语义**。
+
+### 测试
+
+- `pytest tests`：**220 项**全过（新增 `tests/test_perf_v140.py` 21 项：PDF 引擎分层 / 截断 / 扫描件 / 双失败原因 / ContextVar 贯通 / 编码快路径 / 分块耗时出参 / in-flight 去重 / 重发缓存 / 默认参数）。
+- 根套件 `test_file_reader.py`：**75 项**全过（此前因上述测试债红着）。
+- 冒烟 `tests/smoke_test.py`：11 项全过。
+- 门禁 `gate.sh`：PASS 3 / SKIP 0 / FAIL 0。
+- 反向验证（实测，不是声称）：
+  - 把 `_claim_inflight_file` 改成永远放行（还原 v1.3.9 行为）⇒ 并发双触发解析次数变成 **2**，`test_concurrent_duplicate_triggers_parsed_once` 立刻变红 —— 去重确由注册表守住。
+  - 把 `file_parser._pdfium` 置 None（模拟没装 pypdfium2）⇒ 真实 18.4MB 教材仍由 pdfminer 解出 72176 字 / 4.49s —— 降级路径可用，未装依赖不会变成读不了 PDF。
+
+### 未做（见 perf-plan §3/§4）
+
+- OCR（图片型 PDF）、解析↔embedding 流水线重叠、分块器预切、lxml/iterparse 改写、进程池 —— 均无实测支撑，明确不做。
+- 真机验收待办：发一次奶蛙学 PDF，确认日志出现五段耗时且「已入库」只出现一次。
+
 ## v1.3.9（2026-11-03）Planner 公告补「正在解析」状态
+
 
 ### 问题
 

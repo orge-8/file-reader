@@ -141,6 +141,9 @@ async def _test_modules() -> None:
         r_new = vs_m.retrieve(qvec, top_k=5)
         assert any(x["file_name"] == "third.txt" for x in r_new), "置脏重建后应检索到新入库文件"
         # 清理置脏：清理后矩阵不应再返回被删文件的块
+        # v1.4.0：Windows 上 time.time() 分辨率仅 15.6ms，入库与清理可能落在同一 tick，
+        # retention=0 时 `now - last_used > 0` 不成立 ⇒ 偶发不清理。显式推进一个 tick。
+        await asyncio.sleep(0.02)
         removed_m = vs_m.cleanup_expired(retention_seconds=0, max_rounds=999)
         assert removed_m, "时间过期应清理文件"
         r_after = vs_m.retrieve(qvec, top_k=5)
@@ -203,6 +206,9 @@ async def _test_plugin_hooks() -> None:
     lines = text.splitlines()
     expected_pairs = {
         "on_file_message_early", "on_file_message", "inject_file_context",
+        # v1.4.0 补登：v1.3.2 新增的 Planner 公告 hook 一直没写进白名单，
+        # 本套件（直跑脚本，不在 pytest 采集范围内）因此长期红着 —— 是白名单过期，不是绑定错位。
+        "announce_file_context",
         "cmd_clear_file", "cmd_status", "search_file",
         # v1.3.0：BM25 运行期回滚开关（已部署实例的 config.toml 补不上新键，
         # 回滚必须有一条代码层入口）
@@ -757,6 +763,15 @@ async def _test_plugin_hooks() -> None:
         fh.write("回填测试内容：显卡转神教，白话版第一段。")
     orig_resolve = plugin._resolve_via_napcat
     plugin._resolve_via_napcat = lambda fdata: (None, real_path)  # noqa: ARG005
+    # v1.4.0 修正：1i/1i2/1i3 用例把 ctx.llm.embed 换成恒失败的 _dead_embed，
+    # 并在重试成功后 `del plugin.__dict__["_embed"]` 恢复类方法——本用例要真的入库，
+    # 必须重新装上可用的伪 embedding（否则会在取字节之后才失败，报错误导）。
+    plugin.ctx.llm.embed = _orig_llm_embed
+    plugin._embed = _fake_embed_async
+    # v1.4.0 修正：1g/1h 用例把 napcat.enabled 置为 False 后没有恢复，而本用例走的是
+    # 「降级文本 + message_id 回溯」路径，未启用 NapCat 会在取字节前就被拒。
+    # 这是测试内状态泄漏（此前被装饰器白名单的 assert 提前中断掩盖，一直没跑到这里）。
+    plugin.config.napcat.enabled = True
     sent_before = len(runner.host.sent_messages)
     await plugin._handle_file(
         session_id="backfill-session",

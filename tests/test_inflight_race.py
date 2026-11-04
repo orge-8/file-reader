@@ -43,9 +43,12 @@ def _cleanup_stub(store, inflight):
     return SimpleNamespace(
         _store=store,
         _inflight=inflight,
+        _hash_index={},
         config=SimpleNamespace(reader=reader),
         _memo_invalidate_session=lambda _sid: None,
         _prune_summary_failed=lambda: None,
+        # v1.4.0：清理时顺带裁重发缓存；桩里做空实现（真实实现见 test_perf_v140.py）
+        _prune_hash_index=lambda: None,
         ctx=SimpleNamespace(logger=logging.getLogger("test.inflight")),
     )
 

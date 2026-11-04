@@ -20,9 +20,11 @@ import io
 import logging
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,6 +38,64 @@ try:
     from pdfminer.high_level import extract_text  # type: ignore
 except ImportError:  # pragma: no cover
     extract_text = None
+
+# v1.4.0：PDF 首选引擎（C 扩展，解析期间**释放 GIL**，且比 pdfminer 快约 2.5×）。
+# 用宽口径 except：轮子/DLL 损坏时抛的是 OSError 而不是 ImportError，
+# 一律按"不可用"降级到 pdfminer，不能因为装了半个包就让 PDF 彻底读不了。
+try:
+    import pypdfium2 as _pdfium  # type: ignore
+except Exception:  # noqa: BLE001  pragma: no cover
+    _pdfium = None
+
+
+# PDF 页数上限（v1.4.0）：由插件配置 reader.pdf_max_pages 注入，0 = 不限制。
+# 放在模块级是因为解析函数签名要走 SUPPORTED_EXTENSIONS 的 `Callable[[str], str]`，
+# 加参数会破坏扩展名分派表；插件侧用 set_pdf_max_pages() 同步。
+_PDF_MAX_PAGES = 500
+
+# 解析提示（v1.4.0）：解析器需要回话给调用方的内容（如"PDF 已截取前 N 页"）。
+# 用 ContextVar 而不是返回值：`asyncio.to_thread` 会复制当前上下文，
+# 所以事件循环里 with 住的列表在工作线程里同样可见，且并发文件互不串台。
+_PARSE_NOTES: ContextVar[Optional[list]] = ContextVar("file_parser_notes", default=None)
+
+
+def set_pdf_max_pages(pages: int) -> None:
+    """设置 PDF 解析页数上限（0 或负数 = 不限制）。由插件在加载/热重载时同步。"""
+    global _PDF_MAX_PAGES
+    try:
+        _PDF_MAX_PAGES = max(0, int(pages or 0))
+    except (TypeError, ValueError):
+        _PDF_MAX_PAGES = 500
+
+
+def get_pdf_max_pages() -> int:
+    """当前 PDF 页数上限（0 = 不限制）。"""
+    return _PDF_MAX_PAGES
+
+
+@contextmanager
+def collect_parse_notes(notes: list) -> Iterator[None]:
+    """收集本次解析的提示信息（线程安全）。
+
+    用法：`with collect_parse_notes(buf): text = await asyncio.to_thread(read_any_file_to_text, p, n)`。
+    """
+    token = _PARSE_NOTES.set(notes)
+    try:
+        yield
+    finally:
+        _PARSE_NOTES.reset(token)
+
+
+def _note(notes: Optional[list], text: str) -> None:
+    """写一条解析提示：显式传入的列表优先，否则落到当前上下文的收集器。"""
+    sink = notes if notes is not None else _PARSE_NOTES.get()
+    if sink is not None:
+        sink.append(text)
+
+
+def pdf_engine_available() -> tuple[bool, bool]:
+    """(pypdfium2 可用, pdfminer 可用)，供自检与状态命令使用。"""
+    return (_pdfium is not None, extract_text is not None)
 
 try:
     import docx2txt  # type: ignore
@@ -667,10 +727,67 @@ RECOGNIZED_UNSUPPORTED: dict[str, str] = {
 
 
 # ─── 扩展名 → 处理函数（原映射表，函数体改为标准库优先） ────────────
-def _read_pdf(path: str) -> str:
+def _pdfium_extract(path: str, max_pages: int, notes: Optional[list] = None) -> str:
+    """pypdfium2 提取全文（v1.4.0）。超过 max_pages 时截断并登记提示。"""
+    pdf = _pdfium.PdfDocument(path)
+    try:
+        total = len(pdf)
+        limit = total if max_pages <= 0 else min(total, max_pages)
+        parts: list[str] = []
+        for i in range(limit):
+            page = pdf[i]
+            try:
+                parts.append(page.get_textpage().get_text_range())
+            finally:
+                page.close()
+        if limit < total:
+            _note(notes, f"PDF 共 {total} 页，已只读取前 {limit} 页（reader.pdf_max_pages={max_pages}）")
+        return "\n".join(parts)
+    finally:
+        pdf.close()
+
+
+def _read_pdf(path: str, notes: Optional[list] = None) -> str:
+    """PDF 解析：pypdfium2 优先 → pdfminer 兜底 → 双失败报两个引擎的原因。
+
+    v1.4.0：旧版只有 pdfminer（纯 Python、慢、抢 GIL，真机 18MB 教材解析 26min
+    期间 main loop 被拖出多次秒级卡顿）。pypdfium2 是 C 扩展且释放 GIL，
+    同时把「纯扫描件无文字」这种情形提前识别，不再让 pdfminer 白跑几分钟。
+    """
+    max_pages = _PDF_MAX_PAGES
+    errors: list[str] = []
+
+    if _pdfium is not None:
+        try:
+            text = _pdfium_extract(path, max_pages, notes)
+        except Exception as e:  # noqa: BLE001  引擎异常一律降级，不让单点故障终止解析
+            errors.append(f"pypdfium2 {type(e).__name__}: {e}")
+            _LOGGER.warning("pypdfium2 解析失败，回退 pdfminer: %s (%s)", e, path)
+        else:
+            if text.strip():
+                return text
+            # 空文本 = 纯扫描件/图片型 PDF：直接给准确原因，pdfminer 也提不出来
+            raise RuntimeError(
+                "PDF 未提取到任何文字，可能是扫描件或图片型 PDF（本插件不含 OCR，"
+                "如需识别图片文字请先用工具转成文本再发）"
+            )
+
     if extract_text is None:
-        raise RuntimeError("缺少依赖 pdfminer.six，请安装：pip install pdfminer.six")
-    return extract_text(path)
+        if errors:
+            raise RuntimeError("PDF 解析失败（" + "；".join(errors) + "），且未安装 pdfminer.six 兜底")
+        raise RuntimeError("缺少 PDF 解析依赖：请安装 pypdfium2（推荐）或 pdfminer.six")
+
+    try:
+        text = extract_text(path, maxpages=max_pages if max_pages > 0 else 0)
+    except Exception as e:  # noqa: BLE001  双引擎都失败时把两边原因都带上
+        errors.append(f"pdfminer {type(e).__name__}: {e}")
+        raise RuntimeError("PDF 解析失败（" + "；".join(errors) + "）") from e
+    if not text.strip():
+        raise RuntimeError(
+            "PDF 未提取到任何文字，可能是扫描件或图片型 PDF（本插件不含 OCR，"
+            "如需识别图片文字请先用工具转成文本再发）"
+        )
+    return text
 
 
 def _read_docx(path: str) -> str:
@@ -700,14 +817,24 @@ def _read_pptx(path: str) -> str:
 
 
 def _read_txt(path: str) -> str:
+    """纯文本读取（v1.4.0 提速）：UTF-8 快路径 + chardet 只探前 64KB。
+
+    旧版对**全量字节**跑 `chardet.detect`——50MB 的日志光探测就要几秒，
+    而这批文件占实际使用量的绝大多数。现在绝大多数文件（UTF-8）
+    连一次探测都不做；只有解码失败才探测，且只探头部 64KB。
+    """
     with open(path, "rb") as f:
         raw = f.read()
+    try:
+        return raw.decode("utf-8")  # ① 快路径：命中即返回，零探测
+    except UnicodeDecodeError:
+        pass
     encoding = "utf-8"
     if chardet is not None:
-        det = chardet.detect(raw)
+        det = chardet.detect(raw[:65536])  # ② 只探前 64KB，成本恒定
         if det and det.get("encoding") and det.get("confidence", 0) > 0.5:
             encoding = det["encoding"]
-    for enc in (encoding, "utf-8", "gbk", "gb18030", "latin-1"):
+    for enc in (encoding, "utf-8", "gbk", "gb18030", "latin-1"):  # ③ 兜底链不变
         try:
             return raw.decode(enc)
         except (UnicodeDecodeError, LookupError):

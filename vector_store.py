@@ -139,18 +139,25 @@ class VectorStore:
     def total_chunks(self) -> int:
         return sum(len(f.chunks) for f in self._files.values())
 
-    async def add_file(self, file_name: str, content: str) -> FileEntry:
-        """解析文本 → 分块 → 向量化 → 存入。"""
+    async def add_file(self, file_name: str, content: str, timing: Optional[dict] = None) -> FileEntry:
+        """解析文本 → 分块 → 向量化 → 存入。
+
+        v1.4.0：`timing` 给出参字典，回填 chunk / embed / index / total 四段秒数，
+        供调用方打一条可归因的耗时日志（真机排障只有「已入库」一个点，无法定位慢在哪儿）。
+        """
         from chunker import RecursiveCharacterChunker  # noqa: F401  (确认可用)
 
+        t_begin = time.perf_counter()
         # v1.1.0：递归分块是 CPU 密集任务（大文本可达秒级），进线程避免冻结事件循环
         chunks = await asyncio.to_thread(self._chunker.chunk, content)
         if not chunks:
             chunks = [content] if content.strip() else []
         if not chunks:
             raise ValueError("文件内容为空，无可向量化文本")
+        t_chunked = time.perf_counter()
 
         vectors = await self._embed(chunks)
+        t_embedded = time.perf_counter()
 
         # v1.1.0：向量统一转 float32 ndarray（内存约为 list-of-float 的 1/8）；
         # 转换失败（如 ragged）回退原列表，下游 _build_matrix/_cosine 均兼容。
@@ -173,6 +180,16 @@ class VectorStore:
         self._mat_cache = None  # 置脏：下次检索重建矩阵
         # v1.3.0：词法索引增量登记（分词是 CPU 密集，同样进线程）
         await asyncio.to_thread(self._lexical.add, file_name, chunks)
+        if timing is not None:
+            t_done = time.perf_counter()
+            timing.update(
+                {
+                    "chunk": t_chunked - t_begin,
+                    "embed": t_embedded - t_chunked,
+                    "index": t_done - t_embedded,
+                    "total": t_done - t_begin,
+                }
+            )
         return entry
 
     async def _embed(self, texts: List[str]) -> List[List[float]]:

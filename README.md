@@ -23,6 +23,24 @@ MaiBot 插件：解析 QQ 群/私聊上传的文件，分块后做「向量 + BM
   检索无命中时不注入任何内容（旧版会拿概要顶上，反而诱导模型编）。
 - 注入用 `item_id` 前缀判幂等，重试不叠加；hook 全部 `ErrorPolicy.SKIP`，插件出错不阻断聊天。
 
+### 读取耗时（v1.4.0）
+
+真机「读文件慢」实测归因为三件事，逐条落地（完整证据与决策见 `docs/perf-plan.md`）：
+
+| 项 | 手段 | 本机实测 |
+|---|---|---|
+| PDF 解析慢、拖垮事件循环 | pypdfium2 优先 + pdfminer 兜底 + 页数上限 | 18.4MB/141 页教材 4.01s → **1.12s**；main loop 滞后 59ms → **21ms** |
+| embedding 批次数随块数线性增长 | 默认分块 512/100 → **1024/128** | 52 万字日志 1351 块/22 批 → **591 块/10 批** |
+| 同一文件被双 hook 处理两遍 | in-flight 注册表（按 file_id / url / 真实路径去重） | 并发双触发只解析 1 次、embedding 只跑 1 次 |
+| 同会话重发同一文件全部重跑 | 会话内 sha256 缓存（不落盘，清文件/清理自动失效） | 回执秒回，零解析、零 embedding |
+| 大文本编码探测吃满 CPU | UTF-8 快路径 + chardet 只探前 64KB | 31MB 日志探测 0.22s → **0.03s** |
+
+另外新增一条**可归因的耗时日志**（真机排障地基），入库后直接打出每段耗时：
+
+```
+文件处理耗时 奶蛙学 必修第一册.pdf：取字节=1.83s 解析=1.12s 分块=0.01s embedding=28.4s 词法索引=0.42s 合计=31.8s（81 块 / 18.4MB）
+```
+
 ## 安装
 
 1. 将本目录放入 MaiBot 的 `plugins/` 文件夹，重启 MaiBot 或通过 WebUI 启用。
@@ -38,12 +56,14 @@ MaiBot 插件：解析 QQ 群/私聊上传的文件，分块后做「向量 + BM
 |---|---|---|
 | `numpy` >=1.24 | 向量库余弦相似度（`vector_store.py`） | 插件无法加载 |
 | `httpx` >=0.24 | URL 来源文件的流式下载 | URL 下载路径不可用 |
-| `pdfminer.six` >=20221105 | **PDF 解析** | 收到 PDF 只报「缺少依赖 pdfminer.six」，读不到内容 |
+| `pdfminer.six` >=20221105 | PDF 解析**兜底**引擎 | pypdfium2 也缺失时读不到 PDF |
+| `pypdfium2` >=4.30 | PDF 解析**首选**引擎（v1.4.0） | 自动降级 pdfminer：功能不缺，但慢约 3.6× 且解析期间抢 GIL（真机会出现 main loop 秒级卡顿） |
 
-> ⚠️ **PDF 是必需依赖**：PDF 没有标准库解法，`file_parser.py` 里 `_read_pdf` 在缺 `pdfminer.six` 时会直接抛错。
-> 之所以由 manifest 声明而不是"可选手工安装"，是因为插件描述里把 PDF 列为核心能力之一——
-> 装完开箱读不了 PDF 属于功能与声明不符。若你的插件管理器不自动装依赖，请手动执行：
-> `pip install pdfminer.six`
+> ⚠️ **PDF 是必需能力**：PDF 没有标准库解法。v1.4.0 起按 `pypdfium2 → pdfminer` 两级降级，
+> 两个引擎都不可用时才报错（报错信息里会带上两边各自的失败原因）。
+> 本机实测 18.4MB / 141 页教材：`pypdfium2` **1.12s**，`pdfminer` **4.01s**，且前者解析期间
+> main loop 最大滞后 21ms（后者 59ms）——C 扩展释放 GIL，不再拖被动事件循环。
+> 若插件管理器不自动装依赖，请手动执行：`pip install pypdfium2 pdfminer.six`
 
 **可选手工安装**（缺失时全部有降级路径，不影响插件加载与其它格式）：
 
@@ -109,8 +129,9 @@ pip install pandas openpyxl  # 仅 .xls / .ods 老表格格式（xlsx/csv 已零
 |---|---|---|---|
 | plugin.enabled | bool | true | 是否启用插件 |
 | reader.max_file_size | int | 30 | 单文件大小上限（MB）。内存占用约为文件大小的 2~3 倍（字节+解析文本+向量同时驻留），v1.1.0 起下载在开始前/下载中超限即中断，不再全量拉进内存 |
-| reader.chunk_size | int | 512 | 分块大小（字符数） |
-| reader.chunk_overlap | int | 100 | 分块重叠（字符数） |
+| reader.chunk_size | int | **1024**（v1.4.0，旧版 512） | 分块大小（字符数）。块数直接决定 embedding 批次数：52 万字日志实测 1351 块/22 批 → 591 块/10 批。检索粒度变粗由 BM25 词法检索兜底 |
+| reader.chunk_overlap | int | **128**（v1.4.0，旧版 100） | 分块重叠（字符数），随 chunk_size 同比放大（约 12%） |
+| reader.pdf_max_pages | int | 500 | PDF 最多解析页数（v1.4.0）：超过即截断，并在日志与回执中提示「共 N 页、只读前 M 页」；0 = 不限制 |
 | reader.chunk_merge_enabled | bool | true | 短碎片合并（v1.0.18）：相邻短碎片合并到接近 chunk_size 再成块，块数降至约 1/3，入库向量化耗时同步下降；关闭回退旧逐碎片成块 |
 | reader.retrieve_top_k | int | 6 | 检索返回的相关块数量 |
 | reader.retrieve_use_matrix | bool | true | 矩阵化检索（v1.0.18）：缓存 L2 归一化向量矩阵，查询时一次点积算全库相似度（入库/清理自动置脏重建）；块数多时检索开销显著下降；异常自动回退逐条余弦 |
@@ -219,10 +240,10 @@ python tools/check_plugin.py plugins/file-reader
 # 冒烟测试（FakeHost 完整生命周期，11 项：组件清单 / manifest 一致性 / SSRF 守卫 / 卸载收尾）
 python plugins/file-reader/tests/smoke_test.py
 
-# pytest（168 项：下载安全守卫 + 分块 / 词法 / 注入 / 格式解析，门禁里的 pytest 步骤跑的就是它）
+# pytest（220 项：下载安全守卫 + 分块 / 词法 / 注入 / 格式解析 / v1.4.0 提速专项，门禁里的 pytest 步骤跑的就是它）
 python -m pytest -q plugins/file-reader/tests
 
-# 功能自测（解析→分块→向量化→检索→清理 + hook 直调，71 项，用伪 embedding 不依赖真模型）
+# 功能自测（解析→分块→向量化→检索→清理 + hook 直调，75 项，用伪 embedding 不依赖真模型）
 python plugins/file-reader/test_file_reader.py
 ```
 

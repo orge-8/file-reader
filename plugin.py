@@ -13,6 +13,7 @@
 """
 import asyncio
 import base64
+import hashlib
 import ipaddress
 import json
 import logging
@@ -54,7 +55,14 @@ from maibot_sdk.types import (  # noqa: E402
 )
 
 from chunker import RecursiveCharacterChunker  # noqa: E402
-from file_parser import describe_supported_types, get_extension, read_any_file_to_text  # noqa: E402
+from file_parser import (  # noqa: E402
+    collect_parse_notes,
+    describe_supported_types,
+    get_extension,
+    pdf_engine_available,
+    read_any_file_to_text,
+    set_pdf_max_pages,
+)
 from lexical_index import apply_relevance_gate, rrf_fuse  # noqa: E402
 from vector_store import SessionStore  # noqa: E402
 
@@ -330,7 +338,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.1.0", description="配置版本（v1.3.0 从 1.0.0 升到 1.1.0：新增混合检索/生命周期/回执三类配置项，不升版这些键不会出现在已部署实例的 config.toml 里）")
+    config_version: str = Field(default="1.2.0", description="配置版本（v1.3.0：1.0.0→1.1.0 补混合检索/生命周期/回执键；v1.4.0：1.1.0→1.2.0 补 pdf_max_pages。不升版这些键不会出现在已部署实例的 config.toml 里）")
 
 
 class ReaderConfig(PluginConfigBase):
@@ -341,8 +349,9 @@ class ReaderConfig(PluginConfigBase):
     __ui_order__ = 1
 
     max_file_size: int = Field(default=30, description="单文件大小上限（MB）。注意内存占用约为文件大小的 2~3 倍（字节+解析文本+向量同时驻留），大内存机器可调高")
-    chunk_size: int = Field(default=512, description="分块大小（字符数）")
-    chunk_overlap: int = Field(default=100, description="分块重叠（字符数）")
+    chunk_size: int = Field(default=1024, description="分块大小（字符数）。v1.4.0 从 512 提到 1024：块数腰斩 ⇒ embedding 批次数腰斩（真机 1456 块 23 批 → 约 730 块 12 批），检索粒度变粗由 BM25 词法检索兜底")
+    chunk_overlap: int = Field(default=128, description="分块重叠（字符数）。v1.4.0 从 100 调到 128（随 chunk_size 同比放大，保持约 12% 重叠）")
+    pdf_max_pages: int = Field(default=500, description="PDF 最多解析页数（v1.4.0）：超过即截断并在日志/回执中提示；0 = 不限制。防超大 PDF 长时间占用解析线程")
     chunk_merge_enabled: bool = Field(default=True, description="短碎片合并（v1.0.18 性能优化）：递归切分出的相邻短碎片合并到接近 chunk_size 再成块，块数降至约 1/3，入库向量化耗时同步下降；关闭则回退旧的逐碎片成块行为")
     retrieve_top_k: int = Field(default=6, description="检索返回的相关块数量")
     retrieve_use_matrix: bool = Field(default=True, description="矩阵化检索（v1.0.18 性能优化）：缓存 L2 归一化向量矩阵，查询时一次点积算全库相似度（入库/清理/删文件自动置脏重建）；块数多时检索开销显著下降，结果与逐条余弦一致；异常自动回退旧路径")
@@ -505,6 +514,14 @@ class FileReaderPlugin(MaiBotPlugin):
         # 用计数而不是 set：防抖合并会把同一条消息里的 N 个文件并发丢进来，
         # 若用 set，先完成的任务会把 key 抹掉，剩下的文件又失去保护。
         self._inflight: dict[tuple[str, str], int] = {}
+        # v1.4.0：同一文件的并发重复处理注册表（键 = 稳定文件身份 -> 处理它的 Task）。
+        # v1.3.8 的 _recent_file_keys 是 check-then-act，两个 hook 同时进来会**双双通过**；
+        # 真机 11-03 15:47 日志「已入库 奶蛙学…pdf：182 块」出现两次，解析与 embedding
+        # 各做了一遍（成本 ×2）。这里在真正开始干活前登记，后到者直接放弃。
+        self._file_inflight: dict[str, Any] = {}
+        # v1.4.0：会话内重发缓存 (session_id, conversation_id, sha256) -> file_name。
+        # 只在内存、不落盘（跨会话复用有侧信道语义：B 能感知"此文件被处理过"）。
+        self._hash_index: dict[tuple[str, str, str], str] = {}
         # 最近一次"被降级成纯文本"的文件消息留档（供 /file_status 排查）
         self._last_file_hint: dict[str, Any] = {}
         # embedding 失败重试队列（v1.0.11）：[{session_id, conversation_id, stream_id, name, tmp_path, attempts, next_ts}]
@@ -543,6 +560,8 @@ class FileReaderPlugin(MaiBotPlugin):
 
         # 行为自检：确认 chunker / 解析器在进程内可用（runtime-gotchas 5.1 的对策）
         self._run_self_check()
+        # v1.4.0：把页数上限同步给解析器模块（模块级状态，热重载见 on_config_update）
+        self._sync_parser_config()
 
         self.ctx.logger.info(
             "文件读取插件已加载：data_dir=%s，chunk_size=%d，top_k=%d，有效时间=%dmin，最大轮数=%d",
@@ -616,14 +635,27 @@ class FileReaderPlugin(MaiBotPlugin):
         use_matrix = bool(self.config.reader.retrieve_use_matrix)
         for vs in self._store._sessions.values():
             vs.retrieve_use_matrix = use_matrix
+        # v1.4.0：PDF 页数上限是解析器模块级状态，热重载必须同步，否则改配置不生效
+        self._sync_parser_config()
         self.ctx.logger.info(
-            "配置已热重载：chunk_size=%d, top_k=%d, retention=%dmin, max_rounds=%d, matrix_retrieve=%s",
+            "配置已热重载：chunk_size=%d, top_k=%d, retention=%dmin, max_rounds=%d, matrix_retrieve=%s, pdf_max_pages=%d",
             self.config.reader.chunk_size,
             self.config.reader.retrieve_top_k,
             self.config.reader.file_retention_time,
             self.config.reader.file_max_rounds,
             use_matrix,
+            int(self.config.reader.pdf_max_pages or 0),
         )
+
+    def _sync_parser_config(self) -> None:
+        """把解析层相关的配置推给 file_parser（模块级状态，不是每文件读配置）。"""
+        try:
+            set_pdf_max_pages(int(self.config.reader.pdf_max_pages or 0))
+        except (TypeError, ValueError):
+            self.ctx.logger.warning(
+                "reader.pdf_max_pages=%r 不是合法整数，PDF 页数上限保持默认",
+                self.config.reader.pdf_max_pages,
+            )
 
     # ─── 行为自检 ────────────────────────────────────────────────
     def _run_self_check(self) -> None:
@@ -693,6 +725,28 @@ class FileReaderPlugin(MaiBotPlugin):
                 )
         except Exception as e:  # noqa: BLE001
             self.ctx.logger.error("[自检] 下载安全策略: FAIL (%s)", e)
+
+        # v1.4.0：PDF 引擎自检——pypdfium2 缺失只影响速度（自动落 pdfminer），
+        # 两个都没有才是真的读不了 PDF，必须在启动日志里喊出来。
+        try:
+            has_pdfium, has_pdfminer = pdf_engine_available()
+            if has_pdfium:
+                self.ctx.logger.info(
+                    "[自检] PDF 引擎: PASS (pypdfium2 优先%s，页数上限 %d)",
+                    " + pdfminer 兜底" if has_pdfminer else "，无 pdfminer 兜底",
+                    int(self.config.reader.pdf_max_pages or 0),
+                )
+            elif has_pdfminer:
+                self.ctx.logger.warning(
+                    "[自检] PDF 引擎: 降级 (仅 pdfminer，纯 Python 且抢 GIL，大 PDF 会拖慢事件循环；"
+                    "装 pypdfium2 可提速约 2.5×)"
+                )
+            else:
+                self.ctx.logger.error(
+                    "[自检] PDF 引擎: FAIL (pypdfium2 与 pdfminer.six 都不可用，PDF 文件将无法解析)"
+                )
+        except Exception as e:  # noqa: BLE001
+            self.ctx.logger.error("[自检] PDF 引擎: FAIL (%s)", e)
 
     # ─── embedding 封装 ──────────────────────────────────────────
     async def _embed(self, texts: list[str], *, query_mode: bool = False) -> Any:
@@ -1257,6 +1311,91 @@ class FileReaderPlugin(MaiBotPlugin):
             session_id, len(getattr(vs, "files", {}) or {}),
         )
 
+    # ─── v1.4.0：重复处理去重 ────────────────────────────────────
+    @staticmethod
+    def _file_identity(session_id: str, conversation_id: str, fdata: dict[str, Any]) -> str:
+        """稳定文件身份（v1.4.0）：file_id > url > (name, size)。
+
+        真机 11-03 15:21 的双触发里，两条消息的 `name` 一个叫「附件」（占位符）、
+        一个叫「奶蛙学 必修第一册.pdf」（真名），按名字去重永远漏；file_id 才是稳定标识。
+
+        v1.4.0：键里带 `conversation_id`——同一 session 下不同对话各有独立向量库，
+        若只按 session 去重，两处同时发同一文件会让其中一个库永远收不到文件。
+        """
+        scope = f"{session_id}|{conversation_id}"
+        fid = str(fdata.get("file_id") or "").strip()
+        if fid:
+            return f"{scope}|id:{fid}"
+        url = str(fdata.get("url") or "").strip()
+        if url:
+            return f"{scope}|url:{url}"
+        name = str(fdata.get("name") or "").strip()
+        size = fdata.get("size_hint") or fdata.get("size") or 0
+        return f"{scope}|nm:{name}|{size}"
+
+    def _claim_inflight_file(self, key: str, name: str) -> bool:
+        """登记「正在处理」；已有同身份任务在跑则返回 False（本次直接放弃）。
+
+        与 `_recent_file_keys` 的区别：那个是 check-then-act（两个 hook 同时进来会
+        双双通过，于是同一 19MB PDF 被解析两遍、embedding 两遍）；这里"检查 + 登记"
+        在同一段同步代码里完成，中间没有 await，不会被切换打断。
+        """
+        current = asyncio.current_task()
+        if current is None:
+            # 非任务上下文（单测直调等）：没有可复用的"并发主体"，不做登记也不拦
+            return True
+        holder = self._file_inflight.get(key)
+        if holder is not None and holder is not current and not holder.done():
+            self.ctx.logger.info("文件 %s 正在处理中（重复触发），本次直接复用", name)
+            return False
+        self._file_inflight[key] = current
+        return True
+
+    def _release_inflight_file(self, keys: list[str]) -> None:
+        """释放登记（只撤销自己名下的，避免误删后到任务的新登记）。"""
+        current = asyncio.current_task()
+        if current is None:
+            return
+        for key in keys:
+            if self._file_inflight.get(key) is current:
+                self._file_inflight.pop(key, None)
+
+    def _prune_hash_index(self, limit: int = 512) -> None:
+        """裁剪重发缓存（v1.4.0）：先删指向「已不在库」文件的键，仍超量则按插入序淘汰。"""
+        if not self._hash_index:
+            return
+        alive: set[str] = set()
+        for vs in self._store._sessions.values():
+            alive.update(vs.files.keys())
+        for key in [k for k, v in self._hash_index.items() if v not in alive]:
+            self._hash_index.pop(key, None)
+        while len(self._hash_index) > limit:
+            self._hash_index.pop(next(iter(self._hash_index)), None)
+
+    def _log_file_timing(
+        self,
+        name: str,
+        size_mb: float,
+        t_fetch: float,
+        t_parse: float,
+        timing: dict[str, float],
+        chunks: int,
+    ) -> None:
+        """A0：一条可归因的分段耗时日志（真机 26min 空窗的定位地基）。"""
+        self.ctx.logger.info(
+            "文件处理耗时 %s：取字节=%.2fs 解析=%.2fs 分块=%.2fs embedding=%.2fs 词法索引=%.2fs"
+            " 合计=%.2fs（%d 块 / %.1fMB）",
+            name,
+            t_fetch,
+            t_parse,
+            timing.get("chunk", 0.0),
+            timing.get("embed", 0.0),
+            timing.get("index", 0.0),
+            t_fetch + t_parse + timing.get("total", 0.0),
+            chunks,
+            size_mb,
+        )
+
     async def _handle_file(self, session_id: str, conversation_id: str, stream_id: str, fdata: dict[str, Any]) -> None:
         """后台：写临时文件 → 解析 → 向量化 → 落库 → 回执。
 
@@ -1264,6 +1403,19 @@ class FileReaderPlugin(MaiBotPlugin):
         已解析文本放入后台重试队列，由 _retry_loop 定时重试入库，对用户透明。
         """
         name = str(fdata.get("name", "unnamed_file"))
+        # v1.4.0：先做 in-flight 去重登记（在下载/解析之前），重复触发的第二个任务在这里就退出
+        claimed: list[str] = []
+        primary_key = self._file_identity(session_id, conversation_id, fdata)
+        if not self._claim_inflight_file(primary_key, name):
+            return
+        claimed.append(primary_key)
+        # v1.4.0：分段耗时（A0）——取字节 / 解析 / 分块 / embedding / 词法索引
+        t_begin = time.perf_counter()
+        t_fetch = 0.0
+        t_parse = 0.0
+        timing: dict[str, float] = {}
+        parse_notes: list[str] = []
+        size_mb = 0.0
         # v1.3.8：先把会话键登记为 in-flight，清理循环会跳过它（见 _cleanup_once）；
         # 向量库推迟到 add 之前才创建（_get_vs），彻底消除「解析期间挂着空壳」的窗口。
         inflight_key = self._store.key(session_id, conversation_id)
@@ -1353,6 +1505,37 @@ class FileReaderPlugin(MaiBotPlugin):
                 )
                 return
 
+            # v1.4.0：取字节完成 → 记第一段耗时
+            t_fetch = time.perf_counter() - t_begin
+            size_mb = len(raw_bytes) / 1024 / 1024
+
+            # v1.4.0：拿到真实路径后做一次强身份校验。两条触发消息可能一条带 file_id、
+            # 一条是降级文本（身份键不同），但最终落到同一个 NapCat 缓存文件——
+            # 以规范化路径为键，能拦住"身份键不同、物理文件相同"的重复解析。
+            if napcat_path:
+                strong_key = f"{session_id}|{conversation_id}|path:{os.path.normcase(str(napcat_path))}"
+                if not self._claim_inflight_file(strong_key, name):
+                    return
+                claimed.append(strong_key)
+
+            # v1.4.0：会话内重发缓存（D5：会话内 + 不持久化）。字节已在内存，全量哈希仅 ms 级。
+            digest = hashlib.sha256(raw_bytes).hexdigest()
+            cache_key = (session_id, conversation_id, digest)
+            cached_name = self._hash_index.get(cache_key)
+            if cached_name:
+                vs_cached = self._store.get(session_id, conversation_id)
+                if vs_cached is not None and cached_name in vs_cached.files:
+                    vs_cached.touch_files([cached_name])
+                    self.ctx.logger.info(
+                        "文件 %s 与已入库的《%s》内容相同（sha256=%s…），直接复用，跳过解析与向量化",
+                        name, cached_name, digest[:12],
+                    )
+                    if not bool(self.config.reader.silent_success):
+                        await self._reply(stream_id, f"📄 已读取过《{cached_name}》，直接复用（未重复向量化）。")
+                    return
+                # 文件已被清理/清空：缓存条目作废，走完整流程
+                self._hash_index.pop(cache_key, None)
+
             # v1.3.1：文件名回填（真机 11-02 21:26 故障）。SnowLuma 适配器 v1.1.10 起把
             # file 段转成结构化 {name,size,file_id,busid}，而 NapCat 私聊 file 段只有
             # `file`（真实文件名）没有 `name` ⇒ 适配器落到占位符「附件」；再叠加
@@ -1376,13 +1559,19 @@ class FileReaderPlugin(MaiBotPlugin):
             raw_bytes = None
 
             # 解析
-            text = await asyncio.to_thread(read_any_file_to_text, tmp_path, name)
+            # v1.4.0：用 collect_parse_notes 收集解析器侧的提示（PDF 截断页数等）。
+            # ContextVar 会被 asyncio.to_thread 复制进工作线程，并发文件互不串台。
+            with collect_parse_notes(parse_notes):
+                text = await asyncio.to_thread(read_any_file_to_text, tmp_path, name)
+            t_parse = time.perf_counter() - t_begin - t_fetch
+            for note in parse_notes:
+                self.ctx.logger.warning("解析提示 %s：%s", name, note)
 
             # 向量化 + 入库
             # v1.3.8：向量库在这里才创建（解析可能耗时几十分钟，早创建只会留一个空壳给清理循环回收）
             vs = self._get_vs(session_id, conversation_id)
             try:
-                entry = await vs.add_file(name, text)
+                entry = await vs.add_file(name, text, timing=timing)
             except RuntimeError as e:
                 # embedding 为空/超时：放入后台重试队列（v1.0.11）
                 # 注意：ValueError（内容为空）不在此列，走下方通用分支
@@ -1390,6 +1579,7 @@ class FileReaderPlugin(MaiBotPlugin):
                 await self._enqueue_embed_retry(session_id, conversation_id, stream_id, name, str(tmp_path))
                 queued_for_retry = True
                 self.ctx.logger.warning("文件 %s 入库失败（embedding），已入后台重试队列: %s", name, e)
+                self._log_file_timing(name, size_mb, t_fetch, t_parse, timing, 0)
                 return
             self.ctx.logger.info(
                 "已入库文件 %s：%d 块（session=%s）",
@@ -1397,6 +1587,11 @@ class FileReaderPlugin(MaiBotPlugin):
                 len(entry.chunks),
                 session_id,
             )
+            # v1.4.0：记住这次内容指纹，同会话重发同一文件时直接复用（零解析、零 embedding）
+            self._hash_index[cache_key] = name
+            self._prune_hash_index()
+            # v1.4.0：分段耗时汇总（A0）
+            self._log_file_timing(name, size_mb, t_fetch, t_parse, timing, len(entry.chunks))
             # v1.3.8：入库成功后确认该向量库仍挂在 store 上（极端情况下被回收/替换则挂回）
             self._reassert_vs(session_id, conversation_id, vs)
             # v1.0.17：大文件后台预热概要（不阻塞回执；注入时 _ensure_summary 也会懒生成，这里只是让首次提问即命中）
@@ -1421,12 +1616,15 @@ class FileReaderPlugin(MaiBotPlugin):
             except (TypeError, ValueError):
                 ack_min = 0
             elapsed = time.time() - started_at
+            # v1.4.0：解析提示（如 PDF 截断页数）随回执一起说清楚，不能只躺在日志里
+            note_suffix = ("\n" + "；".join(parse_notes)) if parse_notes else ""
             if ack_min > 0 and stream_id and (entry.total_chars() >= ack_min or elapsed >= 30.0):
-                await self._reply(stream_id, f"已读取《{name}》，共 {len(entry.chunks)} 段")
+                await self._reply(stream_id, f"已读取《{name}》，共 {len(entry.chunks)} 段{note_suffix}")
             if not self.config.reader.silent_success:
                 await self._reply(
                     stream_id,
-                    f"📄 已解析「{name}」，切成 {len(entry.chunks)} 块并向量化。现在可以直接问我文件内容了。",
+                    f"📄 已解析「{name}」，切成 {len(entry.chunks)} 块并向量化。现在可以直接问我文件内容了。"
+                    f"{note_suffix}",
                 )
         except ValueError as e:
             await self._reply_error(stream_id, f"⚠️ {e}", reason="value_error", session_id=session_id, file_name=name)
@@ -1450,6 +1648,8 @@ class FileReaderPlugin(MaiBotPlugin):
                 self._inflight.pop(inflight_key, None)
             # v1.3.9：解析结束（成功/失败/入重试队列）都要撤掉「正在解析」状态
             self._parsing.pop(parse_token, None)
+            # v1.4.0：释放 in-flight 去重登记（只撤自己名下的键）
+            self._release_inflight_file(claimed)
             if tmp_path and not queued_for_retry:
                 try:
                     os.remove(tmp_path)
@@ -2621,6 +2821,9 @@ class FileReaderPlugin(MaiBotPlugin):
         removed = self._store.drop(session_id)
         self._memo_invalidate_session(session_id)  # v1.0.18 C3：清文件后失效注入缓存
         self._clear_notices(session_id)  # v1.3.0：连失败通知一起清掉
+        # v1.4.0：重发缓存跟着失效——否则重发同一文件会命中"已清理"的条目
+        for hk in [k for k in self._hash_index if k[0] == session_id]:
+            self._hash_index.pop(hk, None)
         text = f"🗑️ 已清除当前会话 {removed} 个文件块。" if removed else "当前会话没有已入库的文件。"
         await self._reply(str(kwargs.get("stream_id", "") or ""), text)
         return True, text, 2 if removed else 0
@@ -2639,6 +2842,7 @@ class FileReaderPlugin(MaiBotPlugin):
             f"- 向量块总数: {total_chunks}",
             f"- 嵌入模型: {embed_state}",
             f"- 分块: {self.config.reader.chunk_size}/{self.config.reader.chunk_overlap}",
+            f"- PDF 页数上限: {int(self.config.reader.pdf_max_pages or 0) or '不限'}",
             f"- 检索 Top-K: {self.config.reader.retrieve_top_k}",
             f"- 全文直注阈值: {self.config.reader.direct_inject_max_chars} 字" + ("（关闭）" if int(self.config.reader.direct_inject_max_chars) <= 0 else ""),
             f"- 有效时间: {self.config.reader.file_retention_time}min / 最大 {self.config.reader.file_max_rounds} 轮",
@@ -2942,8 +3146,14 @@ class FileReaderPlugin(MaiBotPlugin):
             # 长期运行的 bot 会话数无界增长
             if not vs.files:
                 self._store.drop(sid, cid)
+                # v1.4.0：会话被回收，重发缓存的键一并失效（否则下次重发会命中不存在的库）
+                for hk in [k for k in self._hash_index if k[0] == sid and k[1] == cid]:
+                    self._hash_index.pop(hk, None)
         if total_removed:
             self.ctx.logger.info("后台清理：移除 %d 个过期文件", total_removed)
+        # v1.4.0：重发缓存跟着库状态走——指向已删文件/已回收会话的键一律作废，
+        # 否则重发时会命中一个不存在的库（表现为"直接复用"但检索不到内容）。
+        self._prune_hash_index()
         # v1.1.0：概要失败冷却表随清理周期裁剪——旧版按文件名无界增长
         self._prune_summary_failed()
         return total_removed
