@@ -58,6 +58,7 @@ MaiBot 插件：解析 QQ 群/私聊上传的文件，分块后做「向量 + BM
 | `httpx` >=0.24 | URL 来源文件的流式下载 | URL 下载路径不可用 |
 | `pdfminer.six` >=20221105 | PDF 解析**兜底**引擎 | pypdfium2 也缺失时读不到 PDF |
 | `pypdfium2` >=4.30 | PDF 解析**首选**引擎（v1.4.0） | 自动降级 pdfminer：功能不缺，但慢约 3.6× 且解析期间抢 GIL（真机会出现 main loop 秒级卡顿） |
+| `mutagen` >=1.47 | 音频时长元数据（v1.5.0，超限预检用） | wav 仍可用标准库读时长；mp3/flac 等读不出时长会被 fail-closed 拒绝 |
 
 > ⚠️ **PDF 是必需能力**：PDF 没有标准库解法。v1.4.0 起按 `pypdfium2 → pdfminer` 两级降级，
 > 两个引擎都不可用时才报错（报错信息里会带上两边各自的失败原因）。
@@ -192,6 +193,35 @@ hook 层无论如何都拿不到文件本体。因此文件读取必须走 NapCa
 回溯链路：`[文件] xxx，大小: N` 文本 → 解析文件名 + 取 `message_id` → `get_msg` 拿原始事件 →
 file 段的 `file_id` → `get_file` 换本地路径 → 读盘解析。任一步失败会在日志里留下 `[napcat] ...` 行。
 
+## 音频文件（v1.5.0）
+
+上传音频文件（`mp3` `wav` `flac` `ogg` `m4a` `aac`）后，插件调用 **Omni 音频理解模型**「听一次」，把产出文本（语音→转写+要点；音乐→赏析）当作普通文档解析结果入库，之后的追问走现有混合检索，**免费、不重发音频**。参考 [music_appreciation_plugin](https://github.com/SengokuCola/music_appreciation_plugin) 的调用方式（OpenAI 兼容 `input_audio` + base64 + `stream=true`）。
+
+### 开通与配置（默认阿里云百炼）
+
+宿主 `llm.generate` 不支持音频输入，音频理解需要**独立的接口与密钥**：
+
+1. 开通[阿里云百炼](https://bailian.console.aliyun.com/)，在控制台创建 API-KEY（新用户各模态有免费额度）。
+2. WebUI → 插件管理 → 文件读取 → **音频理解** 节，把 Key 填进 `api_key`，保存。
+3. 直接发音频文件即可。默认模型 `qwen3-omni-flash`，也可换任何支持音频输入的 OpenAI 兼容接口（改 `base_url` + `model`）。
+
+**未配置 Key 时不报错**：音频文件会收到一条配置指引（经解析失败通知注入给模型），其他文件类型完全不受影响。
+
+### 限制与拒绝策略（不截断、不分段）
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| 时长 | ≤ 20 分钟（`max_duration_seconds=1200`） | qwen3-omni-flash 官方上限；超限**直接拒绝**并告知实际时长 |
+| 大小 | ≤ 7MB（`max_file_mb`） | Base64 编码后约 9.3MB；接口 10MB 硬上限不可配置放宽 |
+| 格式 | 六种开放格式直发 | 不引入 ffmpeg 转换依赖；QQ 语音 `silk`/`amr`/`wma` 明确拒绝并提示转 mp3/wav |
+| 时长读不出 | 拒绝 | fail-closed：无法证明在限内就不发（元数据损坏的 mp3 会命中） |
+
+时长/大小预检在**发送前**完成（mutagen 读元数据），超限不产生任何模型调用费用。同会话重发同一音频命中 sha256 缓存，直接复用不重听。
+
+### 成本
+
+Omni 按音频时长计费（百炼 qwen3-omni-flash 约 12.5 token/秒音频输入）。一首 4 分钟的歌 ≈ 3000 token 输入，单次成本很低；**追问零成本**（文本已入库）。上传即自动解析，若群内音频量大可关 `audio.enabled`。
+
 ## 命令
 
 | 命令 | 说明 |
@@ -223,10 +253,15 @@ file 段的 `file_id` → `get_file` 换本地路径 → 读盘解析。任一�
 
 - `xls`：旧版二进制需 `pandas` + `xlrd`；扩展名写错（其实是 xlsx）时按内容嗅探正常解析。
 
+**音频（v1.5.0，需配置 `[audio]`，见上方「音频文件」章节）**
+
+- `mp3` `wav` `flac` `ogg` `m4a` `aac`：Omni 模型听一次 → 文本入库 → 免费追问。
+
 **可识别但不支持**（会给出明确原因，不再输出乱码）
 
 - `doc` `ppt`：旧版二进制 Office → 提示另存为 docx/pptx。
 - `rtf`：读出来是控制字乱码 → 提示另存为 docx/txt。
+- `silk` `slk` `amr` `wma`（v1.5.0）：QQ 语音/旧音频格式 → 提示转 mp3/wav 后重发。
 
 **扩展名不可信时按内容判断**：插件会嗅探文件内容（PDF/OLE/RTF 魔数、ZIP 内的 `mimetype` 与 OOXML 目录结构）。
 改名的 docx（`.bin`）、转发后丢失扩展名的文件都能正确识别——只读中央目录，不解压正文。
@@ -237,11 +272,14 @@ file 段的 `file_id` → `get_file` 换本地路径 → 读盘解析。任一�
 # 结构自检
 python tools/check_plugin.py plugins/file-reader
 
-# 冒烟测试（FakeHost 完整生命周期，11 项：组件清单 / manifest 一致性 / SSRF 守卫 / 卸载收尾）
+# 冒烟测试（FakeHost 完整生命周期，12 项：组件清单 / manifest 一致性 / SSRF 守卫 / 卸载收尾 / 音频通道）
 python plugins/file-reader/tests/smoke_test.py
 
-# pytest（220 项：下载安全守卫 + 分块 / 词法 / 注入 / 格式解析 / v1.4.0 提速专项，门禁里的 pytest 步骤跑的就是它）
+# pytest（242 项：下载安全守卫 + 分块 / 词法 / 注入 / 格式解析 / v1.4.0 提速专项 / 音频 22 项（v1.5.0 通道 17 + v1.5.1 公告语义 5），门禁里的 pytest 步骤跑的就是它）
 python -m pytest -q plugins/file-reader/tests
+
+# 宿主级加载探针（官方 MaiBot 源码 PluginLoader，严格版本区间 + SDK 契约 + 组件数）
+python plugins/file-reader/tests/host_load_probe.py <MaiBot 源码根目录>
 
 # 功能自测（解析→分块→向量化→检索→清理 + hook 直调，75 项，用伪 embedding 不依赖真模型）
 python plugins/file-reader/test_file_reader.py
@@ -252,6 +290,10 @@ python plugins/file-reader/test_file_reader.py
 > 并确认退出码为 0。v1.1.0 就是因为只信了门禁的"全绿"，把已经变红的自测和 SSRF 问题
 > 一起带进了提交（当时门禁只跑 `check_plugin`，冒烟与 pytest 都是缺席状态）。
 > 现在 `tests/` 下已有冒烟与 pytest 用例，但**根目录那 71 项仍不在门禁范围内**。
+
+## 故障排查
+
+排查顺序：`/file_status`（库规模/嵌入模型/配置/检索诊断）→ 插件日志（`[自检]` / `[下载拒绝]` / `[napcat]` / `文件处理耗时` 开头）→ 下方常见问题对照。音频问题先看 `[自检] 音频通道` 与 `音频预检通过` 日志行。
 
 ## 常见问题
 
@@ -270,6 +312,10 @@ python plugins/file-reader/test_file_reader.py
 - **检索感觉不如以前**（v1.3.0 混合检索）：先试 `/file_bm25 off` 退回纯向量——立刻生效、不用重启、不用改配置。确认是配置问题再动 `reader.hybrid_retrieve_enabled`。想调松紧用 `retrieve_min_score`（绝对下限）/ `retrieve_min_ratio`（相对 Top1）。
 - **升级后 `/file_status` 里看不到新配置项**：宿主的 `config.toml` 只在文件**不存在**时生成，之后只会补新增字段、**已存在字段的值一律保留**。所以 `file_max_rounds` 若想用新的 20，需要手动改 `config.toml` 或删掉它重新生成（删前记得抄下 `admin_ids` 之类的现值）。
 - **文件聊着聊着就没了**：v1.3.0 起有效期按「最后一次被注入」滑计算，并新增绝对上限 `file_absolute_ttl`（默认 720 分钟）。若确实需要更久，调大这两项；`file_max_rounds` 也要一起看（默认 20 轮，只给实际被问到的文件计轮）。
+- **音频文件收到「需要音频理解模型…未配置 API Key」**（v1.5.0）：按「音频文件」章节开通百炼并把 Key 填进 `[audio].api_key`，配置后重发即可。
+- **音频被拒「时长/大小超过上限」**（v1.5.0）：这是刻意的 fail-closed 设计（不截断偷发）。剪辑或压码率后重发；确认模型支持更长音频时可调 `max_duration_seconds`（base64 10MB 硬上限不可放宽）。
+- **音频被拒「无法读取时长」**（v1.5.0）：元数据损坏或假扩展名。转成标准 mp3/wav 后重发；确认 `mutagen` 已安装（manifest 已声明）。
+- **音频理解报 HTTP 401/403**：Key 无效或额度用尽，去百炼控制台核对；报 HTTP 4xx 带 `model not exist` 时核对 `audio.model` 名称与 `base_url` 是否匹配。
 
 > **版本细节见 [CHANGELOG.md](CHANGELOG.md)** —— 本文件只写「怎么装、怎么配、怎么排障」。
 

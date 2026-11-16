@@ -70,7 +70,7 @@ EXPECTED_COMPONENTS = {
 
 #: manifest 里必须声明的运行时依赖。pdfminer.six 是 review 项：
 #: PDF 没有标准库降级路径，描述里又把它列为核心能力，漏声明会导致"装完开箱读不了 PDF"。
-REQUIRED_DEPENDENCIES = {"numpy", "httpx", "pdfminer.six"}
+REQUIRED_DEPENDENCIES = {"numpy", "httpx", "pdfminer.six", "mutagen"}
 
 #: 应当被安全策略拒绝的 URL——全部来自"群里谁都能发出来"的消息正文。
 INTERNAL_URLS = [
@@ -235,11 +235,14 @@ def check_manifest_matches_reality() -> list[str]:
     parser_src = (PLUGIN_DIR / "file_parser.py").read_text(encoding="utf-8")
     plugin_src = (PLUGIN_DIR / "plugin.py").read_text(encoding="utf-8")
     store_src = (PLUGIN_DIR / "vector_store.py").read_text(encoding="utf-8")
+    audio_src = (PLUGIN_DIR / "fr_audio.py").read_text(encoding="utf-8")
     if "pdfminer" not in parser_src:
         failures.append("file_parser.py 里找不到 pdfminer，manifest 却声明了它")
     for package, marker in (("numpy", "import numpy"), ("httpx", "import httpx")):
-        if marker not in plugin_src and marker not in store_src:
+        if marker not in plugin_src and marker not in store_src and marker not in audio_src:
             failures.append(f"manifest 声明了 {package}，但代码里找不到 {marker}")
+    if "import mutagen" not in audio_src:
+        failures.append("manifest 声明了 mutagen，但 fr_audio.py 里找不到 import mutagen")
 
     # 描述里承诺的能力必须有实现路径
     if "pdf" not in str(manifest.get("description", "")).lower():
@@ -641,6 +644,109 @@ def check_download_pins_validated_ip() -> list[str]:
     return failures
 
 
+def check_audio_channel() -> list[str]:
+    """音频通道（v1.5.0）：分派/预检/未配 Key 提示/文本入库，全程离线（桩掉 Omni）。
+
+    守住四类静默失效：
+    1. 音频没走异步分派（落进同步解析器报"不支持的文件类型"）；
+    2. 超限被静默截断偷发（决策是拒绝，绝不截断）；
+    3. 未配 Key 被当故障报错（用户尚未开通百炼，必须是配置指引）；
+    4. Omni 产出没进检索管线（追问免费的前提是文本入库）。
+    """
+    failures: list[str] = []
+    runner = Runner(config_overrides={"audio.api_key": "sk-test-dummy"})
+    plugin = runner.plugin
+    import fr_audio
+
+    def _wav(path: Path, seconds: float = 1.0, rate: int = 8000) -> Path:
+        import wave
+
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(b"\x00\x00" * int(seconds * rate))
+        return path
+
+    async def drive():
+        await plugin.on_load()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wav = _wav(Path(td) / "meeting.wav")
+
+                # ① 未配 Key：友好指引（AudioUnsupportedError → value_error 链路）
+                plugin.config.audio.api_key = ""
+                try:
+                    await plugin._parse_to_text(str(wav), "meeting.wav", [])
+                    failures.append("未配 Key 应拒绝并给配置指引")
+                except fr_audio.AudioUnsupportedError as e:
+                    if "api_key" not in str(e):
+                        failures.append(f"未配 Key 提示应指向 audio.api_key，实际：{e}")
+                plugin.config.audio.api_key = "sk-test-dummy"
+
+                # ② 超限拒绝（时长/大小），绝不截断
+                plugin.config.audio.max_duration_seconds = 0  # 先关时长限制单测大小
+                plugin.config.audio.max_file_mb = 0.001
+                try:
+                    await plugin._parse_to_text(str(wav), "meeting.wav", [])
+                    failures.append("超大小上限应拒绝")
+                except fr_audio.AudioUnsupportedError as e:
+                    if "超过上限" not in str(e):
+                        failures.append(f"超限提示应含「超过上限」，实际：{e}")
+                plugin.config.audio.max_file_mb = 7.0
+                plugin.config.audio.max_duration_seconds = 1200
+
+                # ③ silk 明确拒绝且原因准确
+                silk = Path(td) / "voice.silk"
+                silk.write_bytes(b"#!SILK_V3" + b"\x00" * 64)
+                try:
+                    await plugin._parse_to_text(str(silk), "voice.silk", [])
+                    failures.append("silk 应拒绝")
+                except (fr_audio.AudioUnsupportedError, ValueError) as e:
+                    if "silk" not in str(e).lower():
+                        failures.append(f"silk 拒绝原因应说明格式，实际：{e}")
+
+                # ④ 桩掉 Omni：产出文本含元信息头部，且能入库检索
+                async def fake_omni(audio_bytes, omni_format, **kwargs):
+                    if omni_format != "wav":
+                        failures.append(f"format 应为 wav，实际 {omni_format}")
+                    if not audio_bytes:
+                        failures.append("发给 Omni 的音频字节为空")
+                    return "内容类型：语音\n第一段：讨论了下周的发布计划。"
+
+                orig_omni = fr_audio._ask_omni
+                fr_audio._ask_omni = fake_omni
+                try:
+                    text = await plugin._parse_to_text(str(wav), "meeting.wav", [])
+                finally:
+                    fr_audio._ask_omni = orig_omni
+                if "【音频理解】" not in text or "meeting.wav" not in text:
+                    failures.append(f"产出文本缺元信息头部：{text[:80]!r}")
+                if "发布计划" not in text:
+                    failures.append("产出文本缺 Omni 正文")
+                vs = plugin._get_vs("smoke-audio", "smoke-audio")
+                entry = await vs.add_file("meeting.wav", text)
+                if not entry.chunks:
+                    failures.append("音频理解文本入库后无分块")
+                hits = vs.search_lexical("发布计划", 3)
+                if not hits:
+                    failures.append("音频文本入库后 BM25 检索不到关键词")
+
+                # ⑤ enabled=false：准确原因而非笼统不支持
+                plugin.config.audio.enabled = False
+                try:
+                    await plugin._parse_to_text(str(wav), "meeting.wav", [])
+                    failures.append("audio.enabled=false 应拒绝")
+                except fr_audio.AudioUnsupportedError as e:
+                    if "audio.enabled" not in str(e):
+                        failures.append(f"关闭提示应指向 audio.enabled，实际：{e}")
+        finally:
+            await plugin.on_unload()
+
+    asyncio.run(drive())
+    return failures
+
+
 # ═══════════════════════════════════════════════ 运行
 
 _runner_cache: dict[str, Runner] = {}
@@ -671,6 +777,7 @@ CHECKS = [
     ("风险配置在启动自检里告警", check_self_report_warns_on_risky_config),
     ("文件检测 hook 只读不改写消息", lambda: check_messages_are_not_rewritten(_shared_runner())),
     ("file_status 命令回执", lambda: check_status_command_replies(_shared_runner())),
+    ("音频通道：分派/预检/Key 指引/入库（v1.5.0）", check_audio_channel),
 ]
 
 

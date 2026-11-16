@@ -28,6 +28,10 @@ from typing import Callable, Iterator, Optional
 
 _LOGGER = logging.getLogger(__name__)
 
+# v1.5.0：音频扩展名/拒绝原因的单一来源在 fr_audio（异步解析，插件侧分派）。
+# fr_audio 只在函数内部反向 import get_extension，顶层无循环依赖。
+from fr_audio import AUDIO_EXTENSIONS, AUDIO_RECOGNIZED_UNSUPPORTED
+
 # ─── 可选依赖（try-import，缺失则降级） ──────────────────────────
 try:
     import chardet  # type: ignore
@@ -723,7 +727,14 @@ def detect_format(path: str) -> tuple[str, str]:
 # 识别但没有（或不值得）解析器的格式：给出**准确原因**而不是乱码
 RECOGNIZED_UNSUPPORTED: dict[str, str] = {
     "rtf": "RTF 暂不支持（读出来是控制字乱码），请另存为 .docx 或 .txt 后重发",
+    # v1.5.0：音频类拒绝原因与 fr_audio 保持单一来源（silk/amr/wma 明确拒绝）
+    **AUDIO_RECOGNIZED_UNSUPPORTED,
 }
+
+#: v1.5.0：音频扩展名由插件侧异步分派（fr_audio.read_audio_to_text，需要网络调用），
+#: 不进 SUPPORTED_EXTENSIONS 同步分派表。这里只作**标记**：同步入口遇到音频要给
+#: 准确原因而不是笼统的"不支持的文件类型"。
+AUDIO_ASYNC_EXTENSIONS: frozenset = frozenset(AUDIO_EXTENSIONS)
 
 
 # ─── 扩展名 → 处理函数（原映射表，函数体改为标准库优先） ────────────
@@ -956,6 +967,13 @@ def read_any_file_to_text(file_path: str, file_name: str = "") -> str:
     # ① 能识别但明确不支持的：给**准确原因**，不要让模型对着乱码猜
     if ext in RECOGNIZED_UNSUPPORTED:
         raise ValueError(f"{RECOGNIZED_UNSUPPORTED[ext]}（{name}）")
+    # v1.5.0：音频走插件侧异步解析（Omni 网络调用），同步入口给准确原因。
+    # 正常路径不会走到这里（plugin._parse_to_text 先拦截）；gz 内层音频、
+    # 直接调用本函数的旧路径靠这条兜底，不落入笼统的"不支持的文件类型"。
+    if ext in AUDIO_ASYNC_EXTENSIONS:
+        raise ValueError(
+            f"音频文件（.{ext}）需要经插件的音频理解通道解析，不能走同步文本解析入口（{name}）"
+        )
     if sniffed == "rtf":
         raise ValueError(f"{RECOGNIZED_UNSUPPORTED['rtf']}（{name}）")
     if sniffed == "ole" and ext not in ("doc", "xls", "ppt"):
@@ -992,5 +1010,6 @@ def describe_supported_types() -> str:
     return (
         "pdf/docx/odt/epub/eml, xlsx/ods/csv, pptx/odp, html/ipynb/gz, "
         "代码与文本(py/java/cpp/js/ts/go/rs/sh/md/json/yaml/txt/srt/xml...), "
-        "ini/env/toml/log/sql"
+        "ini/env/toml/log/sql, "
+        "音频(mp3/wav/flac/ogg/m4a/aac，需配置 [audio] 音频理解模型，v1.5.0)"
     )

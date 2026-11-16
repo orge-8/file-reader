@@ -16,3 +16,6 @@ venv/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# 测试运行日志
+/logs/

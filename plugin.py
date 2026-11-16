@@ -55,6 +55,7 @@ from maibot_sdk.types import (  # noqa: E402
 )
 
 from chunker import RecursiveCharacterChunker  # noqa: E402
+import fr_audio  # noqa: E402  （v1.5.0 音频理解；模块引用而非 from-import，便于测试替换）
 from file_parser import (  # noqa: E402
     collect_parse_notes,
     describe_supported_types,
@@ -338,7 +339,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.2.0", description="配置版本（v1.3.0：1.0.0→1.1.0 补混合检索/生命周期/回执键；v1.4.0：1.1.0→1.2.0 补 pdf_max_pages。不升版这些键不会出现在已部署实例的 config.toml 里）")
+    config_version: str = Field(default="1.3.0", description="配置版本（v1.3.0：1.0.0→1.1.0 补混合检索/生命周期/回执键；v1.4.0：1.1.0→1.2.0 补 pdf_max_pages；v1.5.0：1.2.0→1.3.0 补 [audio] 音频理解节。不升版这些键不会出现在已部署实例的 config.toml 里）")
 
 
 class ReaderConfig(PluginConfigBase):
@@ -464,12 +465,60 @@ class NapcatConfig(PluginConfigBase):
     )
 
 
+class AudioConfig(PluginConfigBase):
+    """音频理解配置（v1.5.0）。
+
+    路线：Omni 模型听一次 → 产出文本入库（分块 + 混合检索），追问免费不重发音频。
+    参考 SengokuCola/music_appreciation_plugin 的调用方式（OpenAI 兼容 input_audio
+    + base64 + stream=true）。宿主 llm.generate 不支持音频输入，必须独立配置接口。
+    """
+
+    __ui_label__ = "音频理解"
+    __ui_icon__ = "volume-2"
+    __ui_order__ = 3
+
+    enabled: bool = Field(
+        default=True,
+        description="是否启用音频文件理解（mp3/wav/flac/ogg/m4a/aac）。关闭后音频按不支持类型提示",
+    )
+    base_url: str = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        description="模型接口地址（支持音频输入的 OpenAI 兼容接口，默认阿里云百炼）",
+    )
+    api_key: str = Field(
+        default="",
+        description="模型 API 密钥（未配置时音频文件给友好提示而非报错；开通指引见 README「音频文件」）",
+        json_schema_extra={"x-widget": "password"},
+    )
+    model: str = Field(
+        default="qwen3-omni-flash",
+        description="音频理解模型名称（需支持音频输入；默认百炼 qwen3-omni-flash）",
+    )
+    max_duration_seconds: int = Field(
+        default=1200,
+        description="音频时长上限（秒），超过直接拒绝不截断。默认 1200=20 分钟（qwen3-omni-flash 官方上限）；换其他 Omni 模型可自行调整；0 = 不限制",
+    )
+    max_file_mb: float = Field(
+        default=7.0,
+        description="音频大小上限（MB），超过直接拒绝。默认 7MB（Base64 编码后约 9.3MB，低于接口 10MB 硬上限，该硬上限不可配置放宽）",
+    )
+    max_output_tokens: int = Field(
+        default=3000,
+        description="理解文本的最大输出 token 数（语音转写需要较长输出；模型截断时入库文本会不完整）",
+    )
+    request_timeout: float = Field(
+        default=180.0,
+        description="模型请求超时（秒）。长音频理解可达分钟级，勿设太小",
+    )
+
+
 class FileReaderConfig(PluginConfigBase):
     """插件配置。"""
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     reader: ReaderConfig = Field(default_factory=ReaderConfig)
     napcat: NapcatConfig = Field(default_factory=NapcatConfig)
+    audio: AudioConfig = Field(default_factory=AudioConfig)
 
 
 class FileReaderPlugin(MaiBotPlugin):
@@ -677,6 +726,20 @@ class FileReaderPlugin(MaiBotPlugin):
             self.ctx.logger.info("[自检] 解析器类型表: PASS")
         except Exception as e:  # noqa: BLE001
             self.ctx.logger.error("[自检] 解析器类型表: FAIL (%s)", e)
+
+        # v1.5.0：音频通道自检——扩展名表/嗅探/时长探测在进程内可用
+        try:
+            assert fr_audio.is_audio_file("song.MP3")
+            assert not fr_audio.is_audio_file("voice.silk")
+            assert fr_audio.sniff_audio_format(b"ID3\x04\x00\x00\x00\x00\x00\x00\x00\x00") == "mp3"
+            assert fr_audio.sniff_audio_format(b"RIFF\x00\x00\x00\x00WAVEfmt ") == "wav"
+            self.ctx.logger.info("[自检] 音频通道: PASS")
+        except Exception as e:  # noqa: BLE001
+            self.ctx.logger.error("[自检] 音频通道: FAIL (%s)", e)
+        if bool(self.config.audio.enabled) and not str(self.config.audio.api_key or "").strip():
+            self.ctx.logger.warning(
+                "[自检] 音频理解已启用但未配置 audio.api_key——音频文件将收到配置指引而非解析结果"
+            )
 
         # v1.2.0：下载安全策略自检——把风险配置在启动时喊出来，而不是等出事
         try:
@@ -1559,10 +1622,8 @@ class FileReaderPlugin(MaiBotPlugin):
             raw_bytes = None
 
             # 解析
-            # v1.4.0：用 collect_parse_notes 收集解析器侧的提示（PDF 截断页数等）。
-            # ContextVar 会被 asyncio.to_thread 复制进工作线程，并发文件互不串台。
-            with collect_parse_notes(parse_notes):
-                text = await asyncio.to_thread(read_any_file_to_text, tmp_path, name)
+            # v1.5.0：统一分派——音频走异步 Omni 理解，其余走同步解析器（to_thread）。
+            text = await self._parse_to_text(str(tmp_path), name, parse_notes)
             t_parse = time.perf_counter() - t_begin - t_fetch
             for note in parse_notes:
                 self.ctx.logger.warning("解析提示 %s：%s", name, note)
@@ -1571,7 +1632,11 @@ class FileReaderPlugin(MaiBotPlugin):
             # v1.3.8：向量库在这里才创建（解析可能耗时几十分钟，早创建只会留一个空壳给清理循环回收）
             vs = self._get_vs(session_id, conversation_id)
             try:
-                entry = await vs.add_file(name, text, timing=timing)
+                # v1.5.1：音频理解产出的文本带【音频理解】头部（fr_audio.read_audio_to_text
+                # 契约），据此打标——Planner 公告要告诉模型「这文件已经被听过」。
+                entry = await vs.add_file(
+                    name, text, timing=timing, is_audio=text.startswith("【音频理解】")
+                )
             except RuntimeError as e:
                 # embedding 为空/超时：放入后台重试队列（v1.0.11）
                 # 注意：ValueError（内容为空）不在此列，走下方通用分支
@@ -1655,6 +1720,56 @@ class FileReaderPlugin(MaiBotPlugin):
                     os.remove(tmp_path)
                 except OSError:
                     pass
+
+    async def _parse_to_text(self, tmp_path: str, name: str, parse_notes: list[str]) -> str:
+        """解析分派（v1.5.0）：音频 → fr_audio 异步 Omni 理解；其余 → 同步解析器。
+
+        音频判定用 fr_audio.is_audio_file（扩展名）+ 无扩展名时内容嗅探兜底。
+        关闭 audio.enabled 时给准确原因（AudioUnsupportedError 继承 ValueError，
+        走既有 value_error 失败通知链路，模型能向用户转述）。
+        """
+        ext = get_extension(name)
+        is_audio = ext in fr_audio.AUDIO_EXTENSIONS
+        if not is_audio and not ext:
+            # 无扩展名（适配器降级占位名且 napcat 回填失败）：嗅探文件头兜底
+            sniffed = await asyncio.to_thread(self._sniff_audio_head, tmp_path)
+            is_audio = bool(sniffed)
+            if is_audio:
+                name = f"{name}.{sniffed}"
+        if is_audio:
+            if not bool(self.config.audio.enabled):
+                raise fr_audio.AudioUnsupportedError(
+                    f"音频文件「{name}」的理解功能已关闭（audio.enabled=false），"
+                    "如需读取请联系管理员开启"
+                )
+            acfg = self.config.audio
+            return await fr_audio.read_audio_to_text(
+                tmp_path,
+                name,
+                base_url=str(acfg.base_url or ""),
+                api_key=str(acfg.api_key or ""),
+                model=str(acfg.model or ""),
+                max_duration_seconds=float(acfg.max_duration_seconds or 0),
+                max_file_mb=float(acfg.max_file_mb or 0),
+                max_output_tokens=int(acfg.max_output_tokens or 3000),
+                request_timeout=float(acfg.request_timeout or 180.0),
+                log=self.ctx.logger.info,
+            )
+        # v1.4.0：用 collect_parse_notes 收集解析器侧的提示（PDF 截断页数等）。
+        # ContextVar 会被 asyncio.to_thread 复制进工作线程，并发文件互不串台。
+        with collect_parse_notes(parse_notes):
+            return await asyncio.to_thread(read_any_file_to_text, tmp_path, name)
+
+    @staticmethod
+    def _sniff_audio_head(tmp_path: str) -> str:
+        """读文件头 16 字节做音频嗅探（同步，调用处包 to_thread）。"""
+        try:
+            with open(tmp_path, "rb") as f:
+                head = f.read(16)
+        except OSError:
+            return ""
+        fmt = fr_audio.sniff_audio_format(head)
+        return fmt if fmt in fr_audio.AUDIO_EXTENSIONS else ""
 
     def _napcat_ssl_context(self) -> ssl.SSLContext:
         """NapCat urllib SSL 上下文缓存（v1.1.0）：create_default_context 是 ms 级 CPU 调用，
@@ -2530,20 +2645,40 @@ class FileReaderPlugin(MaiBotPlugin):
 
             parts: list[str] = []
             if has_files:
-                names = [str(n) for n in vs.files.keys()]
-                total = sum(int(e.total_chars()) for e in vs.files.values())
-                listed = "、".join(f"《{n}》" for n in names[:3])
-                if len(names) > 3:
-                    listed += f" 等 {len(names)} 个"
                 supply = (
                     "全文会在生成回复时自动附上"
                     if self._full_text_within_limit(vs) is not None
                     else "相关片段会在生成回复时自动附上"
                 )
-                parts.append(
-                    f"本会话已读入文件：{listed}（合计约 {total} 字）。{supply}，"
-                    "规划阶段不需要再调用文件读取工具；需要精确定位某段时用 search_file。"
-                )
+                # v1.5.1：音频与文档分开公告。真机 11-16 22:01：公告只说「已读入
+                # mp3（817 字）」，planner 按「mp3 不可能有文本」的常识自我否定
+                # （reasoning 原文「我没有耳朵，听不了音频」「817 字可能是歌词/元数据？」），
+                # 首轮回复只围绕文件名，靠自发调 search_file 才拿到赏析正文。
+                # 音频必须明说「已经被听过、文本就是听的结果」，模型才敢据此作答。
+                audio_entries = [e for e in vs.files.values() if getattr(e, "is_audio", False)]
+                doc_entries = [e for e in vs.files.values() if not getattr(e, "is_audio", False)]
+                if doc_entries:
+                    names = [str(e.file_name) for e in doc_entries]
+                    total = sum(int(e.total_chars()) for e in doc_entries)
+                    listed = "、".join(f"《{n}》" for n in names[:3])
+                    if len(names) > 3:
+                        listed += f" 等 {len(names)} 个"
+                    parts.append(
+                        f"本会话已读入文件：{listed}（合计约 {total} 字）。{supply}，"
+                        "规划阶段不需要再调用文件读取工具；需要精确定位某段时用 search_file。"
+                    )
+                if audio_entries:
+                    names = [str(e.file_name) for e in audio_entries]
+                    total = sum(int(e.total_chars()) for e in audio_entries)
+                    listed = "、".join(f"《{n}》" for n in names[:3])
+                    if len(names) > 3:
+                        listed += f" 等 {len(names)} 个"
+                    parts.append(
+                        f"本会话的音频文件：{listed} 已由音频理解模型完整听过，"
+                        f"并转成理解文本入库（合计约 {total} 字，转写或赏析）。{supply}。"
+                        "你可以据此谈论音频内容、给出听感与评价，不要声称自己听不了音频；"
+                        "规划阶段不需要再调用文件读取工具，需要精确定位某段时用 search_file。"
+                    )
             if parsing:
                 parts.append(self._parsing_notice(parsing))
             return self._inject_items(items, kwargs, "".join(parts), kind="planner-notice")
@@ -3262,6 +3397,25 @@ class FileReaderPlugin(MaiBotPlugin):
                         item for item in self._embed_retry_queue if now < item["next_ts"]
                     ]
                     for item in due:
+                        # v1.5.0：音频确定性拒绝（未配 Key/超限/格式不支持）立即放弃，
+                        # 不空转 30 次重试——这些原因重试不会自愈，还会反复撞 Omni 计费
+                        if get_extension(item["name"]) in fr_audio.AUDIO_EXTENSIONS and not (
+                            bool(self.config.audio.enabled) and str(self.config.audio.api_key or "").strip()
+                        ):
+                            self.ctx.logger.warning(
+                                "音频 %s 在重试队列中但音频理解不可用（enabled=%s / key=%s），放弃重试",
+                                item["name"],
+                                bool(self.config.audio.enabled),
+                                "已配置" if str(self.config.audio.api_key or "").strip() else "空",
+                            )
+                            self._discard_retry_tmp(item)
+                            await self._reply_error(
+                                item["stream_id"],
+                                f"⚠️ 音频文件「{item['name']}」无法自动重试入库：音频理解未启用或未配置 API Key。"
+                                "配置好后请重新发送文件。",
+                                reason="audio_unavailable",
+                            )
+                            continue
                         item["attempts"] += 1
                         # max_retries 重试时实时读配置（真机 15:20 日志教训：入队时写死会
                         # 在长拥塞里耗尽；热改配置立即生效，正在排队的文件也能受益）
@@ -3280,7 +3434,9 @@ class FileReaderPlugin(MaiBotPlugin):
                             )
                             continue
                         try:
-                            text = await asyncio.to_thread(read_any_file_to_text, tmp_path, item["name"])
+                            # v1.5.0：统一分派（音频重试也走 Omni）。能进重试队列的音频
+                            # 首次解析必然预检通过；确定性拒绝在下方 except 单独处理
+                            text = await self._parse_to_text(tmp_path, item["name"], [])
                             vs = self._store.get_or_create(
                                 item["session_id"],
                                 item["conversation_id"],
@@ -3291,7 +3447,18 @@ class FileReaderPlugin(MaiBotPlugin):
                                 chunk_merge=bool(self.config.reader.chunk_merge_enabled),
                                 retrieve_use_matrix=bool(self.config.reader.retrieve_use_matrix),
                             )
-                            entry = await vs.add_file(item["name"], text)
+                            entry = await vs.add_file(
+                                item["name"], text, is_audio=text.startswith("【音频理解】")
+                            )
+                        except fr_audio.AudioUnsupportedError as e:
+                            # v1.5.0：音频确定性拒绝（超限/时长读不出/格式异常）不会自愈，
+                            # 立即放弃并把准确原因回传，不空转重试
+                            self.ctx.logger.warning("音频 %s 重试中被确定性拒绝，放弃: %s", item["name"], e)
+                            self._discard_retry_tmp(item)
+                            await self._reply_error(
+                                item["stream_id"], f"⚠️ {e}", reason="audio_rejected",
+                            )
+                            continue
                         except Exception as e:  # noqa: BLE001
                             if item["attempts"] >= max_retries:
                                 self.ctx.logger.error(
@@ -3350,7 +3517,7 @@ class FileReaderPlugin(MaiBotPlugin):
 
 #: 默认收起的 section：标题自带「可选 / 默认关闭」的功能节。收起后标题
 #: 与说明仍可见，点开即可配置，避免整页卡片全开淹没常用配置。
-_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset({"napcat"})
+_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset({"napcat", "audio"})
 
 #: 手工指定的 section 标题（键 = section 名）；仅在 SDK 输出标题等于
 #: 节名（未配置 __ui_label__）时采用。
@@ -3361,6 +3528,13 @@ _WEBUI_LABEL_OVERRIDES: dict = {
     "http_url": "HTTP 服务地址",
     "access_token": "HTTP Token",
     "cache_dir": "文件缓存目录",
+    "base_url": "模型接口地址",
+    "api_key": "模型 API 密钥",
+    "model": "音频理解模型",
+    "max_duration_seconds": "时长上限（秒）",
+    "max_file_mb": "大小上限（MB）",
+    "max_output_tokens": "输出长度上限",
+    "request_timeout": "请求超时（秒）",
 }
 
 

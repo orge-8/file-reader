@@ -45,6 +45,12 @@ class FileEntry:
     chunk_overlap: int = 0
     # 全文拼接缓存（v1.1.0）：直注/概要取样每次都要 join(chunks)，缓存一次免重复拼接
     _full_text_cache: str = field(default="", repr=False)
+    # v1.5.1：文本来自音频理解模型（Omni「听过」后产出）而非文档解析。
+    # Planner 公告据此明确告知「已听过并转成理解文本」——真机 11-16 22:01 日志：
+    # 公告只说「已读入文件（817 字）」，planner 不知道 mp3 已被听过，
+    # 反复纠结「我没有耳朵 / 817 字可能是歌词元数据」，首轮回复不敢基于内容作答，
+    # 靠自发调 search_file 拿到正文后才答到点上（多耗一轮工具 + 一轮 planner）。
+    is_audio: bool = False
 
     def __post_init__(self) -> None:
         if not self.last_used:
@@ -139,11 +145,19 @@ class VectorStore:
     def total_chunks(self) -> int:
         return sum(len(f.chunks) for f in self._files.values())
 
-    async def add_file(self, file_name: str, content: str, timing: Optional[dict] = None) -> FileEntry:
+    async def add_file(
+        self,
+        file_name: str,
+        content: str,
+        timing: Optional[dict] = None,
+        *,
+        is_audio: bool = False,
+    ) -> FileEntry:
         """解析文本 → 分块 → 向量化 → 存入。
 
         v1.4.0：`timing` 给出参字典，回填 chunk / embed / index / total 四段秒数，
         供调用方打一条可归因的耗时日志（真机排障只有「已入库」一个点，无法定位慢在哪儿）。
+        v1.5.1：`is_audio` 标记文本来自音频理解模型，Planner 公告据此说明「已听过」。
         """
         from chunker import RecursiveCharacterChunker  # noqa: F401  (确认可用)
 
@@ -175,6 +189,7 @@ class VectorStore:
             vectors=vectors,
             source_chars=len(content),
             chunk_overlap=int(getattr(self._chunker, "chunk_overlap", 0) or 0),
+            is_audio=bool(is_audio),
         )
         self._files[file_name] = entry
         self._mat_cache = None  # 置脏：下次检索重建矩阵

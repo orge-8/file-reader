@@ -8,6 +8,8 @@ README 只保留「原理 / 安装 / 配置 / 命令 / 安全策略 / 常见问�
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
+| v1.5.1 | 2026-11-16 | Planner 公告补音频语义：明示「已由音频理解模型听过」，消除 planner「mp3 哪来文本/我没耳朵」误判（真机 22:01 日志驱动） |
+| v1.5.0 | 2026-11-16 | 音频文件理解：Omni 听一次→文本入库→免费追问（mp3/wav/flac/ogg/m4a/aac；超限拒绝不截断；[audio] 独立配置） |
 | v1.4.0 | 2026-11-04 | 读取提速专项：PDF 换 pypdfium2（3.6×）+ 分块 1024/128 + 双触发去重 + 重发缓存 + 分段耗时日志 |
 | v1.3.9 | 2026-11-03 | Planner 公告补「正在解析」状态（长解析期间不再被当成读不到） |
 | v1.3.8 | 2026-11-03 | 长解析期间空会话壳被清理回收（文件「入库成功」却检索不到）+ 同一文件被处理两遍 |
@@ -285,6 +287,85 @@ README 只保留「原理 / 安装 / 配置 / 命令 / 安全策略 / 常见问�
 - **下载连接钉定，关闭 DNS 重绑定窗口（review 第 2 条）**：旧版 `validate_download_target` 校验时解析一次 DNS，httpx 连接时**再解析一次**——两次解析之间域名可以换 IP；`download_url_policy = public`（README 明写的逃生口）下，攻击者自持 DNS 的域名可以先解析到公网 IP 过检、连接时再解析回内网 IP。现在校验通过的解析结果经 `collect_ips` 带出，实际请求直接连这些已校验 IP（`build_pinned_request`：Host 头/SNI/证书校验仍按原主机名，https 用 httpcore 的 `sni_hostname` 扩展，证书校验不降级），重定向每一跳独立「校验 → 钉定」，多个已校验 IP 只有连接类错误才依次尝试、绝不重新解析。`policy = off` 不解析也就无从钉定，维持旧行为。顺带把阻塞的 `getaddrinfo` 挪进 `asyncio.to_thread`，不再卡事件循环。
 - **napcat.verify_ssl 默认 false → true（review 第 3 条）**：旧默认在 https 地址下会连主机名校验一起关掉（CERT_NONE）。新实例默认开启校验；**存量实例的 config.toml 不会跟随新默认值**，因此启动自检新增一条风险告警：`napcat.verify_ssl=false` 且 `napcat.http_url` 为 https 地址时打 WARNING（与 download 风险配置告警同款机制），提示改用系统信任的证书而不是关校验。
 - 测试：pytest 门禁用例 72 项（新增连接钉定 6 项：`build_pinned_request` 单元契约、collect_ips 拒绝路径不带出 IP、端到端「出站请求打到已校验 IP」、重定向逐跳钉定）；smoke 新增「下载连接钉定」「search_file 跨会话兜底护栏」两项防回归，并把 verify_ssl 告警纳入风险配置告警检查；根套件新增 2a6b（多会话歧义拒绝兜底、拒绝不泄露内容、显式 session_id 各自命中）与 3h/4h/4i。两项修复均做了**反向验证**：还原旧实现后新用例确实 FAIL（钉定还原 → 域名参与连接；旧兜底还原 → LLM 幻觉 session_id 时拿到其他会话内容）。
+
+## v1.5.0（2026-11-16）音频文件理解（Omni 听一次 → 文本入库 → 免费追问）
+
+> 需求与设计决策经三轮 grill 追问定案；参考 [SengokuCola/music_appreciation_plugin](https://github.com/SengokuCola/music_appreciation_plugin) 的音频调用方式（OpenAI 兼容 `input_audio` + base64 data URI + `stream=true` SSE），但定位为 file-reader 的一种**文件解析器**而非一次性赏析 Tool。
+
+### 已定决策（用户确认）
+
+| 决策点 | 结论 |
+|---|---|
+| 路线 | Omni 直接理解（非 ASR 转写管线）；仅上传音频文件，不含 QQ 语音消息 |
+| 追问架构 | 听一次 → 产出文本入库，走现有分块 + 向量/BM25 混合检索；追问免费不重发音频 |
+| 触发 | 上传自动解析（与现有文件流程一致，`audio.enabled` 可关） |
+| 产出 | 按内容自适应：语音→完整转写+要点；音乐→赏析；输出纪律写代码层（不编造/歌词最多引一两句） |
+| 长音频 | **超限直接拒绝，不截断不分段**；时长为主（默认 ≤1200s=20min，qwen3-omni-flash 官方上限）+ 7MB 大小上限（base64 后 ≈9.3MB < 接口 10MB 硬上限，硬上限不可配置放宽） |
+| 格式 | mp3/wav/flac/ogg/m4a/aac 直发，无 ffmpeg 依赖；silk/slk/amr/wma 明确拒绝并提示转格式 |
+| 未配 Key | 友好配置指引（经解析失败通知注入模型），不当故障报错 |
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `fr_audio.py`（新增） | 异步音频理解模块：扩展名/文件头嗅探、mutagen 时长预检（fail-closed：时长读不出也拒绝）、`_ask_omni` 流式调用与 SSE 拼接（心跳/坏 JSON 行跳过、HTTP 错误带 body 前 500 字符）、产出文本带元信息头部。无 self.ctx（铁律 8），日志经回调注入 |
+| `file_parser.py` | `RECOGNIZED_UNSUPPORTED` 并入 silk/slk/amr/wma（单一来源 fr_audio）；同步入口对音频扩展名给准确原因（正常路径由插件先拦截，gz 内层音频/旧调用路径兜底）；`describe_supported_types` 补音频 |
+| `plugin.py` | 新增 `_parse_to_text` 统一分派（音频→fr_audio 异步；其余→原同步解析器 to_thread），`_handle_file` 与 embedding 重试循环两处调用点收敛；无扩展名时文件头嗅探兜底；重试队列对音频确定性拒绝（未配 Key/超限）立即放弃不空转；`[audio]` 配置节（8 字段，api_key password 控件）；config_version 1.2.0→1.3.0；启动自检补音频通道 + 未配 Key 告警；WebUI 收起 audio 节 + 中文 label |
+| `_manifest.json` | version 1.5.0；依赖增 `mutagen>=1.47`；host max 1.3.99→**1.4.5**、sdk max 2.21.99→**2.23.0**（实测后 bump，见下） |
+| `tests/test_audio.py`（新增） | 17 项：判定/嗅探/预检 fail-closed（超大小/超时长/时长读不出/空文件/base64 硬上限）/Key 指引/Omni 请求形态（payload 契约）/SSE 解析/HTTP 错误/产出头部 |
+| `tests/smoke_test.py` | 新增「音频通道」检查（分派/预检/Key 指引/silk 拒绝/文本入库检索/enabled=false，全程桩 Omni 离线）；依赖一致性检查纳入 mutagen 与 fr_audio |
+| `tests/host_load_probe.py`（新增） | 官方宿主源码 PluginLoader 加载探针（严格区间 force=False + SDK 契约 + 组件数 4H/3C/1T）；Windows symlink 假成功检测 + junction 兜底 |
+| `README.md` | 「音频文件」章节（开通指引/限制/成本）+ 故障排查章节 + 音频 FAQ |
+
+### 官方最新版本实测（2026-11-16，交付准入依据）
+
+| 项目 | 结果 |
+|---|---|
+| 官方版本核对 | MaiBot **v1.4.5**（GitHub latest release，2026-11-14）/ maibot-plugin-sdk **2.23.0**（PyPI，2026-11-14） |
+| v1.4.5 宿主源码 PluginLoader 加载探针 | Host 1.4.5 + SDK 2.23.0，manifest 严格区间 `host 1.2.0~1.4.5 / sdk 2.5.1~2.23.0`、`force_plugin_compatibility=False`：**加载成功 1 个插件、8 个组件（4 HOOK_HANDLER + 3 COMMAND + 1 TOOL）、失败 0、契约 OK** |
+| SDK 2.23.0 隔离环境全量测试 | 独立 venv（Python 3.13 + SDK 2.23.0 + pytest 9.2.0）：**237 passed / 0 failed**；冒烟 **12/12 PASS**；根目录功能自测 `test_file_reader.py` **全部通过** |
+| devkit 门禁回归 | `gate.sh`：**PASS 3 / SKIP 0 / FAIL 0**（check_plugin PASS 40 / WARN 5 / FAIL 0；WARN 均为既有 ASCII 组件名配对提示与 README 章节建议，后者本次已补） |
+
+注：1.4.5 宿主对超区间 Host 版本走「兼容模式放行 + WARN」、SDK 超区间仅 WARN（`manifest_validator._validate_runtime_compatibility` 源码核实）；本次仍按纪律实测后才 bump，未依赖该放行路径。
+
+### 真机验证（2026-11-16 22:00~22:03，三份请求日志，v1.5.1 补记）
+
+真机配置 `[audio]` Key 并部署后，端到端闭环验证通过（测试素材为一首 3 分 1 秒的中文流行歌曲母带 mp3）：
+
+| 环节 | 证据 |
+|---|---|
+| 预检 | 7,259,576 字节 = **6.92MiB < 7.0 上限**（适配器显示 7.2MB 为十进制，非超限）；时长 3 分 1 秒；base64 ≈9.2MB < 10MB 硬上限 |
+| Omni 产出 | 817 字赏析入库：「内容类型：音乐」+ 风格/编曲/人声/结构/歌词意象五段；歌词仅引一两句——输出纪律全部生效 |
+| search_file | 小文件直注路径返回【音频理解】全文（planner 调用成功） |
+| replyer 注入 | `file-reader:direct:` 条目注入 817 字全文 |
+| 最终回复 | 给出具体听感（钢琴开头的安静氛围、副歌真声的情绪推进、结尾反复短句的感染力）——逐条对应赏析内容，无编造歌手身份 |
+
+暴露的体验缺口（v1.5.1 修复）：planner 公告只说「已读入文件（817 字）」，planner（LongCat-2.5）不知道 mp3 已被听过，reasoning 纠结「我没有耳朵/817 字可能是歌词元数据」，首轮回复只围绕文件名，靠自发调 search_file 才答到点上（多耗一次工具 + 一轮 planner）。
+
+## v1.5.1（2026-11-16）Planner 公告补音频语义
+
+> 真机证据：见上方 v1.5.0「真机验证」节。行为变更仅公告文案与入库标记，解析/检索/注入链路零改动。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `vector_store.py` | `FileEntry` 新增 `is_audio: bool = False`；`add_file` 增 keyword-only 参数 `is_audio`（缺省 False，文档路径零影响） |
+| `plugin.py` | 两处 `add_file` 调用点按 `text.startswith("【音频理解】")` 打标（fr_audio 产出头部契约）；`announce_file_context` 把音频与文档分开公告——音频段明示「已由音频理解模型完整听过，并转成理解文本入库（转写或赏析）」「你可以据此谈论音频内容、给出听感与评价，不要声称自己听不了音频」；文档段文案保持 v1.3.2 原口径不变 |
+| `tests/test_audio.py` | 新增 5 项（17→22）：纯音频公告语义 / 文档公告口径不变 / 混合会话分段公告 / `_handle_file` 端到端打标 / `add_file` 缺省非音频 |
+| `_manifest.json` | version 1.5.0→1.5.1（host/sdk 区间不变，官方最新仍为 1.4.5 / 2.23.0，本次复测通过） |
+
+### 验证（2026-11-16，SDK 2.23.0 隔离环境 + 官方 v1.4.5 宿主源码）
+
+| 项目 | 结果 |
+|---|---|
+| 官方版本核对 | MaiBot **v1.4.5** / SDK **2.23.0**（GitHub/PyPI 复核，与 v1.5.0 交付时一致，无新版本） |
+| v1.4.5 PluginLoader 加载探针 | **PASS**：8 组件（4H/3C/1T）、manifest 严格区间、SDK 契约 OK |
+| SDK 2.23.0 隔离全量 pytest | **242 passed / 0 failed**（237+5） |
+| 根目录自测 `test_file_reader.py` | 全部通过（含 Planner 公告既有契约用例） |
+| devkit `gate.sh` | **PASS 3 / SKIP 0 / FAIL 0**（check 41 PASS / 4 WARN 均既有；冒烟 12/12） |
+
+注：本次修复效果（planner 不再自称听不了）需真机重发音频验证；离线测试已覆盖公告文案与打标链路。
 
 ## v1.4.0（2026-11-04）读取提速专项（方案 A0–A5 全量落地）
 
