@@ -56,6 +56,7 @@ from maibot_sdk.types import (  # noqa: E402
 
 from chunker import RecursiveCharacterChunker  # noqa: E402
 import fr_audio  # noqa: E402  （v1.5.0 音频理解；模块引用而非 from-import，便于测试替换）
+import fr_video  # noqa: E402  （v1.8.0 视频理解；同上）
 from file_parser import (  # noqa: E402
     collect_parse_notes,
     describe_supported_types,
@@ -349,7 +350,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.5.0", description="配置版本（v1.7.0：1.4.0→1.5.0 补 [snowluma] 适配器取文件节。不升版这些键不会出现在已部署实例的 config.toml 里）")
+    config_version: str = Field(default="1.6.0", description="配置版本（v1.8.0：1.5.0→1.6.0 补 [video] 视频理解节。不升版这些键不会出现在已部署实例的 config.toml 里）")
 
 
 class ReaderConfig(PluginConfigBase):
@@ -562,6 +563,62 @@ class AudioConfig(PluginConfigBase):
     )
 
 
+class VideoConfig(PluginConfigBase):
+    """视频理解配置（v1.8.0）。
+
+    路线（2026-11-18 方案评审定案）：豆包 seed-2.1-lite 全模态，Files API 上传
+    → 一次调用音画双收 → 带【视频理解】头部文本回流 add_file，追问免费。
+    超限只登记不解析（确定性拒绝，通知注入模型不发群）；日预算防刷屏烧钱；
+    缓存仅会话内（复用 reader 的 SHA-256 重发去重），不做跨会话共享。
+    """
+
+    __ui_label__ = "视频理解"
+    __ui_icon__ = "video"
+    __ui_order__ = 5
+
+    enabled: bool = Field(
+        default=True,
+        description="是否启用视频文件理解（mp4/mov/m4v/avi/mkv/webm）。关闭后视频按不支持类型提示",
+    )
+    base_url: str = Field(
+        default="https://ark.cn-beijing.volces.com/api/v3",
+        description="模型接口地址（火山方舟 OpenAI 兼容接口；Files API 上传与理解调用共用）",
+    )
+    api_key: str = Field(
+        default="",
+        description="火山方舟 API 密钥（未配置时视频文件给友好提示而非报错；开通指引见 README「视频文件」）",
+        json_schema_extra={"x-widget": "password"},
+    )
+    model: str = Field(
+        default="doubao-seed-2-1-lite-260915",
+        description="视频理解模型（需支持视频内嵌音轨；默认豆包 seed-2.1-lite，pro/turbo 不含音轨不要换）",
+    )
+    max_file_mb: float = Field(
+        default=20.0,
+        description="视频大小上限（MB），超过只登记不解析并提示剪辑后重发。默认 20 对齐 reader.max_file_size；Files API 硬上限 512MB 不可配置放宽",
+    )
+    max_duration_seconds: int = Field(
+        default=600,
+        description="视频时长上限（秒），超过直接拒绝不截断。默认 600=10 分钟（面向群内短视频）；0 = 不限制",
+    )
+    fps: float = Field(
+        default=1.0,
+        description="上传时指定的抽帧帧率（官方默认 1，可调 0.2~5）。越高画面细节越多、token 越贵；短视频保持 1 即可",
+    )
+    daily_budget: int = Field(
+        default=20,
+        description="每日自动理解视频数上限（防刷屏烧钱，单次约 ¥0.1）。超限只登记不解析，次日恢复；0 = 不限制",
+    )
+    max_output_tokens: int = Field(
+        default=4000,
+        description="理解文本的最大输出 token 数（画面描述+音轨转写需要较长输出）",
+    )
+    request_timeout: float = Field(
+        default=300.0,
+        description="上传与理解请求超时（秒）。视频理解可达分钟级，勿设太小",
+    )
+
+
 class FileReaderConfig(PluginConfigBase):
     """插件配置。"""
 
@@ -570,6 +627,7 @@ class FileReaderConfig(PluginConfigBase):
     napcat: NapcatConfig = Field(default_factory=NapcatConfig)
     snowluma: SnowlumaConfig = Field(default_factory=SnowlumaConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
+    video: VideoConfig = Field(default_factory=VideoConfig)
 
 
 class FileReaderPlugin(MaiBotPlugin):
@@ -667,6 +725,10 @@ class FileReaderPlugin(MaiBotPlugin):
         # 为什么需要在代码层再留一道：已部署实例的 config.toml 不会自动补新键，
         # 只改 Field(default) 对老实例完全无效，体感变差时必须有立刻可用的退路
         self._hybrid_override: Optional[bool] = None
+        # v1.8.0：视频日预算计数（防刷屏烧钱）。{"day": "YYYY-MM-DD", "used": N}
+        # 惰性滚动：每次取用时比对日期，跨天自动清零；只在内存不落盘
+        # （重启清零可接受——预算是成本护栏不是配额账本，重启多花几毛钱无妨）。
+        self._video_budget: dict[str, Any] = {"day": "", "used": 0}
 
         # 行为自检：确认 chunker / 解析器在进程内可用（runtime-gotchas 5.1 的对策）
         self._run_self_check()
@@ -820,6 +882,21 @@ class FileReaderPlugin(MaiBotPlugin):
         if bool(self.config.audio.enabled) and not str(self.config.audio.api_key or "").strip():
             self.ctx.logger.warning(
                 "[自检] 音频理解已启用但未配置 audio.api_key——音频文件将收到配置指引而非解析结果"
+            )
+
+        # v1.8.0：视频通道自检——扩展名表/嗅探/时长探测在进程内可用
+        try:
+            assert fr_video.is_video_file("clip.MP4")
+            assert not fr_video.is_video_file("song.mp3")
+            assert fr_video.sniff_video_format(b"\x00\x00\x00\x20ftypisom\x00\x00") == "mp4"
+            # M4A 品牌是纯音频，视频嗅探必须让位（分派先视频后音频的边界）
+            assert fr_video.sniff_video_format(b"\x00\x00\x00\x20ftypM4A \x00\x00") == ""
+            self.ctx.logger.info("[自检] 视频通道: PASS")
+        except Exception as e:  # noqa: BLE001
+            self.ctx.logger.error("[自检] 视频通道: FAIL (%s)", e)
+        if bool(self.config.video.enabled) and not str(self.config.video.api_key or "").strip():
+            self.ctx.logger.warning(
+                "[自检] 视频理解已启用但未配置 video.api_key——视频文件将收到配置指引而非解析结果"
             )
 
         # v1.2.0：下载安全策略自检——把风险配置在启动时喊出来，而不是等出事
@@ -1834,6 +1911,7 @@ class FileReaderPlugin(MaiBotPlugin):
                     text,
                     timing=timing,
                     is_audio=text.startswith("【音频理解】"),
+                    is_video=text.startswith("【视频理解】"),
                     budget_bytes=budget_bytes,
                     other_bytes=other_bytes,
                     lexical_token_budget=lexical_budget,
@@ -1858,6 +1936,7 @@ class FileReaderPlugin(MaiBotPlugin):
                         e.source_chars,
                         e.is_audio,
                         digest,
+                        is_video=getattr(e, "is_video", False),
                     )
                 except RuntimeError as budget_err:
                     self.ctx.logger.error("文件 %s 重试包落盘失败: %s", name, budget_err)
@@ -1997,21 +2076,73 @@ class FileReaderPlugin(MaiBotPlugin):
             if pending_held:
                 self._pending_sem.release()
 
-    async def _parse_to_text(self, tmp_path: str, name: str, parse_notes: list[str]) -> str:
-        """解析分派（v1.5.0）：音频 → fr_audio 异步 Omni 理解；其余 → 同步解析器。
+    def _video_budget_take(self) -> bool:
+        """视频日预算：取一个名额。超限返回 False（调用方转「只登记不解析」）。
 
-        音频判定用 fr_audio.is_audio_file（扩展名）+ 无扩展名时内容嗅探兜底。
-        关闭 audio.enabled 时给准确原因（AudioUnsupportedError 继承 ValueError，
-        走既有 value_error 失败通知链路，模型能向用户转述）。
+        惰性滚动跨天清零；daily_budget<=0 表示不限制。
+        """
+        limit = max(0, int(self.config.video.daily_budget or 0))
+        if limit <= 0:
+            return True
+        today = time.strftime("%Y-%m-%d")
+        if self._video_budget.get("day") != today:
+            self._video_budget = {"day": today, "used": 0}
+        if int(self._video_budget.get("used") or 0) >= limit:
+            return False
+        self._video_budget["used"] = int(self._video_budget.get("used") or 0) + 1
+        return True
+
+    async def _parse_to_text(self, tmp_path: str, name: str, parse_notes: list[str]) -> str:
+        """解析分派（v1.5.0 音频 / v1.8.0 视频）：媒体 → 异步理解；其余 → 同步解析器。
+
+        分派顺序**先视频后音频**：fr_audio.sniff_audio_format 把 mp42/isom 的
+        ftyp 品牌识别为 m4a，若先判音频，改名的 .mp4 视频会被误喂给 Omni。
+        视频判定用 fr_video.is_video_file（扩展名）+ 无扩展名时内容嗅探兜底。
+        关闭 enabled / 超限 / 超日预算时给准确原因（VideoUnsupportedError 继承
+        ValueError，走既有 value_error 失败通知链路，模型能向用户转述）。
         """
         ext = get_extension(name)
+        is_video = ext in fr_video.VIDEO_EXTENSIONS
         is_audio = ext in fr_audio.AUDIO_EXTENSIONS
-        if not is_audio and not ext:
-            # 无扩展名（适配器降级占位名且 napcat 回填失败）：嗅探文件头兜底
-            sniffed = await asyncio.to_thread(self._sniff_audio_head, tmp_path)
-            is_audio = bool(sniffed)
-            if is_audio:
-                name = f"{name}.{sniffed}"
+        if not is_video and not is_audio and not ext:
+            # 无扩展名（适配器降级占位名且 napcat 回填失败）：嗅探文件头兜底。
+            # 先视频后音频（mp4 家族 ftyp 与 m4a 共享头部，见 fr_video.sniff_video_format）。
+            sniffed_video = await asyncio.to_thread(self._sniff_video_head, tmp_path)
+            if sniffed_video:
+                is_video = True
+                name = f"{name}.{sniffed_video}"
+            else:
+                sniffed = await asyncio.to_thread(self._sniff_audio_head, tmp_path)
+                is_audio = bool(sniffed)
+                if is_audio:
+                    name = f"{name}.{sniffed}"
+        if is_video:
+            if not bool(self.config.video.enabled):
+                raise fr_video.VideoUnsupportedError(
+                    f"视频文件「{name}」的理解功能已关闭（video.enabled=false），"
+                    "如需读取请联系管理员开启"
+                )
+            vcfg = self.config.video
+            # 日预算在预检之前判：超限视频连时长探测都不做，直接登记拒绝。
+            if not self._video_budget_take():
+                raise fr_video.VideoUnsupportedError(
+                    f"视频文件「{name}」已收到，但今日自动理解名额已用完"
+                    f"（video.daily_budget={int(vcfg.daily_budget)}），今天不再解析，"
+                    "明天会自动恢复。如急需理解请联系管理员调高预算"
+                )
+            return await fr_video.read_video_to_text(
+                tmp_path,
+                name,
+                base_url=str(vcfg.base_url or ""),
+                api_key=str(vcfg.api_key or ""),
+                model=str(vcfg.model or ""),
+                max_duration_seconds=float(vcfg.max_duration_seconds or 0),
+                max_file_mb=float(vcfg.max_file_mb or 0),
+                max_output_tokens=int(vcfg.max_output_tokens or 4000),
+                fps=float(vcfg.fps or 1.0),
+                request_timeout=float(vcfg.request_timeout or 300.0),
+                log=self.ctx.logger.info,
+            )
         if is_audio:
             if not bool(self.config.audio.enabled):
                 raise fr_audio.AudioUnsupportedError(
@@ -2046,6 +2177,21 @@ class FileReaderPlugin(MaiBotPlugin):
             return ""
         fmt = fr_audio.sniff_audio_format(head)
         return fmt if fmt in fr_audio.AUDIO_EXTENSIONS else ""
+
+    @staticmethod
+    def _sniff_video_head(tmp_path: str) -> str:
+        """读文件头 16 字节做视频嗅探（同步，调用处包 to_thread）。
+
+        返回的扩展名必须在 VIDEO_EXTENSIONS 内（flv 等明确拒绝的格式
+        不在此列，嗅探命中也返回空，让后续分派给准确拒绝原因）。
+        """
+        try:
+            with open(tmp_path, "rb") as f:
+                head = f.read(16)
+        except OSError:
+            return ""
+        fmt = fr_video.sniff_video_format(head)
+        return fmt if fmt in fr_video.VIDEO_EXTENSIONS else ""
 
     def _napcat_ssl_context(self) -> ssl.SSLContext:
         """NapCat urllib SSL 上下文缓存（v1.1.0）：create_default_context 是 ms 级 CPU 调用，
@@ -3176,7 +3322,11 @@ class FileReaderPlugin(MaiBotPlugin):
                 # 首轮回复只围绕文件名，靠自发调 search_file 才拿到赏析正文。
                 # 音频必须明说「已经被听过、文本就是听的结果」，模型才敢据此作答。
                 audio_entries = [e for e in vs.files.values() if getattr(e, "is_audio", False)]
-                doc_entries = [e for e in vs.files.values() if not getattr(e, "is_audio", False)]
+                video_entries = [e for e in vs.files.values() if getattr(e, "is_video", False)]
+                doc_entries = [
+                    e for e in vs.files.values()
+                    if not getattr(e, "is_audio", False) and not getattr(e, "is_video", False)
+                ]
                 if doc_entries:
                     names = [str(e.file_name) for e in doc_entries]
                     total = sum(int(e.total_chars()) for e in doc_entries)
@@ -3197,6 +3347,20 @@ class FileReaderPlugin(MaiBotPlugin):
                         f"本会话的音频文件：{listed} 已由音频理解模型完整听过，"
                         f"并转成理解文本入库（合计约 {total} 字，转写或赏析）。{supply}。"
                         "你可以据此谈论音频内容、给出听感与评价，不要声称自己听不了音频；"
+                        "规划阶段不需要再调用文件读取工具，需要精确定位某段时用 search_file。"
+                    )
+                # v1.8.0：视频与音频同理——明说「已看过、文本就是看+听的结果」，
+                # 否则 planner 会按「视频不可能有文本」的常识自我否定（v1.5.1 教训翻版）。
+                if video_entries:
+                    names = [str(e.file_name) for e in video_entries]
+                    total = sum(int(e.total_chars()) for e in video_entries)
+                    listed = "、".join(f"《{n}》" for n in names[:3])
+                    if len(names) > 3:
+                        listed += f" 等 {len(names)} 个"
+                    parts.append(
+                        f"本会话的视频文件：{listed} 已由视频理解模型完整看过（画面+音轨），"
+                        f"并转成理解文本入库（合计约 {total} 字，画面描述与语音转写）。{supply}。"
+                        "你可以据此谈论视频内容，不要声称自己看不了视频；"
                         "规划阶段不需要再调用文件读取工具，需要精确定位某段时用 search_file。"
                     )
             if parsing:
@@ -3529,6 +3693,17 @@ class FileReaderPlugin(MaiBotPlugin):
             f"- NapCat 兜底: {'启用' if self.config.napcat.enabled else '停用'} ({self.config.napcat.http_url})",
             f"- 适配器取文件(SnowLuma): {'启用' if self.config.snowluma.enabled else '停用'}",
         ]
+        # v1.8.0：视频通道状态 + 今日预算用量（排查「视频为什么没被理解」的第一眼）
+        vcfg = self.config.video
+        budget_limit = max(0, int(vcfg.daily_budget or 0))
+        today = time.strftime("%Y-%m-%d")
+        used_today = int(self._video_budget.get("used") or 0) if self._video_budget.get("day") == today else 0
+        budget_text = f"{used_today}/{budget_limit}" if budget_limit else "不限"
+        key_state = "已配置" if str(vcfg.api_key or "").strip() else "未配置（视频将收到配置指引）"
+        lines.append(
+            f"- 视频理解: {'启用' if vcfg.enabled else '停用'} (model={vcfg.model}, "
+            f"≤{vcfg.max_file_mb}MB/≤{vcfg.max_duration_seconds}s, Key={key_state}, 今日预算={budget_text})"
+        )
         if self._embed_retry_queue:
             names = "、".join(f"{item['name']}(第{item['attempts']}次)" for item in self._embed_retry_queue[:5])
             lines.append(f"- ⏳ 待重试入库: {len(self._embed_retry_queue)} 个 — {names}")
@@ -3900,6 +4075,8 @@ class FileReaderPlugin(MaiBotPlugin):
         source_chars: int,
         is_audio: bool,
         digest: str,
+        *,
+        is_video: bool = False,
     ) -> tuple[str, int]:
         """把已分块文本写为磁盘重试包；在工作线程中调用。"""
         payload = {
@@ -3908,6 +4085,7 @@ class FileReaderPlugin(MaiBotPlugin):
             "chunks": chunks,
             "source_chars": int(source_chars or 0),
             "is_audio": bool(is_audio),
+            "is_video": bool(is_video),
             "sha256": digest,
         }
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -4034,6 +4212,7 @@ class FileReaderPlugin(MaiBotPlugin):
                             chunks = [str(c) for c in bundle.get("chunks") or []]
                             source_chars = int(bundle.get("source_chars") or 0)
                             is_audio = bool(bundle.get("is_audio"))
+                            is_video = bool(bundle.get("is_video"))
                             await self._active_sem.acquire()
                             try:
                                 store_key = (item["session_id"], item["conversation_id"])
@@ -4068,6 +4247,7 @@ class FileReaderPlugin(MaiBotPlugin):
                                     chunks,
                                     source_chars=source_chars,
                                     is_audio=is_audio,
+                                    is_video=is_video,
                                     budget_bytes=budget_bytes,
                                     other_bytes=other_bytes,
                                     lexical_token_budget=lex_budget,
@@ -4088,6 +4268,13 @@ class FileReaderPlugin(MaiBotPlugin):
                             self._discard_retry_bundle(item)
                             await self._reply_error(
                                 item["stream_id"], f"⚠️ {e}", reason="audio_rejected",
+                            )
+                            continue
+                        except fr_video.VideoUnsupportedError as e:
+                            self.ctx.logger.warning("视频 %s 重试中被确定性拒绝，放弃: %s", item["name"], e)
+                            self._discard_retry_bundle(item)
+                            await self._reply_error(
+                                item["stream_id"], f"⚠️ {e}", reason="video_rejected",
                             )
                             continue
                         except Exception as e:  # noqa: BLE001
@@ -4160,24 +4347,35 @@ class FileReaderPlugin(MaiBotPlugin):
 
 #: 默认收起的 section：标题自带「可选 / 默认关闭」的功能节。收起后标题
 #: 与说明仍可见，点开即可配置，避免整页卡片全开淹没常用配置。
-_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset({"napcat", "audio"})
+_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset({"napcat", "audio", "video"})
 
 #: 手工指定的 section 标题（键 = section 名）；仅在 SDK 输出标题等于
 #: 节名（未配置 __ui_label__）时采用。
 _WEBUI_SECTION_TITLES: dict = {}
 
-#: 手工指定的字段 label（键 = 字段名）；仅在自动推导不可用时采用。
+#: 手工指定的字段 label（键 = (section 名, 字段名)）。仅在自动推导不可用时采用。
+#: v1.8.0 起带 section 维度：model 在 [audio] 叫「音频理解模型」、在 [video] 叫
+#: 「视频理解模型」，旧的扁平键会把视频节的 model 标成音频（显示层 bug）。
 _WEBUI_LABEL_OVERRIDES: dict = {
-    "http_url": "HTTP 服务地址",
-    "access_token": "HTTP Token",
-    "cache_dir": "文件缓存目录",
-    "base_url": "模型接口地址",
-    "api_key": "模型 API 密钥",
-    "model": "音频理解模型",
-    "max_duration_seconds": "时长上限（秒）",
-    "max_file_mb": "大小上限（MB）",
-    "max_output_tokens": "输出长度上限",
-    "request_timeout": "请求超时（秒）",
+    ("napcat", "http_url"): "HTTP 服务地址",
+    ("napcat", "access_token"): "HTTP Token",
+    ("napcat", "cache_dir"): "文件缓存目录",
+    ("audio", "base_url"): "模型接口地址",
+    ("audio", "api_key"): "模型 API 密钥",
+    ("audio", "model"): "音频理解模型",
+    ("audio", "max_duration_seconds"): "时长上限（秒）",
+    ("audio", "max_file_mb"): "大小上限（MB）",
+    ("audio", "max_output_tokens"): "输出长度上限",
+    ("audio", "request_timeout"): "请求超时（秒）",
+    ("video", "base_url"): "模型接口地址",
+    ("video", "api_key"): "方舟 API 密钥",
+    ("video", "model"): "视频理解模型",
+    ("video", "max_duration_seconds"): "时长上限（秒）",
+    ("video", "max_file_mb"): "大小上限（MB）",
+    ("video", "max_output_tokens"): "输出长度上限",
+    ("video", "request_timeout"): "请求超时（秒）",
+    ("video", "fps"): "抽帧帧率",
+    ("video", "daily_budget"): "每日理解数上限",
 }
 
 
@@ -4237,7 +4435,7 @@ def _apply_webui_display_polish(schema: dict) -> dict:
                 field["hint"] = field["description"]
             label = field.get("label")
             if (not label or label == fname) and field.get("description"):
-                new_label = _WEBUI_LABEL_OVERRIDES.get(fname) or _webui_label_from_description(
+                new_label = _WEBUI_LABEL_OVERRIDES.get((name, fname)) or _webui_label_from_description(
                     field["description"]
                 )
                 if new_label and new_label != fname:

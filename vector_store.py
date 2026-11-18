@@ -37,12 +37,20 @@ class EmbeddingFailed(RuntimeError):
     chunks 一并带出；异常释放后不再有其它强引用。
     """
 
-    def __init__(self, cause: BaseException, chunks: List[str], source_chars: int, is_audio: bool) -> None:
+    def __init__(
+        self,
+        cause: BaseException,
+        chunks: List[str],
+        source_chars: int,
+        is_audio: bool,
+        is_video: bool = False,
+    ) -> None:
         super().__init__(str(cause))
         self.cause = cause
         self.chunks = chunks
         self.source_chars = source_chars
         self.is_audio = is_audio
+        self.is_video = is_video
 
 
 @dataclass
@@ -77,6 +85,10 @@ class FileEntry:
     # 反复纠结「我没有耳朵 / 817 字可能是歌词元数据」，首轮回复不敢基于内容作答，
     # 靠自发调 search_file 拿到正文后才答到点上（多耗一轮工具 + 一轮 planner）。
     is_audio: bool = False
+    # v1.8.0：文本来自视频理解模型（画面描述 + 音轨转写）。Planner 公告据此
+    # 明确告知「已看过并转成理解文本」——与 is_audio 同理（v1.5.1 真机教训：
+    # 不说清楚媒体已被理解过，planner 会按「视频不可能有文本」自我否定）。
+    is_video: bool = False
 
     def __post_init__(self) -> None:
         if not self.last_used:
@@ -192,6 +204,7 @@ class VectorStore:
         timing: Optional[dict] = None,
         *,
         is_audio: bool = False,
+        is_video: bool = False,
         budget_bytes: Optional[int] = None,
         other_bytes: int = 0,
         lexical_token_budget: int = 0,
@@ -218,6 +231,7 @@ class VectorStore:
                 chunks,
                 source_chars=len(content),
                 is_audio=is_audio,
+                is_video=is_video,
                 budget_bytes=budget_bytes,
                 other_bytes=other_bytes,
                 lexical_token_budget=lexical_token_budget,
@@ -230,7 +244,7 @@ class VectorStore:
             raise
         except RuntimeError as e:
             # embedding 返回空/异常：带上已经切好的 chunks，由插件落成重试包
-            raise EmbeddingFailed(e, chunks, len(content), is_audio) from e
+            raise EmbeddingFailed(e, chunks, len(content), is_audio, is_video) from e
         if timing is not None:
             timing["total"] = time.perf_counter() - t_begin
         return entry
@@ -242,6 +256,7 @@ class VectorStore:
         *,
         source_chars: int = 0,
         is_audio: bool = False,
+        is_video: bool = False,
         budget_bytes: Optional[int] = None,
         other_bytes: int = 0,
         lexical_token_budget: int = 0,
@@ -250,7 +265,7 @@ class VectorStore:
     ) -> FileEntry:
         """对已分块文本执行 embedding 与提交（v1.6.0）。
 
-        磁盘重试包直接走这里：不再解析、不再分块、音频不再调用 Omni。
+        磁盘重试包直接走这里：不再解析、不再分块、音频/视频不再调用理解模型。
         """
         if not chunks:
             raise ValueError("文件内容为空，无可向量化文本")
@@ -258,7 +273,7 @@ class VectorStore:
         try:
             vectors = await self._embed(chunks)
         except Exception as e:  # noqa: BLE001
-            raise EmbeddingFailed(e, chunks, source_chars, is_audio) from e
+            raise EmbeddingFailed(e, chunks, source_chars, is_audio, is_video) from e
         t_embedded = time.perf_counter()
 
         if np is not None:
@@ -278,6 +293,7 @@ class VectorStore:
             source_chars=source_chars or sum(len(c) for c in chunks),
             chunk_overlap=int(getattr(self._chunker, "chunk_overlap", 0) or 0),
             is_audio=bool(is_audio),
+            is_video=bool(is_video),
         )
         await asyncio.to_thread(
             self._commit_entry,

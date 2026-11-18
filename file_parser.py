@@ -31,6 +31,7 @@ _LOGGER = logging.getLogger(__name__)
 # v1.5.0：音频扩展名/拒绝原因的单一来源在 fr_audio（异步解析，插件侧分派）。
 # fr_audio 只在函数内部反向 import get_extension，顶层无循环依赖。
 from fr_audio import AUDIO_EXTENSIONS, AUDIO_RECOGNIZED_UNSUPPORTED
+from fr_video import VIDEO_EXTENSIONS, VIDEO_RECOGNIZED_UNSUPPORTED
 
 # ─── 可选依赖（try-import，缺失则降级） ──────────────────────────
 try:
@@ -793,12 +794,20 @@ RECOGNIZED_UNSUPPORTED: dict[str, str] = {
     "rtf": "RTF 暂不支持（读出来是控制字乱码），请另存为 .docx 或 .txt 后重发",
     # v1.5.0：音频类拒绝原因与 fr_audio 保持单一来源（silk/amr/wma 明确拒绝）
     **AUDIO_RECOGNIZED_UNSUPPORTED,
+    # v1.8.0：视频类拒绝原因与 fr_video 保持单一来源（flv/wmv/rmvb/ts/3gp 明确拒绝）。
+    # 注意 "ts" 与 TypeScript 冲突：同步入口的 ts 仍按文本解析（见 read_any_file_to_text
+    # 的豁免），这里只供视频分派与提示文案使用。
+    **{k: v for k, v in VIDEO_RECOGNIZED_UNSUPPORTED.items() if k != "ts"},
 }
 
 #: v1.5.0：音频扩展名由插件侧异步分派（fr_audio.read_audio_to_text，需要网络调用），
 #: 不进 SUPPORTED_EXTENSIONS 同步分派表。这里只作**标记**：同步入口遇到音频要给
 #: 准确原因而不是笼统的"不支持的文件类型"。
 AUDIO_ASYNC_EXTENSIONS: frozenset = frozenset(AUDIO_EXTENSIONS)
+
+#: v1.8.0：视频扩展名同理——插件侧异步分派（fr_video.read_video_to_text），
+#: 同步入口遇到视频给准确原因。
+VIDEO_ASYNC_EXTENSIONS: frozenset = frozenset(VIDEO_EXTENSIONS)
 
 
 # ─── 扩展名 → 处理函数（原映射表，函数体改为标准库优先） ────────────
@@ -1042,6 +1051,11 @@ def read_any_file_to_text(file_path: str, file_name: str = "") -> str:
         raise ValueError(
             f"音频文件（.{ext}）需要经插件的音频理解通道解析，不能走同步文本解析入口（{name}）"
         )
+    # v1.8.0：视频同理（Files API 上传 + 理解调用是异步网络链路）。
+    if ext in VIDEO_ASYNC_EXTENSIONS:
+        raise ValueError(
+            f"视频文件（.{ext}）需要经插件的视频理解通道解析，不能走同步文本解析入口（{name}）"
+        )
     if sniffed == "rtf":
         raise ValueError(f"{RECOGNIZED_UNSUPPORTED['rtf']}（{name}）")
     if sniffed == "ole" and ext not in ("doc", "xls", "ppt"):
@@ -1086,5 +1100,6 @@ def describe_supported_types() -> str:
         "pdf/docx/odt/epub/eml, xlsx/ods/csv, pptx/odp, html/ipynb/gz, "
         "代码与文本(py/java/cpp/js/ts/css/go/rs/sh/md/json/yaml/txt/srt/xml...), "
         "ini/env/toml/log/sql, "
-        "音频(mp3/wav/flac/ogg/m4a/aac，需配置 [audio] 音频理解模型，v1.5.0)"
+        "音频(mp3/wav/flac/ogg/m4a/aac，需配置 [audio] 音频理解模型，v1.5.0), "
+        "视频(mp4/mov/m4v/avi/mkv/webm，需配置 [video] 视频理解模型，v1.8.0)"
     )

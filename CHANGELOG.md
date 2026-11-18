@@ -8,6 +8,7 @@ README 只保留「原理 / 安装 / 配置 / 命令 / 安全策略 / 常见问�
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
+| v1.8.0 | 2026-11-19 | 视频文件理解：豆包全模态音画一次调用（Files API 流式上传，不 base64）→【视频理解】文本入库免费追问；[video] 独立配置 + 日预算；超限确定性拒绝 |
 | v1.7.0 | 2026-11-18 | SnowLuma 适配器取文件通道（api.call 换 URL，无需 NapCat HTTP）+ size 预检 + 失败原因精确化 + css/scss/less |
 | v1.6.0 | 2026-11-18 | 性能与内存专项：统一临时文件获取、入库预建索引、全局预算/准入、解析硬上限、磁盘重试包 |
 | v1.5.1 | 2026-11-16 | Planner 公告补音频语义：明示「已由音频理解模型听过」，消除 planner「mp3 哪来文本/我没耳朵」误判（真机 22:01 日志驱动） |
@@ -46,6 +47,39 @@ README 只保留「原理 / 安装 / 配置 / 命令 / 安全策略 / 常见问�
 | v1.0.3 | 2026-09-02 |  |
 | v1.0.2 | 2026-09-02 |  |
 | v1.0.1 | 2026-09-02 |  |
+
+---
+
+## v1.8.0（2026-11-19）视频文件理解（P1：豆包全模态，音画一次调用）
+
+> 来源：《file-reader 插件改进建议汇总》文档方案评审（2026-11-18，grill 式追问定案 D1~D8，决策记录在工作区会话内存档，不入插件 docs/）。文档中「复用现有图片理解通道」为假前提（本插件从无图片通道），已修正为独立视频模块。模型选型二次核对（2026-11-19 调研表：MiMo/Kimi/MiniMax/GLM/百炼VL/混元/Gemini/OpenAI）后维持豆包 `doubao-seed-2-1-lite-260915`：唯一「音轨+画面单模型一次调用 + 国内 + 有托管上传接口」的选项。
+
+### 新增：视频理解通道（`fr_video.py` + `[video]` 配置节）
+
+- **链路**：已落盘视频 → 确定性预检 → 方舟 **Files API multipart 流式上传**（httpx `files=` 传文件对象，**不做 base64 整读**，绕开 fr_audio 的内存放大）→ Chat API 以 `video_url.file_id` 引用 → 一次调用同时得到画面描述 + 音轨转写 → 带【视频理解】头部回流 `add_file`，分块/检索/追问全部复用现有管线。
+- **支持格式**：`mp4` `mov` `m4v` `avi` `mkv` `webm`；`flv` `wmv` `rmvb` `rm` `3gp` 明确拒绝并提示转 mp4（`ts` 不进拒绝表，避免与 TypeScript 冲突）。无扩展名/改名文件按文件头嗅探兜底。
+- **分派边界（先视频后音频）**：`fr_audio.sniff_audio_format` 会把 `mp42`/`isom` 的 ftyp 品牌认成 m4a；分派与嗅探顺序均为视频优先，M4A /M4B 品牌视频嗅探让位（纯音频仍走 Omni）。
+- **闸门（超限确定性拒绝，绝不截断偷发）**：`max_file_mb=20` / `max_duration_seconds=600` / `daily_budget=20`（惰性滚动跨天清零，0=不限）/ Files API 512MB 硬上限（不可配置放宽）。时长探测纯标准库（MP4 moov/mvhd v0+v1、AVI avih），无 ffmpeg 依赖；**读不出时长 fail-closed 拒绝**。`VideoUnsupportedError` 继承 ValueError，走既有 value_error 失败通知链路：**只注入模型、不发群**，模型可向用户转述「剪辑/压缩后重发」。
+- **日预算口径**：只计通过预检并真正发起上传的次数；拒绝/失败不扣预算。
+- **输出纪律写代码层**（`VIDEO_SYSTEM_PROMPT`，不提供用户可改 prompt 配置）：内容类型首行、[mm:ss] 时间点、不编造、（看不清）/（听不清）标注、歌词最多引一两句、简体中文输出。
+- **Planner 公告视频语义**：独立公告「已完整看过（画面+音轨）…不要声称自己看不了视频」（沿用 v1.5.1 音频「我没耳朵」教训）；视频不混进文档公告。`is_video` 标记贯穿 FileEntry / add_file / add_chunks / 磁盘重试包（重试不重新上传/理解）。
+- **未配 Key 不报错**：给配置指引（指向 README「视频文件」节），其他文件类型不受影响。`/file_status` 增加视频状态行（模型/闸门/Key/今日预算）；自检增加视频通道项。
+- **配置**：`config_version` 1.5.0 → **1.6.0**（新增 `[video]` 节：enabled/base_url/api_key/model/max_file_mb/max_duration_seconds/fps=1.0/daily_budget/max_output_tokens=4000/request_timeout=300）。WebUI 配置节默认收起；**label 覆盖表从扁平键改为 (section, field) 元组键**，修复 video.model 被标成「音频理解模型」的串节 bug。
+
+### 测试与门禁（2026-11-19 实测）
+
+- 新增 `tests/test_video_channel.py` **44 用例**（12 个覆盖面：判定/嗅探边界、mvhd v0/v1 与 AVI 时长探测、预检 fail-closed、Key 指引、上传契约（multipart+preprocess_configs+流式文件对象）、Chat 契约（file_id 引用+无 base64）、is_video 入库+公告、分派优先级、日预算、端到端失败通知、重试包 roundtrip、配置默认值/状态/WebUI label），全程离线桩，不发真实请求。
+- 全量 pytest **347 passed**（基线 303 + 新增 44）；devkit `gate.sh` **PASS 3 / SKIP 0 / FAIL 0**（check_plugin PASS 40 / WARN 4 / FAIL 0，WARN 均为既有命名风格提示，非本版引入）。
+- **反向验证 3 组**（注入缺陷→用例变红→还原→变绿）：① 无扩展名分派改回「先音频后视频」→ `test_dispatch_no_extension_sniffs_video_first` 红；② 时长 fail-closed 改 fail-open → `test_precheck_rejects_unknown_duration` 红；③ M4A 品牌嗅探改抢占 → `test_sniff_video_format` 红。
+- 开发中修掉 3 个真实缺陷：mvhd v1 测试合成 version 字节全零、**AVI avih 解析偏移错位**（size 字段被当数据读、total_frames 偏移 +16 误写 +12——真机 AVI 会全部误拒）、模型空白输出未 strip 导致空文本入库。
+- 兼容区间不动：host `1.2.0–1.4.6` / sdk `2.5.1–2.23.0`，已覆盖官方最新（MaiBot v1.4.6 / SDK 2.23.0，2026-11-19 官方渠道核实）。capabilities 无新增（复用既有 hook/command/tool/api.call）。
+- `tests/test_snowluma_channel.py` 两处版本钉子断言改为 `>=` 下限断言（原断言把 config_version/manifest version 钉死在旧值，功能演进即误报）。
+
+### 已知边界（P2 待办，本版不做）
+
+- MKV/WebM 时长读不出（EBML 不解析）→ fail-closed 拒绝；QQ 短视频以 mp4 为主，影响面小。
+- 公网 URL 直传（≤50MB）可省一次上传流量，留作 P2 优化。
+- 真机验证待用户开通方舟 Key 后进行（上传/理解契约已离线锁定，但未打真实接口）。
 
 ---
 

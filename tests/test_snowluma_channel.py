@@ -610,7 +610,9 @@ def test_snowluma_config_defaults():
     assert cfg.snowluma.enabled is True
     assert cfg.snowluma.private_file_url_api == PRIVATE_API
     assert cfg.snowluma.group_file_url_api == GROUP_API
-    assert cfg.plugin.config_version == "1.5.0", "新增 [snowluma] 节必须 bump config_version"
+    # 版本随功能演进（1.5.0=snowluma 节 → 1.6.0=video 节）；断言不低于引入节时的版本
+    from packaging.version import Version
+    assert Version(cfg.plugin.config_version) >= Version("1.5.0"), "新增 [snowluma] 节必须 bump config_version"
 
 
 def test_manifest_declares_api_call():
@@ -618,7 +620,8 @@ def test_manifest_declares_api_call():
     import json
     manifest = json.loads((PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8"))
     assert "api.call" in manifest.get("capabilities", [])
-    assert manifest["version"] == "1.7.0"
+    from packaging.version import Version
+    assert Version(manifest["version"]) >= Version("1.7.0")
 
 
 def test_status_reports_snowluma_channel():
