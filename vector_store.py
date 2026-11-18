@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +19,30 @@ try:
     import numpy as np  # type: ignore
 except ImportError:  # pragma: no cover
     np = None
+
+
+class MemoryBudgetExceeded(RuntimeError):
+    """新增文件会突破全局数据预算；旧 entry 保持不变。"""
+
+    def __init__(self, needed: int, budget: int) -> None:
+        super().__init__(f"数据预算不足：需要约 {needed / 1048576:.1f}MB，上限 {budget / 1048576:.1f}MB")
+        self.needed = needed
+        self.budget = budget
+
+
+class EmbeddingFailed(RuntimeError):
+    """embedding 失败并携带已完成的分块，供插件写磁盘重试包。
+
+    重试不能重新解析原文件（音频还会重复 Omni 调用），因此首次失败必须把
+    chunks 一并带出；异常释放后不再有其它强引用。
+    """
+
+    def __init__(self, cause: BaseException, chunks: List[str], source_chars: int, is_audio: bool) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.chunks = chunks
+        self.source_chars = source_chars
+        self.is_audio = is_audio
 
 
 @dataclass
@@ -89,6 +115,14 @@ class FileEntry:
         self._full_text_cache = "".join(parts)
         return self._full_text_cache
 
+    def release_full_text_cache(self) -> None:
+        """释放拼接全文缓存（v1.6.0）。
+
+        大文件只在概要取样时需要一次全文；缓存会与 chunks 永久并存，等于多留
+        一份正文。概要完成后调用本方法；小文件直注路径仍会按需重建。
+        """
+        self._full_text_cache = ""
+
 
 def _cosine(a: Any, b: Any) -> float:
     """余弦相似度。空向量返回 0。a/b 兼容 list 与 numpy 1D 数组。"""
@@ -121,6 +155,7 @@ class VectorStore:
         chunk_merge: bool = True,
         retrieve_use_matrix: bool = False,
         lexical_max_tokens: int = 0,
+        lexical_max_postings: int = 0,
     ) -> None:
         # 延迟导入 chunker，避免与 plugin.py 的 sys.path 处理耦合
         from chunker import RecursiveCharacterChunker
@@ -131,12 +166,17 @@ class VectorStore:
         self.retrieve_top_k = retrieve_top_k
         self.retrieve_use_matrix = retrieve_use_matrix  # v1.0.18 C5：矩阵化检索开关
         # v1.3.0：词法（BM25）索引，与向量检索做 RRF 融合；0 = 不设上限
-        self._lexical = LexicalIndex(max_tokens=lexical_max_tokens)
+        self._lexical = LexicalIndex(max_tokens=lexical_max_tokens, max_postings=lexical_max_postings)
         self._files: dict[str, FileEntry] = {}
         # 矩阵缓存（C5）：L2 归一化后的全库向量矩阵 + (file_name, chunk_index, text) 索引表
         self._mat_cache: Any = None
         self._mat_index: List[tuple[str, int, str]] = []
         self._mat_fp: Optional[tuple] = None
+        self._matrix_blocked = False
+        # v1.6.0：入库提交/清理/检索的短临界区保护。网络 embedding 不在锁内；
+        # 所有重 CPU 操作都在 asyncio.to_thread 中执行，锁只覆盖内存结构。
+        self._lock = threading.RLock()
+        self.last_matrix_seconds = 0.0
 
     @property
     def files(self) -> dict[str, FileEntry]:
@@ -152,17 +192,19 @@ class VectorStore:
         timing: Optional[dict] = None,
         *,
         is_audio: bool = False,
+        budget_bytes: Optional[int] = None,
+        other_bytes: int = 0,
+        lexical_token_budget: int = 0,
     ) -> FileEntry:
         """解析文本 → 分块 → 向量化 → 存入。
 
-        v1.4.0：`timing` 给出参字典，回填 chunk / embed / index / total 四段秒数，
-        供调用方打一条可归因的耗时日志（真机排障只有「已入库」一个点，无法定位慢在哪儿）。
-        v1.5.1：`is_audio` 标记文本来自音频理解模型，Planner 公告据此说明「已听过」。
+        v1.6.0：
+        - embedding 失败抛 `EmbeddingFailed`，携带 chunks 供磁盘重试包复用；
+        - 入库阶段预建 BM25 与向量矩阵，首次查询不再同步做重 CPU；
+        - 核心数据预算在提交前检查，超限抛 `MemoryBudgetExceeded` 且旧 entry 不变。
         """
-        from chunker import RecursiveCharacterChunker  # noqa: F401  (确认可用)
-
         t_begin = time.perf_counter()
-        # v1.1.0：递归分块是 CPU 密集任务（大文本可达秒级），进线程避免冻结事件循环
+        # 递归分块是 CPU 密集任务，进线程避免冻结事件循环
         chunks = await asyncio.to_thread(self._chunker.chunk, content)
         if not chunks:
             chunks = [content] if content.strip() else []
@@ -170,42 +212,162 @@ class VectorStore:
             raise ValueError("文件内容为空，无可向量化文本")
         t_chunked = time.perf_counter()
 
-        vectors = await self._embed(chunks)
+        try:
+            entry = await self.add_chunks(
+                file_name,
+                chunks,
+                source_chars=len(content),
+                is_audio=is_audio,
+                budget_bytes=budget_bytes,
+                other_bytes=other_bytes,
+                lexical_token_budget=lexical_token_budget,
+                timing=timing,
+                _chunk_seconds=t_chunked - t_begin,
+            )
+        except EmbeddingFailed:
+            raise
+        except MemoryBudgetExceeded:
+            raise
+        except RuntimeError as e:
+            # embedding 返回空/异常：带上已经切好的 chunks，由插件落成重试包
+            raise EmbeddingFailed(e, chunks, len(content), is_audio) from e
+        if timing is not None:
+            timing["total"] = time.perf_counter() - t_begin
+        return entry
+
+    async def add_chunks(
+        self,
+        file_name: str,
+        chunks: List[str],
+        *,
+        source_chars: int = 0,
+        is_audio: bool = False,
+        budget_bytes: Optional[int] = None,
+        other_bytes: int = 0,
+        lexical_token_budget: int = 0,
+        timing: Optional[dict] = None,
+        _chunk_seconds: float = 0.0,
+    ) -> FileEntry:
+        """对已分块文本执行 embedding 与提交（v1.6.0）。
+
+        磁盘重试包直接走这里：不再解析、不再分块、音频不再调用 Omni。
+        """
+        if not chunks:
+            raise ValueError("文件内容为空，无可向量化文本")
+        t_begin = time.perf_counter()
+        try:
+            vectors = await self._embed(chunks)
+        except Exception as e:  # noqa: BLE001
+            raise EmbeddingFailed(e, chunks, source_chars, is_audio) from e
         t_embedded = time.perf_counter()
 
-        # v1.1.0：向量统一转 float32 ndarray（内存约为 list-of-float 的 1/8）；
-        # 转换失败（如 ragged）回退原列表，下游 _build_matrix/_cosine 均兼容。
         if np is not None:
             try:
                 vectors = np.asarray(vectors, dtype="float32")
+                if vectors.ndim == 2 and vectors.size:
+                    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+                    norms[norms == 0] = 1.0
+                    vectors /= norms  # 原地归一化，避免 mat/norms 再复制一份
             except (ValueError, TypeError):
                 pass
 
-        # v1.0.18：记录原文长度（overlap 合并会让 join(chunks) 膨胀，阈值判定要用原文长度）
-        # v1.3.4：同时记住 overlap，供 full_text() 拼全文时去重（否则注入内容重复）
         entry = FileEntry(
             file_name=file_name,
             chunks=chunks,
             vectors=vectors,
-            source_chars=len(content),
+            source_chars=source_chars or sum(len(c) for c in chunks),
             chunk_overlap=int(getattr(self._chunker, "chunk_overlap", 0) or 0),
             is_audio=bool(is_audio),
         )
-        self._files[file_name] = entry
-        self._mat_cache = None  # 置脏：下次检索重建矩阵
-        # v1.3.0：词法索引增量登记（分词是 CPU 密集，同样进线程）
-        await asyncio.to_thread(self._lexical.add, file_name, chunks)
+        await asyncio.to_thread(
+            self._commit_entry,
+            entry,
+            budget_bytes,
+            other_bytes,
+            lexical_token_budget,
+        )
         if timing is not None:
             t_done = time.perf_counter()
-            timing.update(
-                {
-                    "chunk": t_chunked - t_begin,
-                    "embed": t_embedded - t_chunked,
-                    "index": t_done - t_embedded,
-                    "total": t_done - t_begin,
-                }
-            )
+            timing["chunk"] = _chunk_seconds
+            timing["embed"] = t_embedded - t_begin
+            timing["index"] = t_done - t_embedded
+            timing["lexical"] = self._lexical.last_build_seconds
+            timing["matrix"] = self.last_matrix_seconds
+            timing["total"] = t_done - t_begin
         return entry
+
+    def _entry_bytes(self, entry: FileEntry) -> int:
+        total = sys.getsizeof(entry)
+        for chunk in entry.chunks:
+            total += sys.getsizeof(chunk)
+        vectors = entry.vectors
+        if np is not None and isinstance(vectors, np.ndarray):
+            total += int(vectors.nbytes)
+        else:
+            try:
+                total += sum(sys.getsizeof(v) + sum(sys.getsizeof(x) for x in v) for v in vectors)
+            except TypeError:
+                pass
+        return total
+
+    def core_bytes(self, *, include_matrix: bool = True) -> int:
+        with self._lock:
+            total = sum(self._entry_bytes(e) for e in self._files.values())
+            if include_matrix and np is not None and isinstance(self._mat_cache, np.ndarray):
+                total += int(self._mat_cache.nbytes)
+            return total
+
+    def estimated_bytes(self) -> int:
+        """本会话核心数据 + BM25 的近似堆占用，供容量诊断与预算。"""
+        return self.core_bytes() + self._lexical.estimated_bytes()
+
+    def _commit_entry(
+        self,
+        entry: FileEntry,
+        budget_bytes: Optional[int],
+        other_bytes: int,
+        lexical_token_budget: int,
+    ) -> None:
+        """在 worker 线程中原子提交 entry，并预建索引。"""
+        with self._lock:
+            old = self._files.get(entry.file_name)
+            old_bytes = self._entry_bytes(old) if old is not None else 0
+            core_without_old = self.core_bytes(include_matrix=False) - old_bytes
+            new_core = core_without_old + self._entry_bytes(entry)
+            if budget_bytes and other_bytes + new_core > budget_bytes:
+                raise MemoryBudgetExceeded(other_bytes + new_core, budget_bytes)
+
+            self._files[entry.file_name] = entry
+            self._mat_cache = None
+            self._mat_index = []
+            self._mat_fp = None
+            self.last_matrix_seconds = 0.0
+
+            # 同名替换：先删旧词法文档，再登记新文档；不能只 add 留下旧代文本。
+            if lexical_token_budget and lexical_token_budget > 0:
+                self._lexical.max_tokens = lexical_token_budget
+            self._lexical.replace(entry.file_name, entry.chunks)
+            self._lexical.ensure_index()
+
+            if self.retrieve_use_matrix and np is not None:
+                vector_bytes = sum(
+                    int(e.vectors.nbytes) for e in self._files.values() if isinstance(e.vectors, np.ndarray)
+                )
+                core_no_matrix = self.core_bytes(include_matrix=False)
+                if not budget_bytes or other_bytes + core_no_matrix + vector_bytes <= budget_bytes:
+                    self._build_matrix()
+                    self._matrix_blocked = False
+                else:
+                    self._matrix_blocked = True
+                if budget_bytes and other_bytes + self.core_bytes() > budget_bytes:
+                    # 矩阵是加速副本，预算不足时退回逐条向量，不影响检索结果
+                    self._mat_cache = None
+                    self._mat_index = []
+                    self._mat_fp = None
+                    self._matrix_blocked = True
+
+            if budget_bytes and other_bytes + self.estimated_bytes() > budget_bytes:
+                self._lexical.disable("全局数据预算不足，已停用词法索引并退回纯向量")
 
     async def _embed(self, texts: List[str]) -> List[List[float]]:
         """调用注入的 embed_fn，兼容单条/批量两种返回结构。"""
@@ -255,10 +417,11 @@ class VectorStore:
         """重建 L2 归一化矩阵 + 索引表。仅 numpy 可用时生效。"""
         if np is None:
             return
+        started = time.perf_counter()
         rows: List[Any] = []
         index: List[tuple[str, int, str]] = []
         for fname, entry in self._files.items():
-            # v1.1.0：entry.vectors 可能是 ndarray——不能用 `not vec` 判空（歧义真值）
+            # entry.vectors 可能是 ndarray——不能用 `not vec` 判空（歧义真值）
             for i in range(len(entry.vectors)):
                 vec = entry.vectors[i]
                 if vec is None or len(vec) == 0:
@@ -269,17 +432,22 @@ class VectorStore:
             self._mat_cache = None
             self._mat_index = []
             self._mat_fp = self._matrix_fingerprint()
+            self.last_matrix_seconds = time.perf_counter() - started
             return
         mat = np.asarray(rows, dtype="float32")
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0  # 零向量归一化后仍为零，相似度 0
-        self._mat_cache = mat / norms
+        norms[norms == 0] = 1.0
+        mat /= norms  # 原地归一化：旧实现 mat / norms 会再复制一整份矩阵
+        self._mat_cache = mat
         self._mat_index = index
         self._mat_fp = self._matrix_fingerprint()
+        self.last_matrix_seconds = time.perf_counter() - started
 
     def _retrieve_matrix(self, query_vector: List[float], k: int) -> Optional[List[dict]]:
         """矩阵化检索：一次 matmul 算全库相似度。库为空或无 numpy 返回 None（回退逐条）。"""
         if np is None or not self._files:
+            return None
+        if self._matrix_blocked:
             return None
         fp = self._matrix_fingerprint()
         if self._mat_cache is None or fp != self._mat_fp:
@@ -309,32 +477,46 @@ class VectorStore:
         ]
 
     def retrieve(self, query_vector: List[float], top_k: Optional[int] = None) -> List[dict]:
-        """返回 Top-K 相关块：[{file_name, text, score, chunk_index}, ...]
-
-        v1.0.18 C5：retrieve_use_matrix 开启且 numpy 可用时走矩阵化路径
-        （L2 归一化矩阵缓存 + 点积一次算全库），失败自动回退逐条余弦。
-        """
+        """返回 Top-K 相关块：[{file_name, text, score, chunk_index}, ...]"""
         k = top_k or self.retrieve_top_k
-        if self.retrieve_use_matrix:
-            try:
-                results = self._retrieve_matrix(query_vector, k)
-                if results is not None:
-                    return results
-            except Exception:  # noqa: BLE001  矩阵路径异常一律回退逐条
-                pass
-        scored: List[dict] = []
-        for fname, entry in self._files.items():
-            for i, vec in enumerate(entry.vectors):
-                scored.append(
-                    {
-                        "file_name": fname,
-                        "text": entry.chunks[i],
-                        "score": _cosine(query_vector, vec),
-                        "chunk_index": i,
-                    }
-                )
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:k]
+        with self._lock:
+            if self.retrieve_use_matrix:
+                try:
+                    results = self._retrieve_matrix(query_vector, k)
+                    if results is not None:
+                        return results
+                except Exception:  # noqa: BLE001  矩阵路径异常一律回退逐条
+                    pass
+            scored: List[dict] = []
+            for fname, entry in self._files.items():
+                for i, vec in enumerate(entry.vectors):
+                    scored.append(
+                        {
+                            "file_name": fname,
+                            "text": entry.chunks[i],
+                            "score": _cosine(query_vector, vec),
+                            "chunk_index": i,
+                        }
+                    )
+            scored.sort(key=lambda x: x["score"], reverse=True)
+            return scored[:k]
+
+    def retrieve_both(
+        self,
+        query_vector: Optional[List[float]],
+        query: str,
+        k: int,
+        *,
+        use_lexical: bool = True,
+    ) -> tuple[List[dict], List[dict]]:
+        """在同一锁与同一索引代际下执行词法 + 向量检索（v1.6.0）。
+
+        插件在 `asyncio.to_thread` 中调用本方法；查询 embedding 的网络等待不在锁内。
+        """
+        with self._lock:
+            lexical_hits = self._lexical.search(query, k) if use_lexical else []
+            vector_hits = self.retrieve(query_vector, k) if query_vector is not None else []
+            return lexical_hits, vector_hits
 
     def cleanup_expired(
         self,
@@ -351,17 +533,21 @@ class VectorStore:
         """
         now = time.time()
         removed = []
-        for fname in list(self._files.keys()):
-            entry = self._files[fname]
-            expired_time = (now - entry.last_used) > retention_seconds
-            expired_rounds = entry.rounds >= max_rounds
-            expired_abs = bool(absolute_ttl_seconds) and (now - entry.upload_time) > absolute_ttl_seconds
-            if expired_time or expired_rounds or expired_abs:
-                del self._files[fname]
-                self._lexical.remove_file(fname)
-                removed.append(fname)
-        if removed:
-            self._mat_cache = None  # 置脏：下次检索重建矩阵
+        with self._lock:
+            for fname in list(self._files.keys()):
+                entry = self._files[fname]
+                expired_time = (now - entry.last_used) > retention_seconds
+                expired_rounds = entry.rounds >= max_rounds
+                expired_abs = bool(absolute_ttl_seconds) and (now - entry.upload_time) > absolute_ttl_seconds
+                if expired_time or expired_rounds or expired_abs:
+                    del self._files[fname]
+                    removed.append(fname)
+            if removed:
+                # v1.6.0：批量删除一次过滤，避免每个文件都复制一遍 _texts/_refs
+                self._lexical.remove_files(set(removed))
+                self._mat_cache = None  # 置脏：下次检索重建矩阵
+                self._mat_index = []
+                self._mat_fp = None
         return removed
 
     def increment_rounds(self, file_name: Optional[str] = None) -> None:
@@ -387,7 +573,8 @@ class VectorStore:
     def search_lexical(self, query: str, k: Optional[int] = None) -> List[dict]:
         """BM25 检索。索引停用/空库时返回 []（调用方据此降级）。"""
         try:
-            return self._lexical.search(query, k or self.retrieve_top_k)
+            with self._lock:
+                return self._lexical.search(query, k or self.retrieve_top_k)
         except Exception:  # noqa: BLE001  词法检索是增强路径，绝不能影响主流程
             return []
 
@@ -396,10 +583,32 @@ class VectorStore:
         """词法索引状态（供 /file_status 诊断）。"""
         return {
             "tokens": self._lexical.token_count,
+            "postings": self._lexical.posting_count,
             "docs": self._lexical.doc_count,
             "disabled": self._lexical.disabled,
             "reason": self._lexical.disable_reason,
+            "ready": self._lexical.ready,
+            "build_ms": int(self._lexical.last_build_seconds * 1000),
         }
+
+    def diagnostics(self) -> dict:
+        """容量诊断快照（不遍历字符串内容）。"""
+        with self._lock:
+            chunks = sum(len(e.chunks) for e in self._files.values())
+            vectors = 0
+            for entry in self._files.values():
+                if np is not None and isinstance(entry.vectors, np.ndarray):
+                    vectors += int(entry.vectors.nbytes)
+            matrix = int(self._mat_cache.nbytes) if np is not None and isinstance(self._mat_cache, np.ndarray) else 0
+            return {
+                "files": len(self._files),
+                "chunks": chunks,
+                "core_bytes": self.core_bytes(),
+                "vector_bytes": vectors,
+                "matrix_bytes": matrix,
+                "matrix_ms": int(self.last_matrix_seconds * 1000),
+                "lexical": self.lexical_state,
+            }
 
 
 class SessionStore:
@@ -424,6 +633,7 @@ class SessionStore:
         chunk_merge: bool = True,
         retrieve_use_matrix: bool = False,
         lexical_max_tokens: int = 0,
+        lexical_max_postings: int = 0,
     ) -> VectorStore:
         k = self.key(session_id, conversation_id)
         if k not in self._sessions:
@@ -435,8 +645,26 @@ class SessionStore:
                 chunk_merge=chunk_merge,
                 retrieve_use_matrix=retrieve_use_matrix,
                 lexical_max_tokens=lexical_max_tokens,
+                lexical_max_postings=lexical_max_postings,
             )
         return self._sessions[k]
+
+    def total_estimated_bytes(self, exclude: Optional[tuple[str, str]] = None) -> int:
+        """全部（或排除某会话后的）近似数据占用，用于全局预算。"""
+        return sum(vs.estimated_bytes() for key, vs in self._sessions.items() if key != exclude)
+
+    def total_lexical_tokens(self, exclude: Optional[tuple[str, str]] = None) -> int:
+        """全局 BM25 token 数（可排除即将写入的会话）。"""
+        return sum(vs.lexical_state["tokens"] for key, vs in self._sessions.items() if key != exclude)
+
+    def diagnostics(self) -> dict:
+        stores = [(key, vs.diagnostics()) for key, vs in self._sessions.items()]
+        return {
+            "sessions": len(stores),
+            "files": sum(d["files"] for _, d in stores),
+            "chunks": sum(d["chunks"] for _, d in stores),
+            "estimated_bytes": sum(vs.estimated_bytes() for vs in self._sessions.values()),
+        }
 
     def get(self, session_id: str, conversation_id: str) -> Optional[VectorStore]:
         return self._sessions.get(self.key(session_id, conversation_id))

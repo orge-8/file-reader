@@ -156,7 +156,7 @@ def test_concurrent_files_keep_count_until_last_one():
                 plugin._handle_file("k", "k", "k", {"name": "a.txt", "bytes": b"abc"})
             )
             t2 = asyncio.create_task(
-                plugin._handle_file("k", "k", "k", {"name": "b.txt", "bytes": b"abc"})
+                plugin._handle_file("k", "k", "k", {"name": "b.txt", "bytes": b"abd"})
             )
             await asyncio.sleep(0.15)
             # 计数而非集合：两个文件同时处理，计数必须是 2

@@ -38,8 +38,25 @@ MaiBot 插件：解析 QQ 群/私聊上传的文件，分块后做「向量 + BM
 另外新增一条**可归因的耗时日志**（真机排障地基），入库后直接打出每段耗时：
 
 ```
-文件处理耗时 奶蛙学 必修第一册.pdf：取字节=1.83s 解析=1.12s 分块=0.01s embedding=28.4s 词法索引=0.42s 合计=31.8s（81 块 / 18.4MB）
+文件处理耗时 奶蛙学 必修第一册.pdf：取字节=1.83s 解析=1.12s 分块=0.01s embedding=28.4s 词法索引=0.42s（词法构建=0.35s 矩阵=0.07s） 合计=31.8s（81 块 / 18.4MB）
 ```
+
+### 内存与首次查询（v1.6.0）
+
+v1.6.0 面向 4GB 真机，按「峰值 + 稳态 + 故障重试」三条链路治理：
+
+| 项 | 手段 | 行为变化 |
+|---|---|---|
+| 原始字节同时驻留 | bytes/路径/URL/NapCat 统一限长流式落临时文件，哈希在落盘时同步计算 | 解析前释放 `fdata["bytes"]`，不再保留整份文件副本 |
+| 首次提问卡顿 | BM25 与向量矩阵入库预建；查询 CPU 在 worker 线程、同一会话锁下执行 | 首次查询不阻塞 main loop；索引只构建一次 |
+| 多文件峰值叠加 | 默认只激活 1 个文件处理，队列最多 3 个；全局数据预算 192MB | 队列满或预算不足时**拒绝新文件并保留旧文件** |
+| 长期驻留 | 同名 BM25 替换、批量清理、通知/摘要任务/全文缓存回收 | 同名覆盖不再残留旧文本，历史会话键不再增长 |
+| 故障重试重复解析 | embedding 失败保存 chunks 磁盘重试包，重试只做 embedding | 30 次重试中解析次数与 Omni 调用次数均为 1 |
+| 解压/解析放大 | GZ 实际解压上限、ZIP 实际读取成员累计上限、非 PDF 文本上限 | 超限明确拒绝；PDF 仍按页数截断并提示 |
+
+BM25 postings 采用 `array('I')` 扁平结构，并在构建中逐块检查 token/posting 上限，超限立即停止并退回纯向量；不会再出现“完整建完几十万 posting 才发现超限”的峰值。`/file_status` 会显示插件 PID、数据占用估算、队列拒绝次数、重试包磁盘量以及词法 tokens/postings。
+
+> 存量实例注意：`config.toml` 只在缺失时初始化，已有字段不会被新默认值覆盖。新增容量字段需按 README 配置表手动补齐；活跃/队列槽位修改后需完整重启。默认 `max_file_size` 对**新实例**为 20MB，老实例保留原值。
 
 ## 安装
 
@@ -129,7 +146,13 @@ pip install pandas openpyxl  # 仅 .xls / .ods 老表格格式（xlsx/csv 已零
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | plugin.enabled | bool | true | 是否启用插件 |
-| reader.max_file_size | int | 30 | 单文件大小上限（MB）。内存占用约为文件大小的 2~3 倍（字节+解析文本+向量同时驻留），v1.1.0 起下载在开始前/下载中超限即中断，不再全量拉进内存 |
+| reader.max_file_size | int | **20**（v1.6.0，旧版 30） | 单文件大小上限（MB）。v1.6.0 起原始文件直接限长流式落临时文件，不再常驻 bytes；存量实例保留旧值 |
+| reader.active_file_limit | int | 1 | 同时激活的文件处理数（v1.6.0）。4GB 真机建议保持 1；修改后需完整重启 |
+| reader.pending_file_limit | int | 3 | 文件处理队列总上限（含活跃任务）。队列满时拒绝新文件并保留已有文件；修改后需完整重启 |
+| reader.data_budget_mb | int | 192 | 全部会话的近似数据预算：chunks + 向量 + 矩阵 + BM25。超限拒绝新文件，不淘汰旧文件；0 = 不限制。不包含 MaiBot/Python 基础运行内存 |
+| reader.retry_disk_budget_mb | int | 128 | embedding 失败重试包与临时文件总磁盘上限；超限拒绝新重试并提示重发；0 = 不限制 |
+| reader.max_uncompressed_mb | int | 20 | GZ 解压后与 ZIP 实际读取成员的累计上限；超限明确拒绝，防压缩炸弹 |
+| reader.parsed_text_max_chars | int | 2000000 | 非 PDF 文档解析文本上限（字符数），超限明确拒绝；PDF 仍按页数截断；0 = 不限制 |
 | reader.chunk_size | int | **1024**（v1.4.0，旧版 512） | 分块大小（字符数）。块数直接决定 embedding 批次数：52 万字日志实测 1351 块/22 批 → 591 块/10 批。检索粒度变粗由 BM25 词法检索兜底 |
 | reader.chunk_overlap | int | **128**（v1.4.0，旧版 100） | 分块重叠（字符数），随 chunk_size 同比放大（约 12%） |
 | reader.pdf_max_pages | int | 500 | PDF 最多解析页数（v1.4.0）：超过即截断，并在日志与回执中提示「共 N 页、只读前 M 页」；0 = 不限制 |
@@ -166,7 +189,9 @@ pip install pandas openpyxl  # 仅 .xls / .ods 老表格格式（xlsx/csv 已零
 | reader.hybrid_retrieve_enabled | bool | true | BM25 词法检索总开关（v1.3.0）。开启后检索走「向量 + 词法 RRF 融合」，对函数名/报错码/编号这类字面查询显著更准；体感变差可关闭退回纯向量，**或直接用 `/file_bm25 off`** |
 | reader.hybrid_candidate_k | int | 20 | 每路（向量/词法）参与融合的候选数 |
 | reader.rrf_k | int | 60 | RRF 融合常数（越大排名差异越平缓） |
-| reader.lexical_max_tokens | int | 2000000 | 单会话词法索引 token 上限：超过即停用该会话的词法检索并退回纯向量（防大文件会话内存膨胀），原因在 `/file_status` 可见；0 = 不限制 |
+| reader.lexical_max_tokens | int | 2000000 | 单会话词法索引 token 软上限（旧字段，保留兼容）；实际生效值还会受全局额度约束 |
+| reader.lexical_max_postings | int | 200000 | 单会话 posting 上限（v1.6.0）：超限停用该会话 BM25 并退回纯向量。postings 是索引内存主项，200k 为 4GB 真机保守起点 |
+| reader.lexical_global_max_tokens | int | 400000 | 全部会话 BM25 token 总上限（v1.6.0）：新文件只使用剩余额度；超限仅降级词法，不拒绝文件 |
 | reader.retrieve_min_score | float | 0.15 | 向量相关度绝对下限：余弦低于此值的候选在融合前丢弃。只作用于**有向量分**的候选，纯词法命中不受影响；0 = 关闭 |
 | reader.retrieve_min_ratio | float | 0.5 | 融合后相对下限：低于 Top1 分数该比例的结果丢弃；0 = 关闭 |
 | reader.query_rewrite_enabled | bool | true | 追问改写（v1.3.0）：短问/指代问自动拼上上一问再检索；纯规则，不调 LLM |
@@ -275,13 +300,13 @@ python tools/check_plugin.py plugins/file-reader
 # 冒烟测试（FakeHost 完整生命周期，12 项：组件清单 / manifest 一致性 / SSRF 守卫 / 卸载收尾 / 音频通道）
 python plugins/file-reader/tests/smoke_test.py
 
-# pytest（242 项：下载安全守卫 + 分块 / 词法 / 注入 / 格式解析 / v1.4.0 提速专项 / 音频 22 项（v1.5.0 通道 17 + v1.5.1 公告语义 5），门禁里的 pytest 步骤跑的就是它）
+# pytest（262 项：下载安全守卫 + 分块 / 词法 / 注入 / 格式解析 / 提速专项 / 音频 / v1.6.0 容量与重试包，门禁里的 pytest 步骤跑的就是它）
 python -m pytest -q plugins/file-reader/tests
 
 # 宿主级加载探针（官方 MaiBot 源码 PluginLoader，严格版本区间 + SDK 契约 + 组件数）
 python plugins/file-reader/tests/host_load_probe.py <MaiBot 源码根目录>
 
-# 功能自测（解析→分块→向量化→检索→清理 + hook 直调，75 项，用伪 embedding 不依赖真模型）
+# 功能自测（解析→分块→向量化→检索→清理 + hook 直调，全量，用伪 embedding 不依赖真模型）
 python plugins/file-reader/test_file_reader.py
 ```
 
@@ -310,7 +335,10 @@ python plugins/file-reader/test_file_reader.py
 - **`.rtf` 为什么被移出支持列表**（v1.3.0）：旧版按纯文本读，解析出来全是 `\rtf1\ansi` 控制字——既占 token 又毫无信息。现在直接提示另存为 docx/txt。
 - **`.odt` / `.ods` / `.odp` 现在能读了**（v1.3.0）：旧版分别走纯文本 / pandas / pptx 解析器（后者结构完全不同，必然失败）。现在用 `zipfile` + `ElementTree` 直接解 `content.xml`，零依赖。
 - **检索感觉不如以前**（v1.3.0 混合检索）：先试 `/file_bm25 off` 退回纯向量——立刻生效、不用重启、不用改配置。确认是配置问题再动 `reader.hybrid_retrieve_enabled`。想调松紧用 `retrieve_min_score`（绝对下限）/ `retrieve_min_ratio`（相对 Top1）。
-- **升级后 `/file_status` 里看不到新配置项**：宿主的 `config.toml` 只在文件**不存在**时生成，之后只会补新增字段、**已存在字段的值一律保留**。所以 `file_max_rounds` 若想用新的 20，需要手动改 `config.toml` 或删掉它重新生成（删前记得抄下 `admin_ids` 之类的现值）。
+- **升级后 `/file_status` 里看不到新配置项**：宿主的 `config.toml` 只在文件**不存在**时生成，之后只会补新增字段、**已存在字段的值一律保留**。所以 `file_max_rounds` 若想用新的 20，需要手动改 `config.toml` 或删掉它重新生成（删前记得抄下 `admin_ids` 之类的现值）。v1.6.0 新增的容量/预算字段同样需要手动补齐，活跃/队列槽位修改后要完整重启。
+- **文件被拒「当前处理队列已满」**（v1.6.0）：默认只激活 1 个、队列最多 3 个文件；等前序完成后重发即可。不要盲目调大 `active_file_limit`，4GB 机器上会线性放大峰值。
+- **文件被拒「数据预算不足」**（v1.6.0）：`/file_status` 查看数据占用估算与预算。先 `/clear_file` 释放当前会话，或按机器内存调整 `data_budget_mb`；系统**不会**为接收新文件而静默淘汰旧文件。
+- **文件被拒「解析文本/解压后超过上限」**（v1.6.0）：GZ/ZIP 与非 PDF 文本有硬上限，PDF 仍按页数截断。拆分文件或按需调高 `max_uncompressed_mb` / `parsed_text_max_chars`。
 - **文件聊着聊着就没了**：v1.3.0 起有效期按「最后一次被注入」滑计算，并新增绝对上限 `file_absolute_ttl`（默认 720 分钟）。若确实需要更久，调大这两项；`file_max_rounds` 也要一起看（默认 20 轮，只给实际被问到的文件计轮）。
 - **音频文件收到「需要音频理解模型…未配置 API Key」**（v1.5.0）：按「音频文件」章节开通百炼并把 Key 填进 `[audio].api_key`，配置后重发即可。
 - **音频被拒「时长/大小超过上限」**（v1.5.0）：这是刻意的 fail-closed 设计（不截断偷发）。剪辑或压码率后重发；确认模型支持更长音频时可调 `max_duration_seconds`（base64 10MB 硬上限不可放宽）。

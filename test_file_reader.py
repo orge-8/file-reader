@@ -692,8 +692,9 @@ async def _test_plugin_hooks() -> None:
     )
     sent_before2 = len(runner.host.sent_messages)
     plugin.config.reader.silent_success = False  # 先开回执验证重试成功有反馈
-    # v1.1.0：队列条目存临时文件路径而非全文，重试前需重新读取解析
-    retry_text = read_any_file_to_text(item["tmp_path"], item["name"])
+    # v1.6.0：队列条目存分块重试包，重试无需重新解析原文件
+    retry_bundle = plugin._read_retry_bundle(item["bundle_path"])
+    retry_text = "".join(str(c) for c in retry_bundle["chunks"])
     entry = await vs_retry.add_file(item["name"], retry_text)
     assert len(entry.chunks) > 0, "恢复 embedding 后应能正常入库"
     assert ("retry-session", "retry-session") in plugin._store._sessions
@@ -721,9 +722,9 @@ async def _test_plugin_hooks() -> None:
     await asyncio.sleep(0.3)
     same_name_items = [i for i in plugin._embed_retry_queue if i["name"] == "同名文档.txt"]
     assert len(same_name_items) == 1, f"同名文件应只保留一条队列记录: {len(same_name_items)}"
-    # v1.1.0：条目存 tmp_path，二次入队应指向新临时文件（旧的已被覆盖删除）
-    assert same_name_items[0]["tmp_path"] and os.path.exists(same_name_items[0]["tmp_path"]), (
-        "覆盖入队后应持有有效临时文件"
+    # v1.6.0：条目存分块重试包，二次入队应指向新包（旧包已被覆盖删除）
+    assert same_name_items[0]["bundle_path"] and os.path.exists(same_name_items[0]["bundle_path"]), (
+        "覆盖入队后应持有有效重试包"
     )
     print("[PASS] 同名文件重复入队覆盖（不重复排队）")
     plugin._embed_retry_queue = []
@@ -1398,7 +1399,7 @@ async def _test_plugin_hooks() -> None:
     )
     await asyncio.sleep(0.3)
     assert len(asum_gen_calls) == 1, f"失败应恰好调用一次: {len(asum_gen_calls)}"
-    assert "异步文档.txt" in plugin._summary_failed_ts, "失败应记录冷却时间戳"
+    assert any("异步文档.txt" in k for k in plugin._summary_failed_ts), "失败应记录冷却时间戳"
     # 冷却期内再触发注入 → 不再调用 generate
     # 注意：step1 检索成功会写注入 memo（TTL 90s），不清掉的话 step2/step3 会被
     # memo 直接挡住（走不到 _ensure_summary），测的就不是冷却逻辑了

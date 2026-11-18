@@ -57,6 +57,50 @@ except Exception:  # noqa: BLE001  pragma: no cover
 # 加参数会破坏扩展名分派表；插件侧用 set_pdf_max_pages() 同步。
 _PDF_MAX_PAGES = 500
 
+# v1.6.0：解压/解析输出硬预算。GZ 与 ZIP 的实际读取成员共用一个累计上限；
+# 非 PDF 文本在统一入口检查字符数。PDF 继续使用页数截断语义。
+_MAX_UNCOMPRESSED_BYTES = 20 * 1024 * 1024
+_MAX_TEXT_CHARS = 2_000_000
+
+
+def set_parse_limits(*, max_uncompressed_mb: int = 20, max_text_chars: int = 2_000_000) -> None:
+    """由插件加载/热重载时注入解析预算（0 = 关闭对应预算）。"""
+    global _MAX_UNCOMPRESSED_BYTES, _MAX_TEXT_CHARS
+    _MAX_UNCOMPRESSED_BYTES = max(0, int(max_uncompressed_mb or 0)) * 1024 * 1024
+    _MAX_TEXT_CHARS = max(0, int(max_text_chars or 0))
+
+
+def get_parse_limits() -> tuple[int, int]:
+    """返回 (解压字节上限, 非 PDF 文本字符上限)，0 表示不限制。"""
+    return _MAX_UNCOMPRESSED_BYTES, _MAX_TEXT_CHARS
+
+
+class _ZipBudget:
+    """ZIP 实际读取成员的累计预算；只统计被读取的正文/XML，不计图片等媒体。"""
+
+    def __init__(self, label: str = "ZIP") -> None:
+        self.label = label
+        self.used = 0
+        self.limit = _MAX_UNCOMPRESSED_BYTES
+
+    def read(self, zf, name: str) -> bytes:
+        info = zf.getinfo(name)
+        declared = int(getattr(info, "file_size", 0) or 0)
+        if self.limit and declared > self.limit:
+            raise RuntimeError(
+                f"{self.label} 成员 {name} 解压后约 {declared / 1024 / 1024:.1f}MB，"
+                f"超过上限 {self.limit / 1024 / 1024:.0f}MB（reader.max_uncompressed_mb）"
+            )
+        data = zf.read(name)
+        if self.limit and self.used + len(data) > self.limit:
+            raise RuntimeError(
+                f"{self.label} 实际读取成员累计 {self.used + len(data)} 字节，"
+                f"超过上限 {self.limit} 字节（reader.max_uncompressed_mb）"
+            )
+        self.used += len(data)
+        return data
+
+
 # 解析提示（v1.4.0）：解析器需要回话给调用方的内容（如"PDF 已截取前 N 页"）。
 # 用 ContextVar 而不是返回值：`asyncio.to_thread` 会复制当前上下文，
 # 所以事件循环里 with 住的列表在工作线程里同样可见，且并发文件互不串台。
@@ -142,13 +186,14 @@ def _docx_from_zip(path: str) -> str:
     out: list[str] = []
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
+        budget = _ZipBudget("DOCX")
         parts = [n for n in names if n == "word/document.xml"]
         # 页眉页脚作为补充内容
         parts += sorted(n for n in names if n.startswith("word/header") or n.startswith("word/footer"))
         if not parts:
             raise RuntimeError("找不到 word/document.xml，可能不是有效的 docx")
         for name in parts:
-            root = _parse_xml(zf.read(name))
+            root = _parse_xml(budget.read(zf, name))
             for para in root.iter(w + "p"):
                 buf: list[str] = []
                 for node in para.iter():
@@ -189,16 +234,17 @@ def _xlsx_from_zip(path: str) -> str:
     s = f"{{{_NS_S}}}"
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
+        budget = _ZipBudget("XLSX")
 
         shared: list[str] = []
         if "xl/sharedStrings.xml" in names:
-            root = _parse_xml(zf.read("xl/sharedStrings.xml"))
+            root = _parse_xml(budget.read(zf, "xl/sharedStrings.xml"))
             for si in root.iter(s + "si"):
                 shared.append("".join(t.text or "" for t in si.iter(s + "t")))
 
         sheet_titles: list[str] = []
         if "xl/workbook.xml" in names:
-            wb = _parse_xml(zf.read("xl/workbook.xml"))
+            wb = _parse_xml(budget.read(zf, "xl/workbook.xml"))
             sheet_titles = [str(sh.get("name") or "") for sh in wb.iter(s + "sheet")]
 
         sheets = sorted(
@@ -210,7 +256,7 @@ def _xlsx_from_zip(path: str) -> str:
 
         blocks: list[str] = []
         for i, sheet in enumerate(sheets):
-            root = _parse_xml(zf.read(sheet))
+            root = _parse_xml(budget.read(zf, sheet))
             rows: list[str] = []
             for row in root.iter(s + "row"):
                 cells: list[tuple[int, str]] = []
@@ -250,8 +296,9 @@ def _pptx_from_zip(path: str) -> str:
         if not slides:
             raise RuntimeError("找不到幻灯片，可能不是有效的 pptx")
         out: list[str] = []
+        budget = _ZipBudget("PPTX")
         for i, name in enumerate(slides, 1):
-            root = _parse_xml(zf.read(name))
+            root = _parse_xml(budget.read(zf, name))
             texts: list[str] = []
             for para in root.iter(a + "p"):
                 line = "".join(t.text or "" for t in para.iter(a + "t")).strip()
@@ -374,7 +421,8 @@ def _odf_from_zip(path: str, kind: str) -> str:
         names = zf.namelist()
         if "content.xml" not in names:
             raise RuntimeError("找不到 content.xml，可能不是有效的 ODF 文件")
-        root = _parse_xml(zf.read("content.xml"))
+        budget = _ZipBudget("ODF")
+        root = _parse_xml(budget.read(zf, "content.xml"))
 
     if kind == "ods":
         blocks: list[str] = []
@@ -498,9 +546,10 @@ def _read_epub(path: str) -> str:
 
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
+        budget = _ZipBudget("EPUB")
         opf_path = None
         if "META-INF/container.xml" in names:
-            root = _parse_xml(zf.read("META-INF/container.xml"))
+            root = _parse_xml(budget.read(zf, "META-INF/container.xml"))
             for node in root.iter():
                 if str(node.tag).endswith("rootfile"):
                     opf_path = node.get("full-path")
@@ -510,7 +559,8 @@ def _read_epub(path: str) -> str:
         if not opf_path:
             raise RuntimeError("找不到 OPF 描述文件，可能不是有效的 epub")
 
-        opf_root = _parse_xml(zf.read(opf_path))
+        opf_root = _parse_xml(budget.read(zf, opf_path))
+
         base = opf_path.rsplit("/", 1)[0] + "/" if "/" in opf_path else ""
 
         manifest: dict[str, tuple[str, str]] = {}
@@ -538,7 +588,7 @@ def _read_epub(path: str) -> str:
                 if not target:
                     continue
             try:
-                text = _html_to_text(zf.read(target).decode("utf-8", errors="replace"))
+                text = _html_to_text(budget.read(zf, target).decode("utf-8", errors="replace"))
             except Exception:  # noqa: BLE001
                 continue
             if text.strip():
@@ -616,19 +666,29 @@ def _read_eml(path: str) -> str:
 
 
 def _read_gz(path: str) -> str:
-    """gz：解压到临时文件，按内层扩展名递归解析（防 zip/gz bomb：解压后仍受 max_file_size 约束）。"""
+    """gz：解压到临时文件，按内层扩展名递归解析（v1.6.0 实测累计解压上限）。"""
     import gzip
-    import shutil
     import tempfile
 
     inner = Path(path).name
     if inner.lower().endswith(".gz"):
         inner = inner[:-3]
     fd, tmp_path = tempfile.mkstemp(suffix=Path(inner).suffix or "")
+    written = 0
     try:
         with os.fdopen(fd, "wb") as out_f:
             with gzip.open(path, "rb") as src:
-                shutil.copyfileobj(src, out_f, length=1024 * 256)
+                while True:
+                    chunk = src.read(1024 * 256)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if _MAX_UNCOMPRESSED_BYTES and written > _MAX_UNCOMPRESSED_BYTES:
+                        raise RuntimeError(
+                            f"gzip 解压后超过 {_MAX_UNCOMPRESSED_BYTES / 1024 / 1024:.0f}MB "
+                            "上限（reader.max_uncompressed_mb），已拒绝以防止压缩炸弹"
+                        )
+                    out_f.write(chunk)
         return read_any_file_to_text(tmp_path, inner)
     except OSError as e:
         raise RuntimeError(f"gzip 解压失败：{e}") from e
@@ -702,7 +762,11 @@ def detect_format(path: str) -> tuple[str, str]:
             with zipfile.ZipFile(path) as zf:
                 names = zf.namelist()
                 if "mimetype" in names:
-                    mime = zf.read("mimetype").decode("ascii", errors="ignore").strip()
+                    info = zf.getinfo("mimetype")
+                    if int(getattr(info, "file_size", 0) or 0) <= 1024:
+                        mime = zf.read("mimetype").decode("ascii", errors="ignore").strip()
+                    else:
+                        mime = ""
                     mapping = {
                         "application/epub+zip": "epub",
                         "application/vnd.oasis.opendocument.text": "odt",
@@ -998,7 +1062,14 @@ def read_any_file_to_text(file_path: str, file_name: str = "") -> str:
     if handler is None:
         raise ValueError(f"不支持的文件类型: .{ext or '(无扩展名)'}")
 
-    return handler(str(path))
+    text = handler(str(path))
+    # v1.6.0：PDF 继续按页数截断；其余格式超预算明确拒绝，避免“读了一半却当全文”。
+    if ext != "pdf" and _MAX_TEXT_CHARS and len(text) > _MAX_TEXT_CHARS:
+        raise RuntimeError(
+            f"解析文本 {len(text)} 字符，超过上限 {_MAX_TEXT_CHARS} 字符"
+            "（reader.parsed_text_max_chars）；请拆分文件或调高该上限"
+        )
+    return text
 
 
 def describe_supported_types() -> str:
