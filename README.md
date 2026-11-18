@@ -197,18 +197,43 @@ pip install pandas openpyxl  # 仅 .xls / .ods 老表格格式（xlsx/csv 已零
 | reader.query_rewrite_enabled | bool | true | 追问改写（v1.3.0）：短问/指代问自动拼上上一问再检索；纯规则，不调 LLM |
 | reader.ack_min_chars | int | 0 | 入库回执阈值（原文字符数），**默认 0 = 不发**：仅在超大文件确实需要露头时 >0，达到该值（或处理耗时 ≥ 30s）会额外发一条「已读取《X》，共 N 段」。⚠️ 这条是插件直发的独立消息，会与人格化回复并列出现 |
 | reader.parse_notice_ttl | int | 600 | 解析失败通知的存活秒数（v1.3.0）：失败原因注入给模型（不发群消息），TTL 内只注入一次 |
-| **napcat.enabled** | bool | false | **启用 NapCat HTTP 兜底取文件**（见下，QQ 发文件必须开） |
+| **snowluma.enabled** | bool | **true**（v1.7.0） | **适配器取文件通道**：经插件 RPC 调当前适配器（SnowLuma）的 public API 把 file_id 换成短期下载 URL，再走本插件的 SSRF 防护下载。**无需 NapCat OneBot HTTP 服务**；失败自动回退 NapCat 兜底（若启用） |
+| snowluma.private_file_url_api | str | adapter.napcat.file.get_private_file_url | 私聊文件 URL API 名（SnowLuma 复用 adapter.napcat.* 命名空间；一般不用改） |
+| snowluma.group_file_url_api | str | adapter.napcat.file.get_group_file_url | 群文件 URL API 名 |
+| napcat.enabled | bool | false | NapCat HTTP 兜底取文件（v1.7.0 起为**第二道兜底**，首选通道是 snowluma；仅当适配器通道不可用且你开了 OneBot HTTP 服务时才需要） |
 | napcat.http_url | str | http://127.0.0.1:3001 | NapCat OneBot HTTP 服务地址 |
 | napcat.access_token | str | 空 | NapCat HTTP 的 access_token（未设置则留空） |
 | napcat.timeout | float | 15 | HTTP 请求超时（秒） |
 | napcat.verify_ssl | bool | **true**（v1.2.1 起） | HTTPS 时校验证书与主机名。默认从 false 翻转为 true：配 https 地址时关闭它等于允许中间人窃听/篡改（含 access_token）。**存量实例的 config.toml 不会自动跟随新默认值**——若你此前配了 https 地址且没动过这项，请手动改回 true 或删掉 config.toml 重新生成；本地 http 地址不受影响 |
 | napcat.cache_dir | str | 空 | 可选：NapCat 文件缓存目录，`get_file` 失败时按文件名+大小在此搜索 |
 
-### NapCat 兜底（重要）
+### 适配器取文件（v1.7.0，首选通道）
 
-真机实测（napcat-adapter）：适配器会把文件消息降级成纯文本 `[文件] 文章.docx，大小: 9547`，
-**连 `chat.receive.before_process`（`SessionMessage.process()` 之前）拿到的也已经是 text 段**，
-hook 层无论如何都拿不到文件本体。因此文件读取必须走 NapCat HTTP API 回溯：
+官方 napcat-adapter 已合并进 **snowluma-adapter**（Host 1.3.0 起）。结构化 file 段只有
+`{name, size, file_id, busid}`，不含文件本体。v1.7.0 的取文件顺序：
+
+```
+结构化 file 段（file_id）
+  → ① ctx.api.call 适配器 public API 换短期下载 URL
+       私聊 get_private_file_url(file_id, user_id)
+       群聊 get_group_file_url(file_id, group_id[, busid])   ← busid=0 省略
+  → ② 本插件 SSRF 防护下载（白名单 + DNS 钉定 + 逐跳重定向校验）落临时文件
+  → ③ 失败时回退 NapCat HTTP 兜底（napcat.enabled=true 才走）
+```
+
+- **默认开箱即用**：`snowluma.enabled=true`，不需要 NapCat OneBot HTTP 服务（127.0.0.1:3001）。
+  前提只有两个：宿主已加载 SnowLuma 适配器、manifest 声明了 `api.call`（本版已声明）。
+- 下载 URL 提取优先 `data.url`（OneBot 标准形态），多 URL 响应不会拿错预览链接。
+- 超大文件（段内 size > `reader.max_file_size`）**零 RPC 直接拒绝**，不浪费一轮解析。
+- 日志关键字：`[snowluma] 文件下载 URL 解析成功` / `[snowluma] ... 调用失败` /
+  `[snowluma] 下载失败（...），回退 NapCat 兜底`；加载时打 `适配器取文件(SnowLuma): 启用`。
+- 失败回执精确化：file_id 链路失败报「适配器只提供了 file_id，经适配器解析下载地址后仍未取回
+  文件内容」（reason=`no_content_file_id`），不再误报「NapCat 未返回文件内容」。
+
+### NapCat 兜底（第二道，可选）
+
+旧版适配器（≤ SnowLuma v1.1.9）会把文件消息降级成纯文本 `[文件] 文章.docx，大小: 9547`，
+hook 层拿不到文件本体；或首选通道解析/下载失败时，可启用 NapCat HTTP API 回溯：
 
 1. 在 NapCat 里启用 OneBot **HTTP 服务端**（默认 `http://127.0.0.1:3001`），记下 access_token。
 2. 插件配置里把 `napcat.enabled` 设为 `true`，填 `http_url` 与 `access_token`。
@@ -269,7 +294,7 @@ Omni 按音频时长计费（百炼 qwen3-omni-flash 约 12.5 token/秒音频输
 - 演示：`pptx` `odp`
 - 网页/笔记本：`html` `htm`（去标签，跳过 script/style）`ipynb`（取 cells，跳过 outputs）
 - 压缩：`gz`（解压后按内层扩展名递归解析）
-- 代码：`py` `java` `cpp` `c` `h` `hpp` `cs` `js` `ts` `php` `rb` `go` `rs` `swift` `kt` `scala` `sh` `bash` `ps1` `bat` `cmd`
+- 代码：`py` `java` `cpp` `c` `h` `hpp` `cs` `js` `ts` `css` `scss` `less`（v1.7.0）`php` `rb` `go` `rs` `swift` `kt` `scala` `sh` `bash` `ps1` `bat` `cmd`
 - 标记：`md` `markdown` `xml` `json` `yaml` `yml`
 - 配置：`ini` `cfg` `conf` `properties` `env` `toml`
 - 其他：`sql` `txt` `log` `lock` `gitignore` `url` `webloc` `srt` `vtt` `ass` `tex` `rst` `bib`
@@ -318,15 +343,16 @@ python plugins/file-reader/test_file_reader.py
 
 ## 故障排查
 
-排查顺序：`/file_status`（库规模/嵌入模型/配置/检索诊断）→ 插件日志（`[自检]` / `[下载拒绝]` / `[napcat]` / `文件处理耗时` 开头）→ 下方常见问题对照。音频问题先看 `[自检] 音频通道` 与 `音频预检通过` 日志行。
+排查顺序：`/file_status`（库规模/嵌入模型/配置/检索诊断）→ 插件日志（`[自检]` / `[下载拒绝]` / `[snowluma]` / `[napcat]` / `文件处理耗时` 开头）→ 下方常见问题对照。音频问题先看 `[自检] 音频通道` 与 `音频预检通过` 日志行。
 
 ## 常见问题
 
 - **插件未加载**：检查 `_manifest.json` 是否合法、`numpy` 是否安装、三个生命周期方法是否齐全。
 - **embedding 不可用**：`/file_status` 查看；需在 MaiBot 配置里启用一个支持 embedding 的模型（`llm.embed` 能力）。
 - **某类文件解析失败**：docx/xlsx/pptx/txt/代码已零依赖；PDF 需 `pdfminer.six`（**已由 manifest 声明**，插件管理器会装；若手装环境请 `pip install pdfminer.six`）；xls/ods 需 `pandas openpyxl`（建议转存 xlsx/csv），按需安装。
-- **发出文件后回执「适配器把文件降级成了纯文本」**：说明 `napcat.enabled` 未开——按上方「NapCat 兜底」章节配置 HTTP 与 token。
-- **回执「NapCat 未返回文件内容」**：看日志里 `[napcat]` 开头的行；常见原因是 HTTP 服务未启用、token 错、`message_id` 对不上（可在 `/file_status` 里看「最近文件消息」的 mid），此时可配 `napcat.cache_dir` 走目录兜底。
+- **回执「适配器只提供了 file_id，经适配器解析下载地址后仍未取回文件内容」**（v1.7.0）：首选通道与可选兜底都没取到字节。看日志 `[snowluma]` 行定位：`调用失败` = 适配器 RPC 异常（检查适配器是否在线、`api.call` 能力是否被宿主授权）；`未返回下载 URL` = 适配器动作失败（file_id 过期、user_id/group_id 对不上）；`下载失败` = URL 拿到了但下载被拒/超时（对照下一条白名单问题）。仍读不到时可临时启用 `napcat.enabled` 走 HTTP 兜底。
+- **发出文件后回执「适配器把文件降级成了纯文本」**：旧版文本降级形态且 `napcat.enabled` 未开——按上方「NapCat 兜底」章节配置 HTTP 与 token（v1.7.0 的结构化 file 段走首选通道，不需要它）。
+- **回执「文件回溯未返回内容」**：看日志里 `[napcat]` 开头的行；常见原因是 HTTP 服务未启用、token 错、`message_id` 对不上（可在 `/file_status` 里看「最近文件消息」的 mid），此时可配 `napcat.cache_dir` 走目录兜底。
 - **下载报 CERTIFICATE_VERIFY_FAILED**：运行环境存在 TLS MITM 代理（如安全软件的 proxy-root-ca.cer）时，文件下载 URL 的证书链校验会失败。**首选**把代理根证书路径填进 `reader.download_ca_bundle`（校验保持开启）；仅在内网可控环境下才考虑 `reader.insecure_download = true`（跳过校验）。
 - **文件「没有下载：文件链接不在允许下载的域名白名单内」**（v1.2.0）：URL 来源的文件被安全策略拦下了，日志里会有 `[下载拒绝] URL 未通过安全校验（<原因>）`。若你的环境用的是非 QQ 的适配器/CDN，把它的域名加进 `reader.download_allowed_hosts`（逗号分隔，后缀匹配）；确需放开任意公网主机可改 `download_url_policy = public`（仍会拒绝内网地址）。
 - **想让本机适配器的 HTTP 文件服务被读**（如文件 URL 指向 `127.0.0.1`）：需**同时**满足两个条件——把该主机加进 `download_allowed_hosts`，并设 `download_allow_private_hosts = true`。注意这等于重新放开对内网的访问能力，请确认你真的需要。
@@ -355,4 +381,4 @@ python plugins/file-reader/test_file_reader.py
 | 重排序 | RerankProvider | 无（宿主只提供 `llm.embed`，无 rerank 能力）；改用 **BM25 词法 + RRF 融合** 补字面召回 |
 | 嵌入 | embedding_provider | `llm.embed` 能力 |
 | 注入 | on_llm_request | `before_model_request` hook（items） |
-| 文件获取 | `item.get_file()` | 入站消息 file/attachment 段；适配器降级时走 NapCat HTTP `get_msg`/`get_file` 回溯 |
+| 文件获取 | `item.get_file()` | 入站消息 file/attachment 段；v1.7.0 首选适配器 public API 换 URL 下载，失败回退 NapCat HTTP `get_msg`/`get_file` 回溯 |

@@ -8,7 +8,7 @@
   文档:  pdf / docx / doc / rtf / odt
   表格:  xlsx / xls / ods / csv
   演示:  pptx / ppt / odp
-  代码:  py java cpp c h hpp cs js ts php rb go rs swift kt scala sh bash ps1 bat cmd
+  代码:  py java cpp c h hpp cs js ts css scss less php rb go rs swift kt scala sh bash ps1 bat cmd
   标记:  md markdown html htm xml json yaml yml
   配置:  ini cfg conf properties env toml
   其他:  sql txt log lock gitignore url webloc
@@ -946,6 +946,10 @@ SUPPORTED_EXTENSIONS: dict[str, Callable[[str], str]] = {
     "cs": _read_txt,
     "js": _read_txt,
     "ts": _read_txt,
+    # v1.7.0：样式表（真机 11-18：style.css 被拒「不支持的文件类型」）
+    "css": _read_txt,
+    "scss": _read_txt,
+    "less": _read_txt,
     "php": _read_txt,
     "rb": _read_txt,
     "go": _read_txt,
@@ -1080,7 +1084,7 @@ def describe_supported_types() -> str:
     """
     return (
         "pdf/docx/odt/epub/eml, xlsx/ods/csv, pptx/odp, html/ipynb/gz, "
-        "代码与文本(py/java/cpp/js/ts/go/rs/sh/md/json/yaml/txt/srt/xml...), "
+        "代码与文本(py/java/cpp/js/ts/css/go/rs/sh/md/json/yaml/txt/srt/xml...), "
         "ini/env/toml/log/sql, "
         "音频(mp3/wav/flac/ogg/m4a/aac，需配置 [audio] 音频理解模型，v1.5.0)"
     )

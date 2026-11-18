@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "org.mai-mai.file-reader",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "name": "文件读取（File Reader）",
-  "description": "解析 QQ 群/私聊上传的文件（pdf/docx/xlsx/pptx/odt/epub/html/ipynb/csv/代码/文本/音频等），分块后做「向量 + BM25 词法」混合检索（RRF 融合），把最相关内容注入 LLM 上下文，实现低开销的文件问答。音频文件经 Omni 模型听一次产出文本入库，追问免费。v1.6.0 增加统一临时文件获取、入库预建索引、全局数据/队列预算、解析解压上限与磁盘重试包。URL 下载默认只允许 QQ 文件域并拒绝内网/回环地址。参考 astrbot_plugin_file_reader_pro 移植。",
+  "description": "解析 QQ 群/私聊上传的文件（pdf/docx/xlsx/pptx/odt/epub/html/ipynb/csv/代码/文本/音频等），分块后做「向量 + BM25 词法」混合检索（RRF 融合），把最相关内容注入 LLM 上下文，实现低开销的文件问答。音频文件经 Omni 模型听一次产出文本入库，追问免费。v1.7.0 适配 SnowLuma 适配器：经插件 RPC 调适配器 public API 解析文件下载地址（无需 NapCat HTTP 服务），超大文件段内 size 预检，失败原因精确化，新增 css/scss/less 支持。v1.6.0 增加统一临时文件获取、入库预建索引、全局数据/队列预算、解析解压上限与磁盘重试包。URL 下载默认只允许 QQ 文件域并拒绝内网/回环地址。参考 astrbot_plugin_file_reader_pro 移植。",
   "author": {
     "name": "orge-8",
     "url": "https://github.com/orge-8"
@@ -51,7 +51,8 @@
   "capabilities": [
     "send.text",
     "llm.embed",
-    "llm.generate"
+    "llm.generate",
+    "api.call"
   ],
   "i18n": {
     "default_locale": "zh-CN"

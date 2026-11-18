@@ -8,6 +8,7 @@ README 只保留「原理 / 安装 / 配置 / 命令 / 安全策略 / 常见问�
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
+| v1.7.0 | 2026-11-18 | SnowLuma 适配器取文件通道（api.call 换 URL，无需 NapCat HTTP）+ size 预检 + 失败原因精确化 + css/scss/less |
 | v1.6.0 | 2026-11-18 | 性能与内存专项：统一临时文件获取、入库预建索引、全局预算/准入、解析硬上限、磁盘重试包 |
 | v1.5.1 | 2026-11-16 | Planner 公告补音频语义：明示「已由音频理解模型听过」，消除 planner「mp3 哪来文本/我没耳朵」误判（真机 22:01 日志驱动） |
 | v1.5.0 | 2026-11-16 | 音频文件理解：Omni 听一次→文本入库→免费追问（mp3/wav/flac/ogg/m4a/aac；超限拒绝不截断；[audio] 独立配置） |
@@ -47,6 +48,65 @@ README 只保留「原理 / 安装 / 配置 / 命令 / 安全策略 / 常见问�
 | v1.0.1 | 2026-09-02 |  |
 
 ---
+
+## v1.7.0（2026-11-18）SnowLuma 适配器取文件通道 + size 预检 + 失败文案 + css
+
+> 来源：调研 [schxar/file-reader](https://github.com/schxar/file-reader) fork（2 提交 4 文件 +223/-7）后决定**自写移植**（不 merge）：fork 的 CHANGELOG 声称有测试但 diff 里没有任何测试文件，且有两处代码边界缺陷（多 URL 响应取第一个 http URL、裸 `id` 兜底当 user_id）。决策记录见工作区 `docs/decisions-snowluma-fork.md`。
+>
+> 真机基线（2026-11-18 21:12–21:15 日志）：napcat-adapter 已合并进 snowluma-adapter，结构化 file 段 → `[napcat] get_file 命中` 本地 temp 路径 → 文件名回填 → 入库正常（README (1).md 22 块 7.52s）。本版是**简化加固**（去掉对 NapCat OneBot HTTP 服务的依赖），不是急救。日志同时暴露 `.css` 被拒（style.css「不支持的文件类型」），一并补上。
+
+### 新增：适配器取文件通道（首选，`[snowluma]` 配置节）
+
+- **链路**：结构化 file 段（只有 file_id/name/size/busid）→ `ctx.api.call` 调适配器 public API 换短期下载 URL → 走插件自带 SSRF 防护下载（白名单 + DNS 钉定 + 逐跳重定向校验）落临时文件。**不再依赖 NapCat OneBot HTTP 服务（127.0.0.1:3001）**。
+- **API 契约**（MaiBot-SnowLuma-Adapter v1.3.1 `apis/file.py` 源码核实）：私聊 `adapter.napcat.file.get_private_file_url(file_id, user_id)`、群聊 `adapter.napcat.file.get_group_file_url(file_id, group_id[, busid])`，均 public=True；参数包在 `params` 字典里；**busid=0 必须省略**（适配器 v1.1.10 修复，传 0 会参数错误）；`adapter.files.resolve` 是 public=False 的内部 API，不用。
+- **URL 提取**：优先 `data.url`（OneBot 标准形态）→ 顶层 `url` → 递归兜底（深度 ≤5）。修掉 fork「取第一个 http URL」在多 URL 响应里拿错预览链接的缺陷。
+- **上下文提取**：`_message_context` 只从 kwargs 顶层 / message_info 平铺 / user_info / group_info 嵌套取 user_id / group_id，**不用裸 `id` 兜底**（message_info.id 可能是消息/会话 ID，误当 user_id 会解析到别人的文件）——修掉 fork 的第二处缺陷。
+- **降级**：能力关闭 / RPC 异常（含 E_CAPABILITY_DENIED）/ 无 URL / 缺 user_id → 返回 None 回退 NapCat 兜底（若启用）；SL 下载失败（非确定性）同样回退；**超限与白名单拒绝是确定性结论，直接上抛不回退**。
+- **配置**：`snowluma.enabled`（默认 true）、`private_file_url_api` / `group_file_url_api`（可改名适配别名）；`config_version` 1.4.0 → **1.5.0**（不 bump 新节不会出现在已部署实例的 config.toml 里）；加载日志与 `/file_status` 新增通道状态行。
+- **manifest**：capabilities 新增 **`api.call`**——Host 1.4.6 源码 `authorization.py` 证实只有 `api.replace_dynamic` 免声明（此前 02 篇文档口径有误，已勘误）。**真机部署必须同步替换 `_manifest.json` 并完整重启**（capabilities 变更不热更新）。
+
+### 新增：size 预检与失败原因精确化
+
+- 结构化 file 段自带 size 且超过 `reader.max_file_size` 时**零 RPC 直接拒绝**（旧行为会先走一轮 SL/NapCat 回溯再报超限，且可能误报「未返回文件内容」）。恰好等于上限不拒绝。
+- 失败原因拆分：file_id 链路 → `no_content_file_id`（新文案「适配器只提供了 file_id，经适配器解析下载地址后仍未取回文件内容」+ 可操作排查指引）；文本降级 + message_id 回溯链路 → `napcat_no_content`（文案改「文件回溯未返回内容」，不再把两条链路混为一谈）。
+
+### 新增：css / scss / less 解析支持
+
+- 真机 11-18 日志：style.css 被拒「不支持的文件类型」。三者按纯文本解析（`_read_txt`），`describe_supported_types()` 与 README 同步。
+
+### 官方最新版本实测（2026-11-18，交付准入依据）
+
+| 项目 | 结果 |
+|---|---|
+| 官方版本核对 | MaiBot **v1.4.6**（GitHub latest release）/ maibot-plugin-sdk **2.23.0**（PyPI）——与 v1.6.0 交付时一致，host/sdk 区间无需再放宽 |
+| v1.4.6 宿主源码 PluginLoader 加载探针 | **PASS**：loaded=1（v1.7.0, type=data）、capabilities 含 `api.call`、组件 **4 HOOK_HANDLER + 3 COMMAND + 1 TOOL**、SDK 契约 OK |
+| SDK 2.23.0 隔离环境全量 pytest | **303 passed / 0 failed**（262 + 新增 41） |
+| 根目录功能自测 `test_file_reader.py` | 全部通过 |
+| devkit `gate.sh`（唯一门禁入口） | **PASS 3 / SKIP 0 / FAIL 0**（check_plugin PASS 40 / WARN 4 均既有；冒烟 12/12；pytest 303） |
+
+### 测试（新增 `tests/test_snowluma_channel.py`，41 项）
+
+- 私聊/群聊参数契约（params 包装、int 化、busid=0 省略 / >0 才传、群优先、非数字 openid 不强转、API 名可配置）；
+- URL 提取（data.url 优先于预览链接、顶层 url、多层包裹递归、非 http/空/超深度拒绝、list 形态）；
+- 降级（enabled=false 零 RPC、缺 file_id/user_id、RPC 异常、无 URL、fakehost 默认空 data）；
+- `_acquire_source`（首选 SL 下载落盘、下载失败回退 NapCat、白名单拒绝不回退、bytes/path 内容优先）；
+- size 预检（超大零 RPC + 超限回执、等于上限不误伤）；
+- 失败原因（no_content_file_id 通知文案、napcat_no_content 口径不变、silent_errors 不发群）；
+- `_message_context`（嵌套/平铺/kwargs 优先、裸 id 不取、别名字段）+ hook 端到端上下文注入；
+- css/scss/less 解析 + describe 口径 + **css 经 SL 通道端到端入库**；
+- 配置默认值 / config_version=1.5.0 / manifest 声明 api.call / `/file_status` 通道行。
+
+**反向验证（实测，不是声称）**：
+- 还原 fork「取第一个 http URL」策略 → `test_pick_prefers_data_url_over_preview` 立刻变红 ✓
+- 还原「裸 id 兜底」→ `test_message_context_bare_id_not_used` 立刻变红 ✓
+- 去掉 size 预检（直接进 `_acquire_source`）→ 超大文件确实先发起 SL RPC，证明预检省掉这次调用 ✓
+
+### 升级须知
+
+1. **整目录替换 + 完整重启**：`_manifest.json` 新增 `api.call` 能力声明，热重载不生效。
+2. 已部署实例的 config.toml 会由宿主按 config_version=1.5.0 补 `[snowluma]` 新节（默认 enabled=true）；旧字段值保留。
+3. 真机验证要点：发一个文件，日志应出现 `适配器取文件(SnowLuma): 启用`（加载时）与 `[snowluma] 文件下载 URL 解析成功`（取文件时）；若出现 `[snowluma] ... 调用失败` 先看适配器是否在线、api.call 是否被授权。NapCat HTTP 兜底可保持关闭。
+4. 发版（插件中心提交）待真机验证通过后另起。
 
 ## v1.6.0（2026-11-18）
 

@@ -349,7 +349,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.4.0", description="配置版本（v1.6.0：1.3.0→1.4.0 补容量准入、解析预算、词法 posting/全局上限。不升版这些键不会出现在已部署实例的 config.toml 里）")
+    config_version: str = Field(default="1.5.0", description="配置版本（v1.7.0：1.4.0→1.5.0 补 [snowluma] 适配器取文件节。不升版这些键不会出现在已部署实例的 config.toml 里）")
 
 
 class ReaderConfig(PluginConfigBase):
@@ -483,6 +483,38 @@ class NapcatConfig(PluginConfigBase):
     )
 
 
+class SnowlumaConfig(PluginConfigBase):
+    """SnowLuma 适配器取文件配置（v1.7.0）。
+
+    官方 napcat-adapter 已合并进 snowluma-adapter（Host 1.3.0 起），结构化 file 段
+    只有 {file_id, name, size, busid} 不含本体。本通道经 MaiBot 插件 RPC
+    （ctx.api.call）调适配器 public API 换取短期下载 URL，再走插件自带的
+    SSRF 防护下载通道，不依赖 NapCat OneBot HTTP 服务（127.0.0.1:3001）。
+
+    源码依据（MaiBot-SnowLuma-Adapter v1.3.1 apis/file.py）：
+    - 私聊 get_private_file_url(file_id, user_id)、群聊 get_group_file_url(file_id, group_id[, busid])
+      均 public=True；busid=0 必须省略（适配器 v1.1.10 修复）。
+    - adapter.files.resolve 是 public=False 的主程序内部 API，插件不可调用。
+    """
+
+    __ui_label__ = "适配器取文件"
+    __ui_icon__ = "cloud-download"
+    __ui_order__ = 3
+
+    enabled: bool = Field(
+        default=True,
+        description="通过当前适配器（SnowLuma）的 public API 解析文件下载地址；无需 NapCat OneBot HTTP 服务。失败自动回退 NapCat 兜底（若启用）",
+    )
+    private_file_url_api: str = Field(
+        default="adapter.napcat.file.get_private_file_url",
+        description="私聊文件 URL API（SnowLuma public API，复用 adapter.napcat.* 命名空间）",
+    )
+    group_file_url_api: str = Field(
+        default="adapter.napcat.file.get_group_file_url",
+        description="群文件 URL API（SnowLuma public API）",
+    )
+
+
 class AudioConfig(PluginConfigBase):
     """音频理解配置（v1.5.0）。
 
@@ -493,7 +525,7 @@ class AudioConfig(PluginConfigBase):
 
     __ui_label__ = "音频理解"
     __ui_icon__ = "volume-2"
-    __ui_order__ = 3
+    __ui_order__ = 4
 
     enabled: bool = Field(
         default=True,
@@ -536,6 +568,7 @@ class FileReaderConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     reader: ReaderConfig = Field(default_factory=ReaderConfig)
     napcat: NapcatConfig = Field(default_factory=NapcatConfig)
+    snowluma: SnowlumaConfig = Field(default_factory=SnowlumaConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
 
 
@@ -660,6 +693,14 @@ class FileReaderPlugin(MaiBotPlugin):
             self.config.napcat.http_url,
             "已设置" if (self.config.napcat.access_token or "").strip() else "空",
             self.config.napcat.cache_dir or "未设置",
+        )
+        # v1.7.0：适配器取文件通道开关同样在加载时显式打出来——
+        # 真机排查「file_id 取不到文件」时，第一眼看的就是这两行
+        self.ctx.logger.info(
+            "适配器取文件(SnowLuma): %s (私聊=%s, 群=%s)",
+            "启用" if self.config.snowluma.enabled else "停用",
+            self.config.snowluma.private_file_url_api,
+            self.config.snowluma.group_file_url_api,
         )
         await self._start_cleanup_loop()
         await self._start_retry_loop()
@@ -1083,8 +1124,13 @@ class FileReaderPlugin(MaiBotPlugin):
         if len(self._recent_file_keys) > 64:
             self._recent_file_keys = {k: v for k, v in self._recent_file_keys.items() if now - v < 60.0}
 
+        # v1.7.0：适配器解析文件 URL 需要 user_id / group_id 上下文，先补给每个 fdata
+        msg_ctx = self._message_context(message, kwargs)
         # 后台处理，不阻塞聊天主流程（runtime-gotchas 5.3）
         for fdata in to_handle:
+            for key, value in msg_ctx.items():
+                if value and not fdata.get(key):
+                    fdata[key] = value
             self._spawn_bg(self._handle_file(session_id, conversation_id, stream_id, fdata))
         return {"action": "continue"}
 
@@ -1328,6 +1374,124 @@ class FileReaderPlugin(MaiBotPlugin):
         # 无可用内容
         return None
 
+    @staticmethod
+    def _message_context(message: dict[str, Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+        """提取适配器解析文件所需的会话上下文（user_id / group_id / platform）。
+
+        v1.7.0：只在语义明确的来源里找——kwargs 顶层、message_info 平铺、
+        user_info / group_info 嵌套。**不用裸 `id` 兜底**（message_info.id 可能是
+        消息/会话 ID，误当 user_id 会让适配器解析到别人的文件）。
+        """
+        mi = message.get("message_info") or {}
+        if not isinstance(mi, dict):
+            mi = {}
+        ui = mi.get("user_info") if isinstance(mi.get("user_info"), dict) else {}
+        gi = mi.get("group_info") if isinstance(mi.get("group_info"), dict) else {}
+
+        def _first(sources: tuple[dict[str, Any], ...], keys: tuple[str, ...]) -> str:
+            for src in sources:
+                for key in keys:
+                    value = src.get(key)
+                    if value not in (None, "", 0):
+                        return str(value)
+            return ""
+
+        user_id = _first((kwargs, mi, ui), ("user_id", "sender_id", "qq", "user_openid"))
+        group_id = _first((kwargs, mi, gi), ("group_id", "group_all"))
+        return {
+            "user_id": user_id,
+            "group_id": group_id,
+            "platform": str(mi.get("platform") or message.get("platform") or "qq"),
+        }
+
+    @staticmethod
+    def _pick_url_from_response(payload: Any) -> Optional[str]:
+        """从适配器 API 响应里取下载 URL。
+
+        v1.7.0：优先明确路径 `data.url`（OneBot 标准形态），其次顶层 `url`；
+        都没有才递归兜底（兼容多层包裹），避免「取第一个 http URL」在多 URL
+        响应里拿错（如预览链接排在下载链接前面）。
+        """
+        if isinstance(payload, dict):
+            data = payload.get("data")
+            if isinstance(data, dict):
+                candidate = data.get("url")
+                if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+                    return candidate
+            candidate = payload.get("url")
+            if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+                return candidate
+
+        def _walk(node: Any, depth: int) -> Optional[str]:
+            if depth > 5:
+                return None
+            if isinstance(node, dict):
+                for value in node.values():
+                    found = _walk(value, depth + 1)
+                    if found:
+                        return found
+            elif isinstance(node, list):
+                for item in node:
+                    found = _walk(item, depth + 1)
+                    if found:
+                        return found
+            elif isinstance(node, str) and node.startswith(("http://", "https://")):
+                return node
+            return None
+
+        return _walk(payload, 0)
+
+    async def _resolve_via_snowluma(self, fdata: dict[str, Any]) -> Optional[str]:
+        """通过 SnowLuma 适配器 public API 把 file_id 换成短期下载 URL（v1.7.0）。
+
+        私聊 get_private_file_url(file_id, user_id)；群聊
+        get_group_file_url(file_id, group_id[, busid])。全程走 MaiBot 插件 RPC，
+        不需要 NapCat OneBot HTTP 服务。任何失败返回 None，由调用方回退旧路径。
+        """
+        cfg = self.config.snowluma
+        if not cfg.enabled:
+            return None
+        file_id = str(fdata.get("file_id") or "").strip()
+        if not file_id:
+            return None
+
+        def _numeric(value: Any) -> Any:
+            """QQ 的 user_id/group_id 是数字，按适配器内部约定转成 int。"""
+            text = str(value or "").strip()
+            return int(text) if text.isdigit() else text
+
+        group_id = str(fdata.get("group_id") or "").strip()
+        params: dict[str, Any] = {"file_id": file_id}
+        if group_id:
+            params["group_id"] = _numeric(group_id)
+            try:
+                busid = int(fdata.get("busid") or 0)
+            except (TypeError, ValueError):
+                busid = 0
+            # busid=0 必须省略：适配器 v1.1.10 修复，传 0 会导致 SnowLuma 参数错误
+            if busid > 0:
+                params["busid"] = busid
+            api_name = cfg.group_file_url_api
+        else:
+            user_id = str(fdata.get("user_id") or "").strip()
+            if not user_id:
+                self.ctx.logger.warning("[snowluma] 私聊文件缺少 user_id，无法解析下载 URL")
+                return None
+            params["user_id"] = _numeric(user_id)
+            api_name = cfg.private_file_url_api
+        try:
+            response = await self.ctx.api.call(api_name, params=params)
+        except Exception as exc:  # noqa: BLE001
+            # 能力未声明（E_CAPABILITY_DENIED）/ RPC 异常 / 适配器动作失败都走这里
+            self.ctx.logger.warning("[snowluma] %s 调用失败: %s", api_name, exc)
+            return None
+        url = self._pick_url_from_response(response)
+        if not url:
+            self.ctx.logger.warning("[snowluma] %s 未返回下载 URL（file_id=%s）", api_name, file_id)
+            return None
+        self.ctx.logger.info("[snowluma] 文件下载 URL 解析成功: api=%s", api_name)
+        return url
+
     def _pick_session_id(self, message: dict[str, Any], kwargs: dict[str, Any]) -> str:
         for key in ("session_id", "user_id", "sender_id", "user_openid"):
             if kwargs.get(key):
@@ -1562,6 +1726,15 @@ class FileReaderPlugin(MaiBotPlugin):
                 )
                 return
             self._load_metrics["accepted"] += 1
+
+            # v1.7.0：结构化 file 段自带 size 时先预检——超大附件直接拒绝，
+            # 不再为它走一轮 SL/NapCat 回溯，也避免报出误导性的「未返回文件内容」。
+            try:
+                size_hint = int(fdata.get("size_hint") or 0)
+            except (TypeError, ValueError):
+                size_hint = 0
+            if size_hint > max_bytes:
+                raise _DownloadTooLargeError(size_hint)
 
             # 先落盘释放原始字节，再等活跃槽；排队任务只持有临时文件路径，
             # 不把最多 3 份 20MB 的 bytes 一直悬在任务帧里。
@@ -2440,6 +2613,23 @@ class FileReaderPlugin(MaiBotPlugin):
                 ) from e
             return path, None, size, digest
 
+        # v1.7.0：首选适配器（SnowLuma）通道——public API 换短期 URL，再走
+        # 自带 SSRF 防护的下载落盘。不需要 NapCat OneBot HTTP 服务；
+        # 解析失败/下载失败都回退下面的 NapCat 兜底（若启用）。
+        if fdata.get("file_id") and self.config.snowluma.enabled:
+            sl_url = await self._resolve_via_snowluma(fdata)
+            if sl_url:
+                try:
+                    path, size, digest = await self._download_to_temp(sl_url, max_bytes, suffix)
+                    return path, None, size, digest
+                except (_DownloadTooLargeError, _UrlRejectedError):
+                    # 超限/安全拒绝是确定性结论，回退旧路径也不会变好，直接上抛
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    self.ctx.logger.warning(
+                        "[snowluma] 下载失败（%s），回退 NapCat 兜底: %s", type(e).__name__, e
+                    )
+
         napcat_path: Optional[str] = None
         raw_bytes = None
         if fdata.get("file_id") and self.config.napcat.enabled:
@@ -2464,10 +2654,20 @@ class FileReaderPlugin(MaiBotPlugin):
             )
             return path, None, size, digest
 
-        if fdata.get("napcat_message_id") or fdata.get("file_id"):
+        if fdata.get("file_id"):
+            # v1.7.0：适配器只给 file_id、不给本体；已尝试 SL 通道（及可选 NapCat 兜底）
+            # 仍拿不到字节——说清尝试过什么，别再误报「NapCat 未返回文件内容」。
+            raise _SourceUnavailableError(
+                "no_content_file_id",
+                f"文件「{name}」无法读取：当前适配器只提供了 file_id，未提供文件本体；"
+                "已尝试通过适配器解析下载地址，但未取回文件内容"
+                "（检查适配器连接、user_id/group_id、reader.download_allowed_hosts，"
+                "或临时启用 napcat.enabled 走 HTTP 兜底）。",
+            )
+        if fdata.get("napcat_message_id"):
             raise _SourceUnavailableError(
                 "napcat_no_content",
-                f"文件「{name}」无法读取：NapCat 未返回文件内容"
+                f"文件「{name}」无法读取：文件回溯未返回内容"
                 "（检查 HTTP 服务/token/message_id/file_id 是否对得上，或配置 cache_dir）。",
             )
         raise _SourceUnavailableError(
@@ -2508,7 +2708,8 @@ class FileReaderPlugin(MaiBotPlugin):
     _REASON_TEXT = {
         "too_large": "文件超过大小上限",
         "napcat_disabled": "适配器把文件降级成了纯文本，且未启用 NapCat 兜底",
-        "napcat_no_content": "NapCat 未返回文件内容",
+        "napcat_no_content": "文件回溯未返回内容",
+        "no_content_file_id": "适配器只提供了 file_id，经适配器解析下载地址后仍未取回文件内容",
         "no_content": "消息里没有文件内容",
         "embed_failed": "向量化失败",
         "exception": "处理过程异常",
@@ -3326,6 +3527,7 @@ class FileReaderPlugin(MaiBotPlugin):
             f"- 有效时间: {self.config.reader.file_retention_time}min / 最大 {self.config.reader.file_max_rounds} 轮",
             f"- 支持类型: {describe_supported_types()}",
             f"- NapCat 兜底: {'启用' if self.config.napcat.enabled else '停用'} ({self.config.napcat.http_url})",
+            f"- 适配器取文件(SnowLuma): {'启用' if self.config.snowluma.enabled else '停用'}",
         ]
         if self._embed_retry_queue:
             names = "、".join(f"{item['name']}(第{item['attempts']}次)" for item in self._embed_retry_queue[:5])
