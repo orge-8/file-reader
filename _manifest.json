@@ -14,11 +14,11 @@
   },
   "host_application": {
     "min_version": "1.2.0",
-    "max_version": "1.4.6"
+    "max_version": "1.4.99"
   },
   "sdk": {
     "min_version": "2.5.1",
-    "max_version": "2.23.0"
+    "max_version": "2.23.99"
   },
   "plugin_type": "data",
   "dependencies": [

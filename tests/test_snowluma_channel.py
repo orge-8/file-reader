@@ -716,7 +716,7 @@ def test_trusted_bare_ip_downloads_end_to_end(tmp_path):
     restore = _patch_resolver(plugin, lambda h, p: [h])
     _install_client(plugin, client)
     try:
-        fdata = {"name": "附件", "file_id": "fid", "size_hint": len(body), "user_id": "3816023959"}
+        fdata = {"name": "附件", "file_id": "fid", "size_hint": len(body), "user_id": "1000000001"}
         path, napcat_path, size, digest = asyncio.run(
             plugin._acquire_source(fdata, "附件", 1024 * 1024))
         assert napcat_path is None

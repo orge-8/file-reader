@@ -35,7 +35,7 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
 
-VIDEO_NAME = "7a7655930ba843f30410648c130db9e3.mp4"
+VIDEO_NAME = "0123456789abcdef0123456789abcdef.mp4"
 VIDEO_SIZE = 3977255
 VIDEO_URL = "https://multimedia.nt.qq.com.cn/download?appid=1407&rkey=abc"
 BACKTRACK_API = "adapter.napcat.action.call_data"
@@ -73,7 +73,7 @@ def _api_calls(host):
 def _video_msg_data(url=VIDEO_URL, name=VIDEO_NAME):
     """get_msg 返回的原始 OneBot 事件（video 段形态）。"""
     return {
-        "message_id": 1437093324,
+        "message_id": 1234567890,
         "message": [
             {"type": "video", "data": {"file": name, "url": url}},
         ],
@@ -326,7 +326,7 @@ def test_acquire_video_hint_via_backtrack_url(tmp_path):
     plugin._download_to_temp = _fake_download
     try:
         assert plugin.config.napcat.enabled is False
-        fdata = {"name": VIDEO_NAME, "size_hint": VIDEO_SIZE, "napcat_message_id": 1437093324}
+        fdata = {"name": VIDEO_NAME, "size_hint": VIDEO_SIZE, "napcat_message_id": 1234567890}
         path, napcat_path, size, digest = asyncio.run(
             plugin._acquire_source(fdata, VIDEO_NAME, 20 * 1024 * 1024))
         assert seen["url"] == VIDEO_URL
