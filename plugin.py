@@ -76,8 +76,13 @@ _RE_HINT_URL = re.compile(r"链接[:：]\s*(https?://\S+)")
 # `附件，大小: 15397，file_ref: 5a1b…` 整串当成文件名（真机实测：扩展名丢失 ⇒
 # 解析器按扩展名分派直接拒收）。改为「名字不含逗号 + 可选大小组 + 其余尾巴一律忽略」。
 # 代价：文件名自身含中文/英文逗号时会被截断（历史版本同样处理不了，非回归）。
+# v1.9.1：标记扩为 `[文件]|[视频]`。真机 11-19 21:14：QQ「视频」消息是 video 段，
+# 适配器降级成 `[视频] 文件: xxx.mp4，大小: 3977255`（官方文档 04 §6：video/file →
+# 纯文本），旧正则只认 `[文件]` ⇒ 整条消息被丢弃，Planner 空转后误称「看不了视频」。
+# 视频形态名字前可能带 `文件:` 前缀（真机实测），用可选组剥掉；`[文件]` 行为不变。
 _RE_HINT_NAME = re.compile(
-    r"\[文件\]\s*(?P<name>[^，,]+?)(?:\s*[，,]\s*大小[:：]\s*(?P<size>\d+))?(?:\s*[，,].*)?$"
+    r"\[(?:文件|视频)\]\s*(?:文件\s*[:：]\s*)?"
+    r"(?P<name>[^，,]+?)(?:\s*[，,]\s*大小[:：]\s*(?P<size>\d+))?(?:\s*[，,].*)?$"
 )
 
 
@@ -350,7 +355,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.7.0", description="配置版本（v1.8.1：1.6.0→1.7.0 补 [snowluma].trust_adapter_urls。不升版这些键不会出现在已部署实例的 config.toml 里）")
+    config_version: str = Field(default="1.9.1", description="配置版本（v1.9.1：1.7.0→1.9.1 补 [snowluma].msg_backtrack_api（QQ 视频消息回溯）。不升版这些键不会出现在已部署实例的 config.toml 里）")
 
 
 class ReaderConfig(PluginConfigBase):
@@ -523,6 +528,15 @@ class SnowlumaConfig(PluginConfigBase):
             "内网/回环/云元数据地址仍然拒绝，重定向跳回退域名白名单校验。"
             "关闭后适配器 URL 与消息正文 URL 同规（裸 IP 会被拒）。"
             "消息正文里的 URL 不受本开关影响，始终走域名白名单"
+        ),
+    )
+    msg_backtrack_api: str = Field(
+        default="adapter.napcat.action.call_data",
+        description=(
+            "消息回溯 API（v1.9.1）：QQ「视频」消息被适配器降级成 `[视频] 文件: xxx.mp4，大小: N` "
+            "纯文本，没有 file_id，只能拿 message_id 回头调 OneBot get_msg 取原始 video 段。"
+            "默认走通用 action 入口 call_data（只取响应 data，且不做 message_id 正整数规范化，"
+            "负数 ID 合法）。置空 = 关闭该回溯通道"
         ),
     )
 
@@ -760,9 +774,10 @@ class FileReaderPlugin(MaiBotPlugin):
             self.config.reader.data_budget_mb,
         )
         # NapCat 兜底开关是"能否读到文件"的关键，加载时显式打出来
+        # v1.9.1：停用不再等于「读不到」——适配器 RPC 回溯（get_msg）已能接住降级文本
         self.ctx.logger.info(
             "NapCat 兜底: %s (url=%s, token=%s, cache_dir=%s)",
-            "启用" if self.config.napcat.enabled else "停用（适配器降级的文件读不到内容！）",
+            "启用" if self.config.napcat.enabled else "停用（首选适配器 RPC 回溯，失败才需要它）",
             self.config.napcat.http_url,
             "已设置" if (self.config.napcat.access_token or "").strip() else "空",
             self.config.napcat.cache_dir or "未设置",
@@ -770,10 +785,11 @@ class FileReaderPlugin(MaiBotPlugin):
         # v1.7.0：适配器取文件通道开关同样在加载时显式打出来——
         # 真机排查「file_id 取不到文件」时，第一眼看的就是这两行
         self.ctx.logger.info(
-            "适配器取文件(SnowLuma): %s (私聊=%s, 群=%s)",
+            "适配器取文件(SnowLuma): %s (私聊=%s, 群=%s, 消息回溯=%s)",
             "启用" if self.config.snowluma.enabled else "停用",
             self.config.snowluma.private_file_url_api,
             self.config.snowluma.group_file_url_api,
+            self.config.snowluma.msg_backtrack_api or "关闭",
         )
         await self._start_cleanup_loop()
         await self._start_retry_loop()
@@ -1223,14 +1239,19 @@ class FileReaderPlugin(MaiBotPlugin):
         return {"action": "continue"}
 
     def _looks_like_file(self, message: dict[str, Any]) -> bool:
-        """轻量判断：该消息是否疑似文件消息（不做内容提取，只判标记与段类型）。"""
+        """轻量判断：该消息是否疑似文件消息（不做内容提取，只判标记与段类型）。
+
+        v1.9.1：video 段与 `[视频]` 降级文本同样算文件消息（真机 11-19 21:14：
+        QQ 视频消息全程零 hook 诊断，就是这里只认 file/[文件] 漏掉的）。
+        """
         plain = str(message.get("processed_plain_text") or "")
-        if "[文件]" in plain or "[文件]" in str(message.get("text") or ""):
+        text = str(message.get("text") or "")
+        if "[文件]" in plain or "[文件]" in text or "[视频]" in plain or "[视频]" in text:
             return True
         segs = message.get("raw_message")
         if isinstance(segs, list):
             for s in segs:
-                if isinstance(s, dict) and str(s.get("type", "")).lower() in ("file", "attachment"):
+                if isinstance(s, dict) and str(s.get("type", "")).lower() in ("file", "attachment", "video"):
                     return True
         return False
 
@@ -1242,16 +1263,20 @@ class FileReaderPlugin(MaiBotPlugin):
         - 私聊：`[文件] 文章.docx，大小: 9547`
         - 群聊：`[文件] 文章.docx，大小: 9547，链接: https://tjc-download.ftn.qq.com/...`
 
+        v1.9.1 新增视频形态（真机 11-19 21:14，QQ video 段降级文本）：
+        - `[视频] 文件: 7a76…db9e3.mp4，大小: 3977255`（名字前带 `文件:` 前缀）
+        - `[视频] xxx.mp4，大小: N`（无前缀形态同样兼容）
+
         返回 [{"name", "size_hint", "url"?}, ...]；一行解析不出则跳过该行。
         """
         plain = str(message.get("processed_plain_text") or "") or str(message.get("text") or "")
-        if "[文件]" not in plain:
+        if "[文件]" not in plain and "[视频]" not in plain:
             return []
         hints: list[dict[str, Any]] = []
         # 逐行解析：链接可能含逗号，先按行切分再在行内摘 URL
         for line in plain.splitlines():
             line = line.strip()
-            if "[文件]" not in line:
+            if "[文件]" not in line and "[视频]" not in line:
                 continue
             url_m = _RE_HINT_URL.search(line)
             url = url_m.group(1).rstrip("，,。") if url_m else ""
@@ -1362,6 +1387,9 @@ class FileReaderPlugin(MaiBotPlugin):
         - OneBot 风格 {"type": "file", "data": {...}}（napcat 等适配器）
         - raw_message 里嵌套的 file / attachment / files
         - raw_message.message 数组（OneBot 原始事件）
+
+        v1.9.1：video 段同样提取（QQ「视频」消息；data 里通常是 file=文件名 + url，
+        或仅 file/file_id——后者交给取字节层的适配器 get_msg 回溯）。
         """
         found: list[dict[str, Any]] = []
 
@@ -1372,7 +1400,7 @@ class FileReaderPlugin(MaiBotPlugin):
                 if not isinstance(seg, dict):
                     continue
                 stype = str(seg.get("type", "")).lower()
-                if stype in ("file", "attachment"):
+                if stype in ("file", "attachment", "video"):
                     # OneBot 风格：实际字段嵌在 data 里
                     payload = seg.get("data") if isinstance(seg.get("data"), dict) else seg
                     fdata = self._seg_to_file(payload)
@@ -1579,6 +1607,79 @@ class FileReaderPlugin(MaiBotPlugin):
             return None
         self.ctx.logger.info("[snowluma] 文件下载 URL 解析成功: api=%s", api_name)
         return url
+
+    async def _get_msg_via_adapter(self, message_id: Any) -> Optional[dict[str, Any]]:
+        """经适配器 RPC 回溯原始 OneBot 事件（v1.9.1）。
+
+        QQ「视频」消息（video 段）被适配器降级成 `[视频] 文件: xxx.mp4，大小: N`
+        纯文本，没有 file_id——`get_private_file_url` 那类文件 API 用不上，只能拿
+        message_id 回头调 OneBot `get_msg` 取原始 video 段（真机 11-19 21:14 教训）。
+
+        走通用 action 入口 `adapter.napcat.action.call_data`（官方文档 04 §8）：
+        - 只取响应 data，返回 get_msg 的原始 dict；
+        - 不做 message_id 正整数规范化（强类型 message.get_msg 会拒负数 ID，
+          而 QQ message_id 是带符号 int32，负数合法）。
+
+        任何失败（能力被拒抛异常 / 执行失败返回错误字典 / 无 data）返回 None，
+        由调用方回退 NapCat HTTP 兜底。不依赖 napcat.enabled。
+        """
+        api_name = str(self.config.snowluma.msg_backtrack_api or "").strip()
+        if not api_name or message_id in (None, ""):
+            return None
+        try:
+            response = await self.ctx.api.call(
+                api_name, action_name="get_msg", params={"message_id": message_id}
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.warning("[snowluma] get_msg 回溯调用失败: %s", exc)
+            return None
+        if not isinstance(response, dict):
+            return None
+        # Host 层失败（解析失败/目标插件异常/超时）返回 {"success": False, ...}
+        if response.get("success") is False:
+            self.ctx.logger.warning(
+                "[snowluma] get_msg 回溯失败: %s", response.get("error") or response.get("wording") or "-"
+            )
+            return None
+        # call_data 已剥到 data；兼容个别形态仍带 OneBot 外壳 {status, retcode, data}
+        data = response.get("data") if isinstance(response.get("data"), dict) else response
+        if not isinstance(data, dict) or not data:
+            return None
+        if "message" not in data and not (isinstance(data.get("data"), dict) and "message" in data["data"]):
+            self.ctx.logger.warning(
+                "[snowluma] get_msg 回溯无 message 段: keys=%s", sorted(data.keys())
+            )
+            return None
+        self.ctx.logger.info("[snowluma] get_msg 回溯成功: message_id=%r", message_id)
+        return data
+
+    def _extract_from_msg_data(self, msg_data: dict[str, Any], name: str, size_hint: int) -> tuple[Optional[bytes], Optional[str], Optional[str]]:
+        """从 get_msg 原始事件里取文件内容（file/video 段通用，v1.9.1 抽出共用）。
+
+        返回 (bytes, path, url)：段内 base64 → bytes；本地路径 → path；
+        http(s) URL → url（video 段常态）。三者皆无返回 (None, None, None)。
+        """
+        segs = self._pick_onebot_file_segs(msg_data)
+        file_seg, match_mode = self._match_file_seg(segs, name, size_hint)
+        if file_seg is None:
+            return None, None, None
+        log_fn = self.ctx.logger.info if match_mode in ("name", "size") else self.ctx.logger.warning
+        log_fn("[回溯] 文件段匹配: name=%s mode=%s segs=%d", name, match_mode, len(segs))
+        b64 = file_seg.get("base64")
+        if b64:
+            try:
+                return base64.b64decode(b64), None, None
+            except Exception as e:  # noqa: BLE001
+                self.ctx.logger.error("[回溯] base64 解码失败: %s", e)
+        for key in ("path", "file_path", "file"):
+            val = file_seg.get(key)
+            if val and Path(str(val)).exists():
+                return None, str(val), None
+        for key in ("url", "file"):
+            val = str(file_seg.get(key) or "")
+            if val.startswith(("http://", "https://")):
+                return None, None, val
+        return None, None, None
 
     def _pick_session_id(self, message: dict[str, Any], kwargs: dict[str, Any]) -> str:
         for key in ("session_id", "user_id", "sender_id", "user_openid"):
@@ -2279,12 +2380,16 @@ class FileReaderPlugin(MaiBotPlugin):
 
     @staticmethod
     def _pick_onebot_file_segs(msg_data: dict[str, Any]) -> list[dict[str, Any]]:
-        """从原始事件的 message 段数组里取出**全部** file 段（OneBot：{type, data:{...}}）。
+        """从原始事件的 message 段数组里取出**全部** file/video 段（OneBot：{type, data:{...}}）。
 
         v1.3.0：旧版 `_pick_onebot_file_seg` 只返回第一个 file 段。防抖合并后 N 条
         `[文件]` 提示共用同一个 message_id（消息体里却是 N 个 file 段），于是 N 个
         文件全被读成第一个文件的内容、再按各自文件名分别入库——静默串档，且污染检索
         （库里会出现 N 份「同一份内容 + N 个不同文件名」）。
+
+        v1.9.1：video 段同样取出（QQ「视频」消息回溯）。video 段 data 通常是
+        {file: 文件名或 URL, url: 下载地址}，没有 file_id/file_size 也能靠
+        `_match_file_seg` 的 name（file 字段 basename）匹配。
         """
         segs = msg_data.get("message")
         if isinstance(msg_data.get("data"), dict) and "message" in msg_data["data"]:
@@ -2295,7 +2400,7 @@ class FileReaderPlugin(MaiBotPlugin):
         for seg in segs:
             if not isinstance(seg, dict):
                 continue
-            if str(seg.get("type", "")).lower() != "file":
+            if str(seg.get("type", "")).lower() not in ("file", "video"):
                 continue
             data = seg.get("data")
             out.append(data if isinstance(data, dict) else seg)
@@ -2400,7 +2505,12 @@ class FileReaderPlugin(MaiBotPlugin):
         return None
 
     def _resolve_via_napcat(self, fdata: dict[str, Any]) -> tuple[Optional[bytes], Optional[str]]:
-        """同步：拿 NapCat 原始事件 → file 段 → 文件内容。返回 (bytes, path)。"""
+        """同步：拿 NapCat 原始事件 → file/video 段 → 文件内容。返回 (bytes, path)。
+
+        v1.9.1：video 段的 http URL 在这里也接住——下载器是 async，本函数在
+        to_thread 里跑，故用 urllib 同步拉取（NapCat HTTP 兜底路径专用；
+        首选的适配器 RPC 回溯走 async 下载器，带完整 SSRF 防护）。
+        """
         name = str(fdata.get("name", ""))
         size_hint = int(fdata.get("size_hint") or 0)
         msg_data = self._napcat_get_msg(fdata.get("napcat_message_id"))
@@ -2408,7 +2518,7 @@ class FileReaderPlugin(MaiBotPlugin):
         file_seg, match_mode = self._match_file_seg(segs, name, size_hint)
         if file_seg is None:
             self.ctx.logger.error(
-                "[napcat] 原始事件里没有 file 段: message_id=%r data_keys=%s",
+                "[napcat] 原始事件里没有 file/video 段: message_id=%r data_keys=%s",
                 fdata.get("napcat_message_id"),
                 sorted(msg_data.keys()) if isinstance(msg_data, dict) else None,
             )
@@ -2432,8 +2542,54 @@ class FileReaderPlugin(MaiBotPlugin):
                 self.ctx.logger.error("[napcat] base64 解码失败: %s", e)
         path = self._napcat_resolve_path(file_seg)
         if not path:
+            # v1.9.1：video 段常态是 {file: 文件名, url: 下载地址}，无本地路径。
+            for key in ("url", "file"):
+                val = str(file_seg.get(key) or "")
+                if val.startswith(("http://", "https://")):
+                    data = self._napcat_download_url(val)
+                    if data is not None:
+                        return (data, None)
+                    break
+        if not path:
             path = self._search_cache_dir(name, size_hint)
         return (None, path)
+
+    def _napcat_download_url(self, url: str) -> Optional[bytes]:
+        """NapCat HTTP 兜底专用：同步下载回溯到的媒体 URL（v1.9.1）。
+
+        只在适配器 RPC 回溯不可用、且用户显式启用 napcat.enabled 时才会走到。
+        URL 来自 NapCat get_msg 原始事件（与 get_file 同源的可信服务端），
+        但仍做基本防护：仅 http/https、拒绝内网/回环主机名、限大小。
+        """
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            return None
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        host = parsed.hostname.lower()
+        if host in ("localhost",) or host.endswith((".local", ".internal")):
+            self.ctx.logger.warning("[napcat] 回溯 URL 指向本机/内网主机名，拒绝: %s", host)
+            return None
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+        if ip is not None and not ip.is_global:
+            self.ctx.logger.warning("[napcat] 回溯 URL 指向非公网 IP，拒绝: %s", host)
+            return None
+        limit = int(self.config.reader.max_file_size * 1024 * 1024)
+        req = urllib.request.Request(url, headers={"User-Agent": "file-reader/1.9.1"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.napcat.timeout) as resp:
+                data = resp.read(limit + 1)
+        except Exception as e:  # noqa: BLE001
+            self.ctx.logger.error("[napcat] 回溯 URL 下载失败: %s: %s", type(e).__name__, e)
+            return None
+        if len(data) > limit:
+            self.ctx.logger.warning("[napcat] 回溯 URL 内容超过大小上限，丢弃")
+            return None
+        return data
 
     def _download_verify_setting(self) -> Any:
         """下载用的 TLS 校验设置（v1.2.0）：默认系统 CA；配了 CA 证书就用该路径；
@@ -2821,12 +2977,39 @@ class FileReaderPlugin(MaiBotPlugin):
         raw_bytes = None
         if fdata.get("file_id") and self.config.napcat.enabled:
             napcat_path = await asyncio.to_thread(self._napcat_resolve_path, fdata)
-        if napcat_path is None and fdata.get("napcat_message_id"):
+        # v1.9.1：适配器 RPC 回溯（不依赖 NapCat HTTP 服务）。QQ「视频」消息被降级成
+        # `[视频] 文件: xxx.mp4，大小: N` 纯文本，只有 message_id——经 action.call_data
+        # 调 get_msg 取原始 video 段（url/base64/本地路径）。真机 11-19 21:14：旧版在
+        # 这里直接抛 napcat_disabled，视频永远进不了理解链路。
+        if napcat_path is None and fdata.get("napcat_message_id") and self.config.snowluma.enabled:
+            msg_data = await self._get_msg_via_adapter(fdata.get("napcat_message_id"))
+            if isinstance(msg_data, dict):
+                raw_bytes, napcat_path, back_url = self._extract_from_msg_data(
+                    msg_data, name, int(fdata.get("size_hint") or 0)
+                )
+                if back_url:
+                    try:
+                        # 回溯 URL 来自适配器 RPC（可信来源），与 SL 通道同规：
+                        # 首跳公网地址校验放行裸 IP，内网仍拒（v1.8.1 语义）。
+                        path, size, digest = await self._download_to_temp(
+                            back_url,
+                            max_bytes,
+                            suffix,
+                            trusted_source=bool(self.config.snowluma.trust_adapter_urls),
+                        )
+                        return path, None, size, digest
+                    except (_DownloadTooLargeError, _UrlRejectedError):
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        self.ctx.logger.warning(
+                            "[snowluma] 回溯 URL 下载失败（%s），回退 NapCat 兜底: %s", type(e).__name__, e
+                        )
+        if napcat_path is None and raw_bytes is None and fdata.get("napcat_message_id"):
             if not self.config.napcat.enabled:
                 raise _SourceUnavailableError(
                     "napcat_disabled",
                     f"文件「{name}」读不到内容：适配器把文件降级成了纯文本，"
-                    "请在插件配置里启用「NapCat 兜底」并填好 HTTP 地址与 token。",
+                    "适配器消息回溯也未取到内容；可启用「NapCat 兜底」并填好 HTTP 地址与 token 再试。",
                 )
             raw_bytes, napcat_path = await asyncio.to_thread(self._resolve_via_napcat, fdata)
 
@@ -2894,7 +3077,7 @@ class FileReaderPlugin(MaiBotPlugin):
     #: reason → 面向模型的失败原因（v1.3.0：失败要能被模型说清楚，而不是只进日志）
     _REASON_TEXT = {
         "too_large": "文件超过大小上限",
-        "napcat_disabled": "适配器把文件降级成了纯文本，且未启用 NapCat 兜底",
+        "napcat_disabled": "适配器把文件降级成了纯文本，适配器消息回溯未取到内容，且未启用 NapCat 兜底",
         "napcat_no_content": "文件回溯未返回内容",
         "no_content_file_id": "适配器只提供了 file_id，经适配器解析下载地址后仍未取回文件内容",
         "no_content": "消息里没有文件内容",

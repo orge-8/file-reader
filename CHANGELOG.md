@@ -8,6 +8,7 @@ README 只保留「原理 / 安装 / 配置 / 命令 / 安全策略 / 常见问�
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
+| v1.9.1 | 2026-11-19 | QQ「视频」消息（video 段）接入读取链路（真机 21:14 日志）：`[视频]` 降级文本解析 + video 段提取 + 适配器 RPC get_msg 回溯取 URL（不依赖 NapCat HTTP）；修「视频全程零日志、Planner 误称看不了视频」 |
 | v1.9.0 | 2026-11-19 | 音频默认模型升级 qwen3.8-omni-flash：时长闸门 20 分钟→1 小时、请求超时 180→300s、显式关思考（enable_thinking=false 防挤占转写输出预算）；7MB 大小闸门不变（base64 10MB 是传输通道通用硬上限，不区分模型） |
 | v1.8.2 | 2026-11-19 | 视频链路真机热修（10:04 日志）：Files API 上传后轮询预处理状态至 active 再调 Chat（修 403 OperationDenied.InvalidState）；统一 fr_video/fr_audio 日志回调口径（修 Logging error 刷屏） |
 | v1.8.1 | 2026-11-19 | 修复 QQ 离线文件下载被白名单误拒（真机 09:19 日志）：适配器 URL 按可信来源首跳公网校验，内网仍拒、重定向回退白名单；[snowluma].trust_adapter_urls 回滚开关 |
@@ -50,6 +51,66 @@ README 只保留「原理 / 安装 / 配置 / 命令 / 安全策略 / 常见问�
 | v1.0.3 | 2026-09-02 |  |
 | v1.0.2 | 2026-09-02 |  |
 | v1.0.1 | 2026-09-02 |  |
+
+---
+
+## v1.9.1（2026-11-19）QQ「视频」消息（video 段）接入读取链路
+
+> 真机 11-19 21:14 日志：用户私聊直接发 QQ「视频」，
+> `[所见] 风卷恋苍穹: [视频] 文件: 7a7655930ba843f30410648c130db9e3.mp4，大小: 3977255`。
+> **全程零 file-reader 日志**（连 `file hook[before][FILE] 触发` 诊断都没有），
+> 视频没进解析链路；Planner 空转 7 次 tool_search（约 90 秒）后错误宣称
+> 「这视频我这边放不出来」「m4a也放不出来，我这边音频一律听不了」。
+> 对比 12:12 成功那次：`[文件] 附件，大小: 1998522`（file 段）诊断行齐全、41.88s 入库。
+
+### 根因：三道门全只认 file 段，video 段被整体丢弃
+
+QQ 里「发文件」走 OneBot **file 段**，「发视频」走 **video 段**——两种消息形态。
+SnowLuma 适配器把 video 段降级成纯文本 `[视频] 文件: xxx.mp4，大小: N`
+（官方文档 04 §6 段编解码表：`video`/`file` → 纯文本）。旧版：
+
+1. `_looks_like_file` 只认 `[文件]` 标记与 file/attachment 段 → video 消息连
+   FILE 诊断都不打（普通消息诊断每阶段只打一次，早被别的消息消耗）；
+2. `_RE_HINT_NAME` 只匹配 `[文件]` → `[视频]` 降级文本解析不出 hint；
+3. 即便解析出 hint，`_acquire_source` 对只有 message_id 的 hint 在
+   `napcat.enabled=false`（真机默认）时直接抛 `napcat_disabled`——
+   而视频段根本没有 file_id，`get_private_file_url` 那类文件 API 用不上。
+
+### 修法
+
+- **文本门**：`_RE_HINT_NAME` 标记扩为 `[文件]|[视频]`，并剥掉视频形态的
+  可选 `文件:` 前缀；`_looks_like_file` / `_parse_file_hints` 同步认 `[视频]`。
+  `[文件]` 行为逐字节不变（回归守卫用例）。
+- **段门**：`_extract_files` / `_pick_onebot_file_segs` 认 video 段
+  （url / base64 / 本地路径 / 仅 file_id 各形态）；`_match_file_seg` 对
+  video 段按 `file` 字段 basename 匹配、size 消歧照旧。
+- **取字节门（核心）**：新增 `_get_msg_via_adapter`——经
+  `adapter.napcat.action.call_data` 调 OneBot `get_msg` 回溯原始事件
+  （通用 action 入口不做 message_id 正整数规范化，**负数 ID 合法**；
+  强类型 `message.get_msg` 会拒负数，故不用它）。拿到 video 段 URL 后走
+  既有 SSRF 防护下载器，`trusted_source` 与 SL 通道同规（v1.8.1 语义：
+  首跳公网校验放行裸 IP，内网仍拒）。**不依赖 napcat.enabled**。
+  新配置 `[snowluma].msg_backtrack_api`（默认即上述 API，置空关闭），
+  `config_version` 1.7.0 → **1.9.1**。
+- **兜底链**：SL file_id 通道（有 file_id 时仍首选）→ RPC get_msg 回溯 →
+  NapCat HTTP 兜底（若启用；`_resolve_via_napcat` 也接住 video 段 URL，
+  同步下载 + 内网/非公网 IP 拒绝 + 大小上限）。确定性拒绝（超限/内网）不回退。
+- **失败语义**：`napcat_disabled` 文案与 `_REASON_TEXT` 补「适配器消息回溯
+  未取到内容」；加载日志打出消息回溯 API 与 NapCat 兜底新语义。
+- 视频入库后 Planner 公告沿用 v1.8.0 的「已看过（画面+音轨）」语义，
+  不再给「看不了视频」的自我否定留空间。
+
+### 测试与验证
+
+- 新增 `tests/test_video_message.py` **29 用例**：文本解析 6 / 段提取 4 /
+  段匹配 3 / RPC 回溯契约 7 / `_acquire_source` 端到端 6 / HTTP 兜底 2 / 配置 1。
+- 全量 **399 passed**（370 既有 + 29 新增）；gate.sh **PASS 3 / SKIP 0 / FAIL 0**
+  （WARN 4 为既有命名风格）。
+- 反向验证 3 组红绿闭环：①正则回退只认 `[文件]` → 4 红；②禁用 RPC 回溯 →
+  3 红（端到端/base64/安全拒绝）；③段提取不认 video → 5 红。还原后全绿，
+  无 RV-TEMP 残留。
+- **真机待验**：重发同一条 QQ 视频消息，预期出现 `[诊断] file hook[before][FILE]`
+  + `[snowluma] get_msg 回溯成功` + 视频理解入库日志。
 
 ---
 
