@@ -437,3 +437,38 @@ def test_add_file_default_not_audio():
         assert entry.is_audio is False
 
     asyncio.run(_drive())
+
+
+# ─── v1.8.2：日志回调契约（与 fr_video 同款修复） ────────────────
+
+
+def test_normalize_log_strips_level_for_logger_info():
+    received = []
+
+    def logger_info(msg, *args):
+        received.append((msg, args))
+
+    emit = fr_audio._normalize_log(logger_info)
+    emit("info", "音频预检通过 %s：format=%s", "a.wav", "wav")
+    assert received == [("音频预检通过 %s：format=%s", ("a.wav", "wav"))]
+
+
+def test_read_audio_with_real_logger_no_logging_error(tmp_path, monkeypatch, caplog):
+    """真机口径：log=logger.info 不得产生 Logging error（fr_video 已复现同病）。"""
+    import logging
+
+    wav = _wav(tmp_path / "log.wav", seconds=1.0)
+
+    async def fake_omni(audio_bytes, omni_format, **kwargs):
+        return "内容类型：语音\n转写。"
+
+    monkeypatch.setattr(fr_audio, "_ask_omni", fake_omni)
+    logger = logging.getLogger("fr_test.audio_logger_contract")
+    with caplog.at_level(logging.INFO, logger="fr_test.audio_logger_contract"):
+        text = asyncio.run(fr_audio.read_audio_to_text(
+            str(wav), "log.wav", log=logger.info, **_KW,
+        ))
+    assert text.startswith("【音频理解】")
+    assert "音频预检通过 log.wav" in caplog.text
+    assert "Logging error" not in caplog.text
+    assert "not all arguments converted" not in caplog.text

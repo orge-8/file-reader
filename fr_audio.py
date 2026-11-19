@@ -68,6 +68,37 @@ AUDIO_SYSTEM_PROMPT = (
     "- 用简体中文输出（音频本身是外语时，转写保留原文并附中文大意）。"
 )
 
+#: log 回调级别白名单（v1.8.2，与 fr_video 同款）：首参是合法级别名
+#: 才按 (level, fmt, *args) 约定解释，否则原样透传 (fmt, *args)。
+_LOG_LEVELS = frozenset({"debug", "info", "warning", "error", "critical", "exception"})
+
+
+def _normalize_log(log: Optional[Callable[..., None]]) -> Callable[..., None]:
+    """把注入的 log 回调规范化为 (fmt, *args) 口径（v1.8.2）。
+
+    模块内按 ``_log("info", fmt, *args)`` 调用，而 plugin 侧传的是
+    ``self.ctx.logger.info``（签名 ``(msg, *args)``）——首参 'info' 会被
+    logger 当成消息正文，真机刷 ``TypeError: not all arguments converted
+    during string formatting``（fr_video 2026-11-19 真机已复现，音频同病
+    先治）。首参是合法级别名 → 剥掉级别再调原回调；否则原样透传；
+    未注入 → no-op。与 fr_video._normalize_log 口径必须一致。
+    """
+    if log is None:
+        return lambda *a, **k: None
+
+    def _emit(*args: Any, **kwargs: Any) -> None:
+        if args and isinstance(args[0], str) and args[0] in _LOG_LEVELS:
+            args = args[1:]
+        if not args:
+            return
+        try:
+            log(*args, **kwargs)
+        except Exception:  # noqa: BLE001
+            # 日志失败绝不影响文件解析主流程
+            _LOGGER.debug("log 回调调用失败", exc_info=True)
+
+    return _emit
+
 
 class AudioUnsupportedError(ValueError):
     """格式不支持 / 超限 / 未配置等**确定性拒绝**。
@@ -293,7 +324,7 @@ async def read_audio_to_text(
     未配置 api_key 时给友好指引（用户尚未开通百炼，不能当故障报错）。
     网络/模型异常抛 RuntimeError，走既有 runtime_error 失败通知链路。
     """
-    _log = log or (lambda *a, **k: None)
+    _log = _normalize_log(log)
     if not (api_key or "").strip():
         raise AudioUnsupportedError(
             f"音频文件「{file_name}」需要音频理解模型才能读取，当前未配置 API Key。"

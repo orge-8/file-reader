@@ -249,7 +249,12 @@ def test_read_video_text_header_and_body(tmp_path, monkeypatch):
         assert file_id == "file-test-123"
         return "内容类型：演示\n[00:01] 画面里一只狸猫在敲键盘。音轨：「今天写插件」。"
 
+    async def fake_wait(file_id, **kw):
+        assert file_id == "file-test-123"
+        return None
+
     monkeypatch.setattr(fr_video, "_upload_to_files_api", fake_upload)
+    monkeypatch.setattr(fr_video, "_wait_file_active", fake_wait)
     monkeypatch.setattr(fr_video, "_ask_video_model", fake_ask)
     text = asyncio.run(fr_video.read_video_to_text(str(p), "clip.mp4", **_KW))
     assert text.startswith("【视频理解】clip.mp4")
@@ -268,7 +273,11 @@ def test_read_video_empty_model_output_raises(tmp_path, monkeypatch):
     async def fake_ask(file_id, **kw):
         return "   "
 
+    async def fake_wait(file_id, **kw):
+        return None
+
     monkeypatch.setattr(fr_video, "_upload_to_files_api", fake_upload)
+    monkeypatch.setattr(fr_video, "_wait_file_active", fake_wait)
     monkeypatch.setattr(fr_video, "_ask_video_model", fake_ask)
     with pytest.raises(RuntimeError, match="空内容"):
         asyncio.run(fr_video.read_video_to_text(str(p), "a.mp4", **_KW))
@@ -291,9 +300,20 @@ class _FakeResp:
         return self._payload
 
 
-def _install_fake_httpx(monkeypatch, capture, upload_resp, chat_resp):
-    """替换 sys.modules['httpx']：AsyncClient.post 按 URL 分流记录请求。"""
+class _StubHTTPError(Exception):
+    """桩 httpx 的网络异常基类：模块级定义，跨多次装桩保持同一类型，
+    保证 fr_video 的 ``except httpx.HTTPError`` 能命中。"""
+
+
+def _install_fake_httpx(monkeypatch, capture, upload_resp, chat_resp, file_detail_resps=None):
+    """替换 sys.modules['httpx']：AsyncClient.post 按 URL 分流记录请求。
+
+    v1.8.2：GET /files/{id}（预处理状态轮询）走 file_detail_resps 序列，
+    逐个弹出、耗尽后重复最后一个；未提供时默认直接 active（兼容旧用例）。
+    """
     mod = types.ModuleType("httpx")
+    mod.HTTPError = _StubHTTPError
+    details = list(file_detail_resps) if file_detail_resps else [_FakeResp(200, {"status": "active"})]
 
     class _AsyncClient:
         def __init__(self, timeout=None):
@@ -317,6 +337,13 @@ def _install_fake_httpx(monkeypatch, capture, upload_resp, chat_resp):
                     assert hasattr(fobj, "read"), "上传必须传文件对象（流式），不得 base64 整读"
                 return upload_resp
             return chat_resp
+
+        async def get(self, url, headers=None):
+            capture.setdefault("gets", []).append({"url": url, "headers": headers})
+            resp = details.pop(0) if len(details) > 1 else details[0]
+            if isinstance(resp, Exception):
+                raise resp
+            return resp
 
     mod.AsyncClient = _AsyncClient
     monkeypatch.setitem(sys.modules, "httpx", mod)
@@ -774,5 +801,239 @@ def test_webui_video_section_labels():
         assert afields["model"]["label"] == "音频理解模型", "section 维度 label 不得串节"
         assert vfields["daily_budget"]["label"] == "每日理解数上限"
         assert vfields["api_key"].get("hint"), "说明必须抄进 hint"
+    finally:
+        asyncio.run(plugin.on_unload())
+
+
+# ── 13. v1.8.2：Files API 预处理轮询（真机 403 InvalidState 修复） ──
+
+
+def _no_sleep(monkeypatch, module=fr_video):
+    """把 asyncio.sleep 换成 no-op（轮询测试不真等 2s）。"""
+    async def _instant(_seconds):
+        return None
+
+    monkeypatch.setattr(module.asyncio, "sleep", _instant)
+
+
+def test_wait_file_active_waits_until_active(monkeypatch):
+    """processing → processing → active：GET 次数与最终放行。"""
+    _no_sleep(monkeypatch)
+    capture = {}
+    _install_fake_httpx(
+        monkeypatch, capture,
+        _FakeResp(200, {"id": "f"}), _FakeResp(200, {"choices": []}),
+        file_detail_resps=[
+            _FakeResp(200, {"status": "processing"}),
+            _FakeResp(200, {"status": "processing"}),
+            _FakeResp(200, {"status": "active", "bytes": 123}),
+        ],
+    )
+    asyncio.run(fr_video._wait_file_active(
+        "file-w", base_url=_KW["base_url"], api_key="k", request_timeout=60.0,
+    ))
+    gets = capture["gets"]
+    assert len(gets) == 3
+    assert gets[0]["url"] == "https://ark.cn-beijing.volces.com/api/v3/files/file-w"
+    assert gets[0]["headers"]["Authorization"] == "Bearer k"
+
+
+def test_wait_file_active_failed_raises_with_error_detail(monkeypatch):
+    _no_sleep(monkeypatch)
+    _install_fake_httpx(
+        monkeypatch, {},
+        _FakeResp(200, {"id": "f"}), _FakeResp(200, {"choices": []}),
+        file_detail_resps=[
+            _FakeResp(200, {"status": "failed", "error": {"code": "InvalidVideo.Codec", "message": "不支持的编码"}}),
+        ],
+    )
+    with pytest.raises(RuntimeError, match="预处理失败.*InvalidVideo.Codec"):
+        asyncio.run(fr_video._wait_file_active(
+            "f", base_url=_KW["base_url"], api_key="k", request_timeout=60.0,
+        ))
+
+
+def test_wait_file_active_timeout(monkeypatch):
+    """一直 processing：总等待超 request_timeout → 确定性超时错误。"""
+    _no_sleep(monkeypatch)
+    clock = {"t": 0.0}
+
+    def fake_monotonic():
+        clock["t"] += 1.0  # 每次读时钟推进 1s，快速触顶
+        return clock["t"]
+
+    monkeypatch.setattr("time.monotonic", fake_monotonic)
+    capture = {}
+    _install_fake_httpx(
+        monkeypatch, capture,
+        _FakeResp(200, {"id": "f"}), _FakeResp(200, {"choices": []}),
+        file_detail_resps=[_FakeResp(200, {"status": "processing"})],
+    )
+    with pytest.raises(RuntimeError, match="预处理超时"):
+        asyncio.run(fr_video._wait_file_active(
+            "f", base_url=_KW["base_url"], api_key="k", request_timeout=5.0,
+        ))
+    assert len(capture["gets"]) >= 2, "超时必须经过多次轮询而非一次就放弃"
+
+
+def test_wait_file_active_http_error_fails_fast(monkeypatch):
+    _no_sleep(monkeypatch)
+    _install_fake_httpx(
+        monkeypatch, {},
+        _FakeResp(200, {"id": "f"}), _FakeResp(200, {"choices": []}),
+        file_detail_resps=[_FakeResp(404, body=b'{"error":"file not found"}')],
+    )
+    with pytest.raises(RuntimeError, match="404"):
+        asyncio.run(fr_video._wait_file_active(
+            "f", base_url=_KW["base_url"], api_key="k", request_timeout=60.0,
+        ))
+
+
+def test_wait_file_active_transient_network_error_retries(monkeypatch):
+    """瞬时网络错误不致命：退避重试，恢复后继续轮询到 active。"""
+    _no_sleep(monkeypatch)
+    _install_fake_httpx(
+        monkeypatch, {},
+        _FakeResp(200, {"id": "f"}), _FakeResp(200, {"choices": []}),
+        file_detail_resps=[_StubHTTPError("connect reset"), _FakeResp(200, {"status": "active"})],
+    )
+    asyncio.run(fr_video._wait_file_active(
+        "f", base_url=_KW["base_url"], api_key="k", request_timeout=60.0,
+    ))
+
+
+def test_read_video_polls_before_chat_order(tmp_path, monkeypatch):
+    """端到端顺序契约：上传 → 轮询 active → 才调 Chat（真机 403 的根因）。"""
+    p = _mp4(tmp_path / "order.mp4", seconds=6.0)
+    capture = {}
+    _install_fake_httpx(
+        monkeypatch, capture,
+        _FakeResp(200, {"id": "file-order"}),
+        _FakeResp(200, {"choices": [{"message": {"content": "内容类型：演示\n画面描述"}}]}),
+        file_detail_resps=[
+            _FakeResp(200, {"status": "processing"}),
+            _FakeResp(200, {"status": "active"}),
+        ],
+    )
+    _no_sleep(monkeypatch)
+    text = asyncio.run(fr_video.read_video_to_text(str(p), "order.mp4", **_KW))
+    assert text.startswith("【视频理解】order.mp4")
+    posts = [r["url"] for r in capture["requests"]]
+    gets = [g["url"] for g in capture["gets"]]
+    assert posts[0].endswith("/files"), "第一步必须是上传"
+    assert len(gets) == 2 and all(u.endswith("/files/file-order") for u in gets)
+    assert posts[-1].endswith("/chat/completions"), "Chat 必须在轮询之后"
+    # 交错顺序：upload(post) → get → get → chat(post)
+    seq = [("post", r["url"]) for r in capture["requests"]]
+    assert len(seq) == 2
+
+
+def test_read_video_preprocess_failed_not_chat(tmp_path, monkeypatch):
+    """预处理 failed：不得调 Chat，错误走 runtime_error 通知链路。"""
+    p = _mp4(tmp_path / "bad.mp4", seconds=6.0)
+    capture = {}
+    _install_fake_httpx(
+        monkeypatch, capture,
+        _FakeResp(200, {"id": "file-bad"}),
+        _FakeResp(200, {"choices": [{"message": {"content": "不该出现"}}]}),
+        file_detail_resps=[
+            _FakeResp(200, {"status": "failed", "error": {"code": "X", "message": "视频损坏"}}),
+        ],
+    )
+    _no_sleep(monkeypatch)
+    with pytest.raises(RuntimeError, match="预处理失败"):
+        asyncio.run(fr_video.read_video_to_text(str(p), "bad.mp4", **_KW))
+    assert all(not r["url"].endswith("/chat/completions") for r in capture["requests"]), \
+        "failed 后绝不调 Chat"
+
+
+# ── 14. v1.8.2：日志回调契约（真机 Logging error 修复） ─────────
+
+
+def test_normalize_log_strips_level_for_logger_info():
+    """plugin 传 logger.info(msg, *args)：首参 'info' 必须被剥掉。"""
+    received = []
+
+    def logger_info(msg, *args):
+        received.append((msg, args))
+
+    emit = fr_video._normalize_log(logger_info)
+    emit("info", "视频预检通过 %s：时长=%s", "a.mp4", "33 秒")
+    assert received == [("视频预检通过 %s：时长=%s", ("a.mp4", "33 秒"))]
+
+
+def test_normalize_log_passthrough_plain_callback():
+    received = []
+    emit = fr_video._normalize_log(lambda *a: received.append(a))
+    emit("已上传 %s", "a.mp4")  # 首参不是级别名 → 原样透传
+    assert received == [("已上传 %s", "a.mp4")]
+
+
+def test_normalize_log_none_and_callback_exception_safe():
+    fr_video._normalize_log(None)("info", "x")  # no-op 不抛
+
+    def boom(*a):
+        raise TypeError("not all arguments converted during string formatting")
+
+    fr_video._normalize_log(boom)("info", "x %s", 1)  # 日志异常不得外溢
+
+
+def test_read_video_with_real_logger_no_logging_error(tmp_path, monkeypatch, caplog):
+    """真机复现口径：log=logger.info 全程不得产生 Logging error。"""
+    import logging
+
+    p = _mp4(tmp_path / "log.mp4", seconds=6.0)
+
+    async def fake_upload(path, file_name, **kw):
+        return "file-log"
+
+    async def fake_wait(file_id, **kw):
+        return None
+
+    async def fake_ask(file_id, **kw):
+        return "内容类型：其他\n描述"
+
+    monkeypatch.setattr(fr_video, "_upload_to_files_api", fake_upload)
+    monkeypatch.setattr(fr_video, "_wait_file_active", fake_wait)
+    monkeypatch.setattr(fr_video, "_ask_video_model", fake_ask)
+    logger = logging.getLogger("fr_test.video_logger_contract")
+    with caplog.at_level(logging.INFO, logger="fr_test.video_logger_contract"):
+        text = asyncio.run(fr_video.read_video_to_text(
+            str(p), "log.mp4", log=logger.info, **_KW,
+        ))
+    assert text.startswith("【视频理解】")
+    assert "视频预检通过 log.mp4" in caplog.text
+    assert "视频预处理完成 log.mp4" in caplog.text
+    assert "Logging error" not in caplog.text
+    assert "not all arguments converted" not in caplog.text
+
+
+def test_dispatch_passes_logger_info_end_to_end(tmp_path, monkeypatch, caplog):
+    """plugin._parse_to_text → fr_video：真实 logger.info 注入全链路无错。"""
+    import logging
+
+    plugin, mod = _new_plugin("vidlog")
+    p = _mp4(tmp_path / "e2e.mp4", seconds=4.0)
+    plugin.config.video.api_key = "k"
+
+    async def fake_upload(path, file_name, **kw):
+        return "file-e2e"
+
+    async def fake_wait(file_id, **kw):
+        return None
+
+    async def fake_ask(file_id, **kw):
+        return "内容类型：其他\n描述"
+
+    monkeypatch.setattr(mod.fr_video, "_upload_to_files_api", fake_upload)
+    monkeypatch.setattr(mod.fr_video, "_wait_file_active", fake_wait)
+    monkeypatch.setattr(mod.fr_video, "_ask_video_model", fake_ask)
+    logger_name = f"plugin.{plugin.ctx.plugin_id}"
+    try:
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            text = asyncio.run(plugin._parse_to_text(str(p), "e2e.mp4", []))
+        assert text.startswith("【视频理解】")
+        assert "视频预检通过 e2e.mp4" in caplog.text
+        assert "Logging error" not in caplog.text
     finally:
         asyncio.run(plugin.on_unload())

@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "org.mai-mai.file-reader",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "name": "文件读取（File Reader）",
-  "description": "解析 QQ 群/私聊上传的文件（pdf/docx/xlsx/pptx/odt/epub/html/ipynb/csv/代码/文本/音频/视频等），分块后做「向量 + BM25 词法」混合检索（RRF 融合），把最相关内容注入 LLM 上下文，实现低开销的文件问答。音频经 Omni 模型听一次、视频经豆包 seed-2.1-lite 看一次（Files API 上传，画面+音轨一次调用）产出文本入库，追问免费。v1.8.1 修复 QQ 离线文件（裸 IP+HTTP 链接）被下载白名单误拒：适配器返回的 URL 按可信来源做公网地址校验（内网仍拒、重定向回退白名单、消息正文 URL 不受影响）。v1.8.0 新增视频理解：mp4/mov/m4v/avi/mkv/webm，大小/时长闸门、每日预算防刷屏、超限只登记不解析（通知注入模型不发群）。v1.7.0 适配 SnowLuma 适配器取文件通道（api.call 换 URL，无需 NapCat HTTP 服务）+ size 预检 + css/scss/less。v1.6.0 统一临时文件获取、入库预建索引、全局数据/队列预算、解析解压上限与磁盘重试包。URL 下载默认只允许 QQ 文件域并拒绝内网/回环地址。参考 astrbot_plugin_file_reader_pro 移植。",
+  "description": "解析 QQ 群/私聊上传的文件（pdf/docx/xlsx/pptx/odt/epub/html/ipynb/csv/代码/文本/音频/视频等），分块后做「向量 + BM25 词法」混合检索（RRF 融合），把最相关内容注入 LLM 上下文，实现低开销的文件问答。音频经 Omni 模型听一次、视频经豆包 seed-2.1-lite 看一次（Files API 上传，画面+音轨一次调用）产出文本入库，追问免费。v1.8.2 视频链路真机热修：Files API 上传后轮询预处理状态至 active 再调用模型（修 403 InvalidState 竞态），统一音视频日志回调口径（修 Logging error 刷屏）。v1.8.1 修复 QQ 离线文件（裸 IP+HTTP 链接）被下载白名单误拒：适配器返回的 URL 按可信来源做公网地址校验（内网仍拒、重定向回退白名单、消息正文 URL 不受影响）。v1.8.0 新增视频理解：mp4/mov/m4v/avi/mkv/webm，大小/时长闸门、每日预算防刷屏、超限只登记不解析（通知注入模型不发群）。v1.7.0 适配 SnowLuma 适配器取文件通道（api.call 换 URL，无需 NapCat HTTP 服务）+ size 预检 + css/scss/less。v1.6.0 统一临时文件获取、入库预建索引、全局数据/队列预算、解析解压上限与磁盘重试包。URL 下载默认只允许 QQ 文件域并拒绝内网/回环地址。参考 astrbot_plugin_file_reader_pro 移植。",
   "author": {
     "name": "orge-8",
     "url": "https://github.com/orge-8"

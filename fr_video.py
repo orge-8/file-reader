@@ -50,6 +50,18 @@ FILES_API_HARD_LIMIT_BYTES = 512 * 1024 * 1024
 #: 上传接口的 purpose（官方示例固定 user_data）。
 _UPLOAD_PURPOSE = "user_data"
 
+#: Files API 预处理轮询参数（v1.8.2）。上传成功 ≠ 可用：视频要先经服务端
+#: 异步抽帧预处理（status=processing），此时引用 file_id 调 Chat 会被
+#: 403 OperationDenied.InvalidState 拒绝（2026-11-19 真机实测）。
+#: 官方 SDK 示例即「上传后循环 RetrieveFile 直到非 processing」。
+#: 间隔 2s 对齐官方示例；总时长上限取 request_timeout，不新增配置项。
+FILE_POLL_INTERVAL_SECONDS = 2.0
+FILE_POLL_MAX_INTERVAL_SECONDS = 8.0
+FILE_POLL_HTTP_TIMEOUT_SECONDS = 30.0
+
+#: log 回调级别白名单：首参是合法级别名才按 (level, fmt, *args) 约定解释。
+_LOG_LEVELS = frozenset({"debug", "info", "warning", "error", "critical", "exception"})
+
 #: 输出纪律写在代码层（铁律 11）：不编造、听不清/看不清要标注是硬约束，
 #: 不提供用户可改的 prompt 配置项，避免存量实例改不动。
 VIDEO_SYSTEM_PROMPT = (
@@ -288,7 +300,37 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes} 分 {sec} 秒" if minutes else f"{sec} 秒"
 
 
-# ─── Files API 上传 + 理解调用 ───────────────────────────────────
+def _normalize_log(log: Optional[Callable[..., None]]) -> Callable[..., None]:
+    """把注入的 log 回调规范化为 (fmt, *args) 口径（v1.8.2）。
+
+    模块内统一按 ``_log("info", fmt, *args)`` 调用；而 plugin 侧传的是
+    ``self.ctx.logger.info``（签名 ``(msg, *args)``）——首参 'info' 会被
+    logger 当成消息正文、fmt 及参数变成格式化参数，真机刷
+    ``TypeError: not all arguments converted during string formatting``
+    （2026-11-19 真机日志）。这里按首参是否为合法级别名分流：
+    - 首参是级别名 → 剥掉级别再调原回调（级别统一按 info 输出）；
+    - 否则视为直接收 (fmt, *args) 的回调，原样透传；
+    - 未注入 → no-op。
+    fr_audio 有同款实现，两模块口径必须一致。
+    """
+    if log is None:
+        return lambda *a, **k: None
+
+    def _emit(*args: Any, **kwargs: Any) -> None:
+        if args and isinstance(args[0], str) and args[0] in _LOG_LEVELS:
+            args = args[1:]
+        if not args:
+            return
+        try:
+            log(*args, **kwargs)
+        except Exception:  # noqa: BLE001
+            # 日志失败绝不影响文件解析主流程
+            _LOGGER.debug("log 回调调用失败", exc_info=True)
+
+    return _emit
+
+
+# ─── Files API 上传 + 预处理轮询 + 理解调用 ──────────────────────
 
 
 async def _upload_to_files_api(
@@ -335,6 +377,82 @@ async def _upload_to_files_api(
     if not file_id:
         raise RuntimeError(f"视频上传未返回 file_id: {str(payload)[:300]}")
     return file_id
+
+
+async def _wait_file_active(
+    file_id: str,
+    *,
+    base_url: str,
+    api_key: str,
+    request_timeout: float,
+    poll_interval: float = FILE_POLL_INTERVAL_SECONDS,
+) -> None:
+    """轮询 GET /files/{file_id} 直到 status=active（v1.8.2）。
+
+    Files API 上传是异步的：视频先经服务端抽帧预处理（processing），
+    此时调 Chat 会 403 OperationDenied.InvalidState（真机 2026-11-19）。
+    状态语义依据官方《查询文件详情》（2026-11-19 核实）：
+    active=可用于推理；processing=预处理中；failed=失败（error.code/message）。
+
+    - failed → RuntimeError 携带服务端 error 详情（确定性失败，不重试）；
+    - 总等待超过 request_timeout → RuntimeError（不新增配置项）；
+    - 单次查询瞬时网络错误容忍重试（退避），HTTP 4xx/5xx 立即失败；
+    - 未知状态按处理中继续轮询（fail-safe，超时兜底）。
+    """
+    import time
+
+    import httpx  # type: ignore
+
+    url = f"{base_url.rstrip('/')}/files/{file_id}"
+    headers = {"Authorization": f"Bearer {api_key.strip()}"}
+    deadline = time.monotonic() + max(float(request_timeout), 1.0)
+    interval = max(float(poll_interval), 0.05)
+    transient_errors = 0
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=FILE_POLL_HTTP_TIMEOUT_SECONDS) as client:
+                response = await client.get(url, headers=headers)
+        except httpx.HTTPError:
+            # 瞬时网络抖动：退避重试，总超时兜底（连续失败也不提前放弃）
+            transient_errors += 1
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"视频文件预处理状态查询持续失败（已等待超过 {request_timeout:.0f}s，"
+                    f"网络错误 {transient_errors} 次），请稍后重发"
+                ) from None
+            await asyncio.sleep(interval)
+            interval = min(interval * 2, FILE_POLL_MAX_INTERVAL_SECONDS)
+            continue
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"查询视频文件状态失败 HTTP {response.status_code}: {response.text[:300]}"
+            )
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            raise RuntimeError(
+                f"视频文件状态响应不是合法 JSON: {response.text[:200]}"
+            ) from e
+        status = str(payload.get("status") or "").lower()
+        if status == "active":
+            return
+        if status == "failed":
+            err = payload.get("error") or {}
+            code = str(err.get("code") or "未知错误码")
+            message = str(err.get("message") or response.text[:200])
+            raise RuntimeError(
+                f"视频文件预处理失败（服务端返回 failed）：{code} {message}。"
+                "请检查视频是否损坏或编码异常，转换后重发"
+            )
+        # processing / 未知状态：继续等
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"视频文件预处理超时（已等待 {request_timeout:.0f}s，最后状态 "
+                f"{status or '未知'}），请稍后重发；若反复出现可联系管理员调大 "
+                "video.request_timeout"
+            )
+        await asyncio.sleep(interval)
+        interval = min(interval * 2, FILE_POLL_MAX_INTERVAL_SECONDS)
 
 
 async def _ask_video_model(
@@ -413,7 +531,7 @@ async def read_video_to_text(
     未配置 api_key 时给友好指引（用户尚未开通方舟，不能当故障报错）。
     网络/模型异常抛 RuntimeError，走既有 runtime_error 失败通知链路。
     """
-    _log = log or (lambda *a, **k: None)
+    _log = _normalize_log(log)
     if not (api_key or "").strip():
         raise VideoUnsupportedError(
             f"视频文件「{file_name}」需要视频理解模型才能读取，当前未配置 API Key。"
@@ -443,7 +561,17 @@ async def read_video_to_text(
         fps=float(fps),
         request_timeout=request_timeout,
     )
-    _log("info", "视频已上传 %s：file_id=%s", file_name, file_id)
+    _log("info", "视频已上传 %s：file_id=%s，等待服务端预处理", file_name, file_id)
+
+    # v1.8.2：上传成功 ≠ 可用。必须等预处理完成（status=active）再调 Chat，
+    # 否则 403 OperationDenied.InvalidState（真机 2026-11-19 实测）。
+    await _wait_file_active(
+        file_id,
+        base_url=base_url,
+        api_key=api_key,
+        request_timeout=request_timeout,
+    )
+    _log("info", "视频预处理完成 %s：file_id=%s，开始理解", file_name, file_id)
 
     user_text = (
         f"文件名：{file_name}\n时长：{_format_duration(duration)}\n"

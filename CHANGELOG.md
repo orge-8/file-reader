@@ -8,6 +8,7 @@ README 只保留「原理 / 安装 / 配置 / 命令 / 安全策略 / 常见问�
 
 | 版本 | 日期 | 主题 |
 |---|---|---|
+| v1.8.2 | 2026-11-19 | 视频链路真机热修（10:04 日志）：Files API 上传后轮询预处理状态至 active 再调 Chat（修 403 OperationDenied.InvalidState）；统一 fr_video/fr_audio 日志回调口径（修 Logging error 刷屏） |
 | v1.8.1 | 2026-11-19 | 修复 QQ 离线文件下载被白名单误拒（真机 09:19 日志）：适配器 URL 按可信来源首跳公网校验，内网仍拒、重定向回退白名单；[snowluma].trust_adapter_urls 回滚开关 |
 | v1.8.0 | 2026-11-19 | 视频文件理解：豆包全模态音画一次调用（Files API 流式上传，不 base64）→【视频理解】文本入库免费追问；[video] 独立配置 + 日预算；超限确定性拒绝 |
 | v1.7.0 | 2026-11-18 | SnowLuma 适配器取文件通道（api.call 换 URL，无需 NapCat HTTP）+ size 预检 + 失败原因精确化 + css/scss/less |
@@ -48,6 +49,57 @@ README 只保留「原理 / 安装 / 配置 / 命令 / 安全策略 / 常见问�
 | v1.0.3 | 2026-09-02 |  |
 | v1.0.2 | 2026-09-02 |  |
 | v1.0.1 | 2026-09-02 |  |
+
+---
+
+## v1.8.2（2026-11-19）视频链路真机热修：预处理轮询 + 日志口径（真机日志驱动）
+
+> 真机复验（2026-11-19 10:04，v1.8.1 部署后）：下载修复**已生效**——
+> `[snowluma] URL 解析成功` → 落盘 → 预检通过（33 秒 / 1.9MB）→ 上传成功
+> `file-20261119100451-95z5c`。但视频理解仍失败，暴露两个新缺陷：
+> 1. **致命**：上传后立即调 Chat → `HTTP 403 OperationDenied.InvalidState:
+>    The specified file ... is in invalid state: processing`；
+> 2. **刷屏**：`--- Logging error --- TypeError: not all arguments converted
+>    during string formatting`（Message: 'info'，Arguments: ('视频预检通过 %s…', …)）。
+
+### 缺陷 1：Files API 上传成功 ≠ 可用（异步预处理竞态）
+
+- **根因**：方舟 Files API 上传后视频先经服务端**异步抽帧预处理**
+  （`status=processing`），此时引用 `file_id` 调 Chat 一律 403。
+  v1.8.0 上传拿到 id 就直接调 Chat，必然撞竞态（文件越大预处理越久）。
+- **修法**：新增 `_wait_file_active`——`GET {base_url}/files/{file_id}`
+  轮询 `status` 至 `active` 再调 Chat（官方《查询文件详情》语义 +
+  官方 SDK 示例同款循环，2026-11-19 核实）：
+  - 间隔 2s 起步、指数退避封顶 8s；总等待上限 = `video.request_timeout`
+    （默认 300s，**不新增配置项**，config_version 不变）；
+  - `failed` → 确定性 RuntimeError 携带服务端 `error.code/message`，不重试；
+  - 单次查询瞬时网络错误退避重试（总超时兜底）；HTTP 4xx/5xx 立即失败；
+  - 超时给明确文案（提示调大 request_timeout），走既有 runtime_error 通知链路。
+- 日志新增两行进度：`视频已上传 …，等待服务端预处理` / `视频预处理完成 …，开始理解`。
+
+### 缺陷 2：日志回调签名错配（fr_video / fr_audio 同病）
+
+- **根因**：模块内按 `_log("info", fmt, *args)` 调用，plugin 传的却是
+  `log=self.ctx.logger.info`（签名 `(msg, *args)`）——首参 `'info'` 被
+  logger 当成消息正文，fmt 与参数变成格式化参数 → 每条日志刷一次
+  Logging error（不致命但污染日志、掩盖真错误）。音频通道同款调用，
+  真机尚未跑到音频所以未暴露，本次一并修复。
+- **修法**：两模块各加 `_normalize_log`（口径一致）：首参是合法级别名
+  （debug/info/warning/error/critical/exception）→ 剥掉级别再调原回调；
+  否则视为直接收 `(fmt, *args)` 的回调原样透传；回调自身异常吞掉降级
+  debug，绝不影响解析主流程。plugin 侧调用点不改（继续传 logger.info）。
+
+### 测试与验证
+
+- 新增 14 用例（视频 12 + 音频 2）：轮询状态机（processing→active / failed
+  带错误详情 / 总超时 / HTTP 错误快失败 / 瞬时网络错误重试）、端到端顺序
+  契约（上传→轮询→才 Chat；failed 后绝不 Chat）、日志契约（剥级别 /
+  透传 / 真实 logger.info 全链路无 Logging error，含 plugin 分派端到端）。
+- 全量 **368 passed**（354 既有 + 14 新增）；gate PASS 3 / SKIP 0 / FAIL 0。
+- 反向验证 3 组红绿闭环：① 取消轮询 → 顺序/failed 契约 2 用例红；
+  ② fr_video 不剥级别 → 日志契约 3 用例红；③ fr_audio 不剥级别 → 2 用例红。
+- 附带观察（非本插件）：真机 LongCat-2.5 频繁 30s APITimeoutError，
+  建议调大对应 Provider 的 timeout，与本次修复无关。
 
 ---
 
