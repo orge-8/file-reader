@@ -229,6 +229,12 @@ pip install pandas openpyxl  # 仅 .xls / .ods 老表格格式（xlsx/csv 已零
   `[snowluma] 下载失败（...），回退 NapCat 兜底`；加载时打 `适配器取文件(SnowLuma): 启用`。
 - 失败回执精确化：file_id 链路失败报「适配器只提供了 file_id，经适配器解析下载地址后仍未取回
   文件内容」（reason=`no_content_file_id`），不再误报「NapCat 未返回文件内容」。
+- **v1.8.1 离线文件修复**：QQ 离线文件服务器返回**裸 IP + HTTP** 链接（如
+  `http://183.60.230.81/qqdownloadftnv5`），域名白名单覆盖不了，v1.7.0~v1.8.0 会误拒。
+  现在适配器返回的 URL 按**可信来源**处理（`snowluma.trust_adapter_urls`，默认开）：
+  首跳只做公网地址校验（内网/回环/云元数据仍拒绝），重定向跳回退域名白名单。
+  **消息正文里的 URL 不受影响**，始终走域名白名单。设 `trust_adapter_urls=false`
+  可回到旧行为（离线文件会再次被拒）。
 
 ### NapCat 兜底（第二道，可选）
 
@@ -393,7 +399,7 @@ python plugins/file-reader/test_file_reader.py
 - **发出文件后回执「适配器把文件降级成了纯文本」**：旧版文本降级形态且 `napcat.enabled` 未开——按上方「NapCat 兜底」章节配置 HTTP 与 token（v1.7.0 的结构化 file 段走首选通道，不需要它）。
 - **回执「文件回溯未返回内容」**：看日志里 `[napcat]` 开头的行；常见原因是 HTTP 服务未启用、token 错、`message_id` 对不上（可在 `/file_status` 里看「最近文件消息」的 mid），此时可配 `napcat.cache_dir` 走目录兜底。
 - **下载报 CERTIFICATE_VERIFY_FAILED**：运行环境存在 TLS MITM 代理（如安全软件的 proxy-root-ca.cer）时，文件下载 URL 的证书链校验会失败。**首选**把代理根证书路径填进 `reader.download_ca_bundle`（校验保持开启）；仅在内网可控环境下才考虑 `reader.insecure_download = true`（跳过校验）。
-- **文件「没有下载：文件链接不在允许下载的域名白名单内」**（v1.2.0）：URL 来源的文件被安全策略拦下了，日志里会有 `[下载拒绝] URL 未通过安全校验（<原因>）`。若你的环境用的是非 QQ 的适配器/CDN，把它的域名加进 `reader.download_allowed_hosts`（逗号分隔，后缀匹配）；确需放开任意公网主机可改 `download_url_policy = public`（仍会拒绝内网地址）。
+- **文件「没有下载：文件链接不在允许下载的域名白名单内」**（v1.2.0）：URL 来源的文件被安全策略拦下了，日志里会有 `[下载拒绝] URL 未通过安全校验（<原因>）`。若你的环境用的是非 QQ 的适配器/CDN，把它的域名加进 `reader.download_allowed_hosts`（逗号分隔，后缀匹配）；确需放开任意公网主机可改 `download_url_policy = public`（仍会拒绝内网地址）。**v1.8.1 起适配器返回的 URL（含 QQ 离线文件裸 IP）不再命中此拒绝**；若仍出现，检查 `snowluma.trust_adapter_urls` 是否被关。
 - **想让本机适配器的 HTTP 文件服务被读**（如文件 URL 指向 `127.0.0.1`）：需**同时**满足两个条件——把该主机加进 `download_allowed_hosts`，并设 `download_allow_private_hosts = true`。注意这等于重新放开对内网的访问能力，请确认你真的需要。
 - **Hook 报 `'ReaderConfig' object has no attribute 'xxx'`**：配置字段按 section 分层，`enabled` 在 `plugin` 段（`self.config.plugin.enabled`），读取参数在 `reader` 段；跨段误访问会直接 AttributeError（v1.0.0 真机踩过，v1.0.1 已修）。
 - **旧版 `.doc` / `.ppt` 为什么读不了**（v1.3.0）：它们是 OLE 二进制格式，解析需要 LibreOffice/antiword 级外部依赖，不适合塞进插件子进程。现在插件会识别 OLE 魔数并**明确提示**「请另存为 docx/pptx」，而不是丢一个 `缺少 python-docx` 的莫名错误或一堆乱码。

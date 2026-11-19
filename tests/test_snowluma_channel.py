@@ -290,8 +290,9 @@ def test_acquire_prefers_snowluma_and_downloads(tmp_path):
     body = b"body { color: red; }\n"
     seen = {}
 
-    async def _fake_download(url, max_bytes, suffix=""):
+    async def _fake_download(url, max_bytes, suffix="", **kwargs):
         seen["url"] = url
+        seen["trusted"] = kwargs.get("trusted_source")
         p = tmp_path / "sl.bin"
         p.write_bytes(body)
         return str(p), len(body), hashlib.sha256(body).hexdigest()
@@ -303,6 +304,7 @@ def test_acquire_prefers_snowluma_and_downloads(tmp_path):
         path, napcat_path, size, digest = asyncio.run(
             plugin._acquire_source(fdata, "style.css", 1024 * 1024))
         assert seen["url"] == QQ_URL
+        assert seen["trusted"] is True, "SL 通道必须以可信来源下载（v1.8.1）"
         assert napcat_path is None
         assert size == len(body)
         assert digest == hashlib.sha256(body).hexdigest()
@@ -320,7 +322,7 @@ def test_acquire_download_failure_falls_back_to_napcat(tmp_path, caplog):
     src.parent.mkdir()
     src.write_bytes(b"napcat local content")
 
-    async def _broken_download(url, max_bytes, suffix=""):
+    async def _broken_download(url, max_bytes, suffix="", **kwargs):
         raise ConnectionError("simulated network failure")
 
     plugin._download_to_temp = _broken_download
@@ -339,9 +341,13 @@ def test_acquire_download_failure_falls_back_to_napcat(tmp_path, caplog):
 
 
 def test_acquire_url_rejected_does_not_fallback():
-    """白名单拒绝是确定性结论：回退旧路径也不会变好，直接上抛。"""
+    """安全拒绝是确定性结论：回退旧路径也不会变好，直接上抛。
+
+    v1.8.1 起适配器 URL 是可信来源（首跳按公网地址校验），域外公网域名不再拒；
+    确定性拒绝的判据改为**内网地址**（IP 层校验对可信来源同样生效）。
+    """
     plugin, _, host = _new_plugin("slreject",
-                                  api_response=_ok("https://evil.example.com/file.bin"))
+                                  api_response=_ok("http://192.168.1.1/file.bin"))
     called = {"napcat": 0}
 
     def _napcat(seg):
@@ -355,7 +361,7 @@ def test_acquire_url_rejected_does_not_fallback():
             asyncio.run(plugin._acquire_source(
                 {"name": "x.bin", "file_id": "fid", "user_id": "123"}, "x.bin", 1024 * 1024))
         assert type(ei.value).__name__ == "_UrlRejectedError"
-        assert ei.value.reason == "host_not_allowed"
+        assert ei.value.reason == "non_public_address"
         assert called["napcat"] == 0, "安全拒绝后不得再走 NapCat 兜底"
     finally:
         asyncio.run(plugin.on_unload())
@@ -420,7 +426,7 @@ def test_size_hint_at_limit_not_rejected():
     plugin, _, host = _new_plugin("sledgesize", api_response=_ok())
     body = b"x" * 64
 
-    async def _fake_download(url, max_bytes, suffix=""):
+    async def _fake_download(url, max_bytes, suffix="", **kwargs):
         import tempfile
         fd, p = tempfile.mkstemp(suffix=suffix)
         import os
@@ -574,7 +580,7 @@ def test_css_end_to_end_via_snowluma_channel(tmp_path):
     plugin, mod, host = _new_plugin("slcss", api_response=_ok())
     css = "body { margin: 0; }\n.header { display: flex; }\n"
 
-    async def _fake_download(url, max_bytes, suffix=""):
+    async def _fake_download(url, max_bytes, suffix="", **kwargs):
         import os
         import tempfile
         fd, p = tempfile.mkstemp(suffix=suffix)
@@ -632,3 +638,211 @@ def test_status_reports_snowluma_channel():
         assert "适配器取文件" in text
     finally:
         asyncio.run(plugin.on_unload())
+
+
+# ── 10. v1.8.1 可信适配器 URL（真机 11-19 09:19 裸 IP 被误拒） ──
+#
+# 真机日志：私聊离线文件 → SL 换 URL 成功 → http://183.60.230.81:80/qqdownloadftnv5
+# 被 host_not_allowed 拒绝。QQ 离线文件服务器给裸 IP+HTTP，域名白名单覆盖不了。
+# 修法：适配器 URL 是可信来源（RPC 返回，非消息正文），首跳按公网地址校验；
+# 内网仍拒、重定向回退白名单、消息正文 URL 不受影响。
+
+
+class _FakeStreamResponse:
+    def __init__(self, status_code, headers=None, body=b""):
+        self.status_code = status_code
+        self.headers = dict(headers or {})
+        self._body = body
+
+    @property
+    def is_redirect(self):
+        return self.status_code in (301, 302, 303, 307, 308) and "location" in self.headers
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    async def aiter_bytes(self, chunk_size=65536):
+        for i in range(0, len(self._body), chunk_size):
+            yield self._body[i : i + chunk_size]
+
+
+class _FakeClient:
+    """记录出站 (url, headers) 的 httpx 替身。"""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.requests = []
+
+    def stream(self, method, url, **kwargs):
+        self.requests.append((url, dict(kwargs.get("headers") or {})))
+        status, headers, body = self.routes.get(url, (404, {}, b""))
+        resp = _FakeStreamResponse(status, headers, body)
+
+        class _Ctx:
+            async def __aenter__(self):
+                return resp
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+    async def aclose(self):
+        return None
+
+
+def _patch_resolver(plugin, resolver):
+    """在被测模块命名空间替换 resolve_host_ips（load_plugin_module 每次出新模块对象）。"""
+    g = type(plugin)._download.__globals__
+    original = g["resolve_host_ips"]
+    g["resolve_host_ips"] = resolver
+    return lambda: g.__setitem__("resolve_host_ips", original)
+
+
+def _install_client(plugin, client):
+    async def factory():
+        return client
+
+    plugin._get_http_client = factory
+
+
+def test_trusted_bare_ip_downloads_end_to_end(tmp_path):
+    """真机场景复现：SL 返回裸 IP+HTTP → 下载成功落盘（v1.8.0 这里会 host_not_allowed）。"""
+    bare = "http://183.60.230.81:80/qqdownloadftnv5?sig=xxx"
+    plugin, _, host = _new_plugin("slbareip", api_response=_ok(bare))
+    body = b"offline file content"
+    client = _FakeClient({"http://183.60.230.81:80/qqdownloadftnv5?sig=xxx": (200, {}, body)})
+    restore = _patch_resolver(plugin, lambda h, p: [h])
+    _install_client(plugin, client)
+    try:
+        fdata = {"name": "附件", "file_id": "fid", "size_hint": len(body), "user_id": "3816023959"}
+        path, napcat_path, size, digest = asyncio.run(
+            plugin._acquire_source(fdata, "附件", 1024 * 1024))
+        assert napcat_path is None
+        assert Path(path).read_bytes() == body
+        assert size == len(body)
+        assert digest == hashlib.sha256(body).hexdigest()
+        assert client.requests, "应当发出一次请求"
+        Path(path).unlink(missing_ok=True)
+    finally:
+        restore()
+        asyncio.run(plugin.on_unload())
+
+
+def test_trusted_source_still_rejects_private_ip():
+    """可信来源只放宽域名层：内网/回环/云元数据 IP 一律仍拒（零出站请求）。"""
+    for ip in ("127.0.0.1", "10.0.0.5", "192.168.1.1", "169.254.169.254"):
+        plugin, _, _ = _new_plugin(f"slpriv{ip.replace('.', '')}",
+                                   api_response=_ok(f"http://{ip}/x"))
+        client = _FakeClient({})
+        restore = _patch_resolver(plugin, lambda h, p: [h])
+        _install_client(plugin, client)
+        try:
+            with pytest.raises(Exception) as ei:
+                asyncio.run(plugin._acquire_source(
+                    {"name": "x.bin", "file_id": "fid", "user_id": "123"}, "x.bin", 4096))
+            assert type(ei.value).__name__ == "_UrlRejectedError", ip
+            assert ei.value.reason == "non_public_address", ip
+            assert client.requests == [], f"{ip} 不应发出任何请求"
+        finally:
+            restore()
+            asyncio.run(plugin.on_unload())
+
+
+def test_trust_disabled_restores_whitelist_rejection():
+    """trust_adapter_urls=False 回滚开关：裸 IP 回到 host_not_allowed（旧行为）。"""
+    plugin, _, _ = _new_plugin("sltrustoff",
+                               api_response=_ok("http://183.60.230.81/qqdownloadftnv5"))
+    client = _FakeClient({})
+    restore = _patch_resolver(plugin, lambda h, p: [h])
+    _install_client(plugin, client)
+    try:
+        plugin.config.snowluma.trust_adapter_urls = False
+        with pytest.raises(Exception) as ei:
+            asyncio.run(plugin._acquire_source(
+                {"name": "x.bin", "file_id": "fid", "user_id": "123"}, "x.bin", 4096))
+        assert type(ei.value).__name__ == "_UrlRejectedError"
+        assert ei.value.reason == "host_not_allowed"
+        assert client.requests == []
+    finally:
+        restore()
+        asyncio.run(plugin.on_unload())
+
+
+def test_message_body_url_not_trusted():
+    """威胁模型边界：消息正文里的 URL（fdata.url）不享受信任，裸 IP 仍拒。"""
+    plugin, _, host = _new_plugin("slmsgurl")
+    client = _FakeClient({})
+    restore = _patch_resolver(plugin, lambda h, p: [h])
+    _install_client(plugin, client)
+    try:
+        with pytest.raises(Exception) as ei:
+            asyncio.run(plugin._acquire_source(
+                {"name": "x.bin", "url": "http://183.60.230.81/qqdownloadftnv5"}, "x.bin", 4096))
+        assert type(ei.value).__name__ == "_UrlRejectedError"
+        assert ei.value.reason == "host_not_allowed"
+        assert client.requests == []
+        assert _api_calls(host) == [], "正文 URL 路径不应触发适配器 RPC"
+    finally:
+        restore()
+        asyncio.run(plugin.on_unload())
+
+
+def test_trusted_redirect_hop_falls_back_to_whitelist():
+    """信任只给首跳：302 到域外主机 → 第二跳按用户白名单拒绝。"""
+    plugin, _, _ = _new_plugin("slredir",
+                               api_response=_ok("http://183.60.230.81/qqdownloadftnv5"))
+    client = _FakeClient({
+        "http://183.60.230.81/qqdownloadftnv5": (
+            302, {"location": "http://evil.example.com/payload"}, b""),
+    })
+    restore = _patch_resolver(plugin, lambda h, p: {"183.60.230.81": ["183.60.230.81"],
+                                                    "evil.example.com": ["93.184.216.34"]}[h])
+    _install_client(plugin, client)
+    try:
+        with pytest.raises(Exception) as ei:
+            asyncio.run(plugin._acquire_source(
+                {"name": "x.bin", "file_id": "fid", "user_id": "123"}, "x.bin", 4096))
+        assert type(ei.value).__name__ == "_UrlRejectedError"
+        assert ei.value.reason == "host_not_allowed"
+        assert len(client.requests) == 1, "第二跳被拒前只应有首跳请求"
+    finally:
+        restore()
+        asyncio.run(plugin.on_unload())
+
+
+def test_trusted_redirect_to_whitelisted_host_succeeds(tmp_path):
+    """302 到白名单内主机（QQ 域）→ 正常跟随下载（信任不破坏合法重定向）。"""
+    plugin, _, _ = _new_plugin("slredirok",
+                               api_response=_ok("http://183.60.230.81/qqdownloadftnv5"))
+    body = b"REDIR_OK"
+    client = _FakeClient({
+        "http://183.60.230.81/qqdownloadftnv5": (
+            302, {"location": "https://ftn.qq.com/realfile"}, b""),
+        "https://93.184.216.34/realfile": (200, {}, body),
+    })
+    restore = _patch_resolver(plugin, lambda h, p: {"183.60.230.81": ["183.60.230.81"],
+                                                    "ftn.qq.com": ["93.184.216.34"]}[h])
+    _install_client(plugin, client)
+    try:
+        path, _, size, _ = asyncio.run(plugin._acquire_source(
+            {"name": "x.bin", "file_id": "fid", "user_id": "123"}, "x.bin", 4096))
+        assert Path(path).read_bytes() == body
+        assert size == len(body)
+        urls = [u for u, _h in client.requests]
+        assert urls == ["http://183.60.230.81/qqdownloadftnv5", "https://93.184.216.34/realfile"], (
+            f"第二跳应钉到它自己校验过的 IP: {client.requests}")
+        Path(path).unlink(missing_ok=True)
+    finally:
+        restore()
+        asyncio.run(plugin.on_unload())
+
+
+def test_trust_adapter_urls_default_and_config_version():
+    from plugin import FileReaderConfig
+    cfg = FileReaderConfig()
+    assert cfg.snowluma.trust_adapter_urls is True, "默认信任适配器 URL（修复开箱即用）"
+    from packaging.version import Version
+    assert Version(cfg.plugin.config_version) >= Version("1.7.0"), (
+        "新增 trust_adapter_urls 字段必须 bump config_version，否则存量实例不补键")

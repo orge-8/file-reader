@@ -350,7 +350,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.6.0", description="配置版本（v1.8.0：1.5.0→1.6.0 补 [video] 视频理解节。不升版这些键不会出现在已部署实例的 config.toml 里）")
+    config_version: str = Field(default="1.7.0", description="配置版本（v1.8.1：1.6.0→1.7.0 补 [snowluma].trust_adapter_urls。不升版这些键不会出现在已部署实例的 config.toml 里）")
 
 
 class ReaderConfig(PluginConfigBase):
@@ -513,6 +513,17 @@ class SnowlumaConfig(PluginConfigBase):
     group_file_url_api: str = Field(
         default="adapter.napcat.file.get_group_file_url",
         description="群文件 URL API（SnowLuma public API）",
+    )
+    trust_adapter_urls: bool = Field(
+        default=True,
+        description=(
+            "信任适配器返回的下载 URL（v1.8.1）：URL 来自适配器 RPC 而非消息正文，"
+            "首跳按「公网地址校验」放行（QQ 离线文件服务器返回裸 IP+HTTP，如 "
+            "http://183.60.230.81/qqdownloadftnv5，域名白名单天然覆盖不了）；"
+            "内网/回环/云元数据地址仍然拒绝，重定向跳回退域名白名单校验。"
+            "关闭后适配器 URL 与消息正文 URL 同规（裸 IP 会被拒）。"
+            "消息正文里的 URL 不受本开关影响，始终走域名白名单"
+        ),
     )
 
 
@@ -2465,7 +2476,14 @@ class FileReaderPlugin(MaiBotPlugin):
             self._http_client_verify = verify
         return self._http_client
 
-    async def _download(self, url: str, max_bytes: int, sink: Optional[Callable[[bytes], None]] = None) -> Optional[bytes]:
+    async def _download(
+        self,
+        url: str,
+        max_bytes: int,
+        sink: Optional[Callable[[bytes], None]] = None,
+        *,
+        trusted_source: bool = False,
+    ) -> Optional[bytes]:
         """流式下载文件（v1.1.0 重写，v1.2.0 加 SSRF 防护 + 逐跳重定向，v1.2.1 连接钉定）。
 
         v1.6.0：可选 `sink`。传 sink 时边下边交给调用方写盘，不再构造 chunks 列表
@@ -2496,6 +2514,14 @@ class FileReaderPlugin(MaiBotPlugin):
         运行机器若存在 TLS MITM 代理（proxy-root-ca.cer），HTTPS 会报
         CERTIFICATE_VERIFY_FAILED；建议配 reader.download_ca_bundle 指向代理根证书
         （校验保持开启），万不得已再用 reader.insecure_download 跳过校验。
+
+        v1.8.1 `trusted_source`（仅 SnowLuma 适配器通道传 True）：URL 来自适配器
+        RPC 而非消息正文（威胁模型不同——发消息的人控制不了适配器返回什么）。
+        QQ 离线文件服务器返回**裸 IP + HTTP**（真机 2026-11-19 09:19：
+        http://183.60.230.81:80/qqdownloadftnv5），域名白名单天然覆盖不了。
+        首跳策略放宽为 public（跳过域名白名单，**IP 层公网校验原样保留**：
+        内网/回环/云元数据仍拒绝）；重定向跳回退用户配置策略——Location 由
+        远端服务器控制，不再享受信任。scheme/凭据检查任何策略下都不放开。
         """
         try:
             import httpx  # type: ignore  # noqa: F401
@@ -2519,10 +2545,14 @@ class FileReaderPlugin(MaiBotPlugin):
                 #    校验依据的解析结果经 collect_ips 带出来，供 ② 钉定连接（v1.2.1）。
                 #    顺带：getaddrinfo 是阻塞调用，挪进线程池不再卡事件循环。
                 resolved: list[str] = []
+                # v1.8.1：可信来源（适配器 RPC）仅首跳放宽域名层；重定向跳回退用户策略
+                hop_policy = policy
+                if trusted_source and hop == 0 and policy == DOWNLOAD_POLICY_WHITELIST:
+                    hop_policy = DOWNLOAD_POLICY_PUBLIC
                 target, host = await asyncio.to_thread(
                     validate_download_target,
                     current,
-                    policy=policy,
+                    policy=hop_policy,
                     allowed_hosts=allowed_hosts,
                     allow_private_hosts=allow_private,
                     collect_ips=resolved,
@@ -2613,10 +2643,13 @@ class FileReaderPlugin(MaiBotPlugin):
                 raise
             return None
 
-    async def _download_to_temp(self, url: str, max_bytes: int, suffix: str = "") -> tuple[str, int, str]:
+    async def _download_to_temp(
+        self, url: str, max_bytes: int, suffix: str = "", *, trusted_source: bool = False
+    ) -> tuple[str, int, str]:
         """URL 边下边写临时文件并计算 SHA-256（v1.6.0）。
 
         避免旧路径的 `chunks 列表 + join` 在完成点同时持有约 2 份原始字节。
+        v1.8.1：trusted_source 透传给 _download（仅适配器通道使用）。
         """
         fd, path = tempfile.mkstemp(suffix=suffix)
         digest = hashlib.sha256()
@@ -2630,11 +2663,11 @@ class FileReaderPlugin(MaiBotPlugin):
                 total += len(chunk)
 
             try:
-                await self._download(url, max_bytes, sink=_sink)
+                await self._download(url, max_bytes, sink=_sink, trusted_source=trusted_source)
             except TypeError as e:
                 # 兼容测试/旧扩展点里只接受 (url, max_bytes) 的 _download 覆写；
-                # 真实现已原生支持 sink，不会走这里。
-                if "sink" not in str(e):
+                # 真实现已原生支持 sink/trusted_source，不会走这里。
+                if "sink" not in str(e) and "trusted_source" not in str(e):
                     raise
                 data = await self._download(url, max_bytes)
                 if data:
@@ -2766,7 +2799,15 @@ class FileReaderPlugin(MaiBotPlugin):
             sl_url = await self._resolve_via_snowluma(fdata)
             if sl_url:
                 try:
-                    path, size, digest = await self._download_to_temp(sl_url, max_bytes, suffix)
+                    # v1.8.1：适配器 URL 是可信来源（RPC 返回，非消息正文）——
+                    # QQ 离线文件给裸 IP+HTTP，域名白名单覆盖不了；首跳按公网
+                    # 地址校验放行，内网仍拒。trust_adapter_urls=False 回到旧行为。
+                    path, size, digest = await self._download_to_temp(
+                        sl_url,
+                        max_bytes,
+                        suffix,
+                        trusted_source=bool(self.config.snowluma.trust_adapter_urls),
+                    )
                     return path, None, size, digest
                 except (_DownloadTooLargeError, _UrlRejectedError):
                     # 超限/安全拒绝是确定性结论，回退旧路径也不会变好，直接上抛

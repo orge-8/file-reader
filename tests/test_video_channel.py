@@ -739,7 +739,9 @@ def test_config_defaults_and_version():
         assert v.max_duration_seconds == 600
         assert v.fps == 1.0
         assert v.daily_budget == 20
-        assert plugin.config.plugin.config_version == "1.6.0"
+        # 版本随功能演进（1.6.0=video 节 → 1.7.0=trust_adapter_urls）；断言不低于引入节时的版本
+        from packaging.version import Version
+        assert Version(plugin.config.plugin.config_version) >= Version("1.6.0")
     finally:
         asyncio.run(plugin.on_unload())
 
