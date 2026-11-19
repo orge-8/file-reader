@@ -140,8 +140,8 @@ def test_precheck_unsupported_format(tmp_path):
 _KW = dict(
     base_url="https://example.invalid/v1",
     api_key="sk-test",
-    model="qwen3-omni-flash",
-    max_duration_seconds=1200,
+    model="qwen3.8-omni-flash",
+    max_duration_seconds=3600,
     max_file_mb=7.0,
     max_output_tokens=3000,
     request_timeout=30.0,
@@ -168,11 +168,11 @@ def test_read_audio_text_header_and_body(tmp_path, monkeypatch):
     text = asyncio.run(fr_audio.read_audio_to_text(str(wav), "meeting.wav", **_KW))
     assert text.startswith("【音频理解】meeting.wav")
     assert "时长：2 秒" in text
-    assert "qwen3-omni-flash" in text
+    assert "qwen3.8-omni-flash" in text
     assert "讨论了发布计划" in text
     assert captured["format"] == "wav"
     assert captured["bytes"] == wav.read_bytes()
-    assert captured["kwargs"]["model"] == "qwen3-omni-flash"
+    assert captured["kwargs"]["model"] == "qwen3.8-omni-flash"
 
 
 def test_read_audio_empty_model_output_raises(tmp_path, monkeypatch):
@@ -258,7 +258,7 @@ def test_ask_omni_payload_shape(monkeypatch):
             b"AUDIO", "mp3",
             base_url="https://example.invalid/v1/",
             api_key="sk-test",
-            model="qwen3-omni-flash",
+            model="qwen3.8-omni-flash",
             max_output_tokens=3000,
             request_timeout=30.0,
             user_text="理解这段音频",
@@ -270,8 +270,11 @@ def test_ask_omni_payload_shape(monkeypatch):
     payload = capture["payload"]
     assert payload["stream"] is True
     assert payload["modalities"] == ["text"]
-    assert payload["model"] == "qwen3-omni-flash"
+    assert payload["model"] == "qwen3.8-omni-flash"
     assert payload["max_tokens"] == 3000
+    # v1.9.0：qwen3.8 思考默认开启会挤占输出预算，必须显式关思考；
+    # 官方 OpenAI 兼容文档：raw HTTP 放 body 顶层（不是 extra_body 嵌套）
+    assert payload["enable_thinking"] is False
     content = payload["messages"][1]["content"]
     audio_part = content[0]
     assert audio_part["type"] == "input_audio"
@@ -472,3 +475,36 @@ def test_read_audio_with_real_logger_no_logging_error(tmp_path, monkeypatch, cap
     assert "音频预检通过 log.wav" in caplog.text
     assert "Logging error" not in caplog.text
     assert "not all arguments converted" not in caplog.text
+
+
+# ─── v1.9.0：默认模型升级 qwen3.8-omni-flash + 闸门放宽 ───────────
+
+
+def test_audio_config_defaults_v190():
+    """默认值契约：模型/时长/超时升级，大小闸门不随模型放宽（base64 通用硬上限）。"""
+    plugin, _ = _new_plugin()
+    try:
+        a = plugin.config.audio
+        assert a.model == "qwen3.8-omni-flash"
+        assert a.max_duration_seconds == 3600
+        assert a.max_file_mb == 7.0, "base64 10MB 是传输通道通用约束，不随模型升级放宽"
+        assert a.max_output_tokens == 3000
+        assert a.request_timeout == 300.0
+    finally:
+        asyncio.run(plugin.on_unload())
+
+
+def test_precheck_duration_gate_uses_config_value(tmp_path, monkeypatch):
+    """时长闸门按配置值判定：30 分钟音频在新默认 3600 下放行、旧默认 1200 下拒绝。
+
+    时长探测桩成 1800s（探测本身另有真文件用例）；大小闸门设 0 跳过，
+    避免合成大 wav 触发 base64 硬上限干扰本用例焦点。
+    """
+    wav = _wav(tmp_path / "long.wav", seconds=1.0)
+    monkeypatch.setattr(fr_audio, "probe_audio_duration", lambda path: 1800.0)
+    fmt, duration, _ = fr_audio.precheck_audio(
+        str(wav), "long.wav", max_duration_seconds=3600, max_file_mb=0,
+    )
+    assert fmt == "wav" and duration == 1800.0
+    with pytest.raises(fr_audio.AudioUnsupportedError, match="超过上限"):
+        fr_audio.precheck_audio(str(wav), "long.wav", max_duration_seconds=1200, max_file_mb=0)

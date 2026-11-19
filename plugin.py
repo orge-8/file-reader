@@ -553,12 +553,12 @@ class AudioConfig(PluginConfigBase):
         json_schema_extra={"x-widget": "password"},
     )
     model: str = Field(
-        default="qwen3-omni-flash",
-        description="音频理解模型名称（需支持音频输入；默认百炼 qwen3-omni-flash）",
+        default="qwen3.8-omni-flash",
+        description="音频理解模型名称（需支持音频输入；默认百炼 qwen3.8-omni-flash，v1.9.0 起；旧默认 qwen3-omni-flash 仍可用但时长上限仅 20 分钟）",
     )
     max_duration_seconds: int = Field(
-        default=1200,
-        description="音频时长上限（秒），超过直接拒绝不截断。默认 1200=20 分钟（qwen3-omni-flash 官方上限）；换其他 Omni 模型可自行调整；0 = 不限制",
+        default=3600,
+        description="音频时长上限（秒），超过直接拒绝不截断。默认 3600=1 小时（qwen3.8-omni-flash 官方上限 3 小时，base64 通道下 7MB 大小闸门通常先命中）；0 = 不限制",
     )
     max_file_mb: float = Field(
         default=7.0,
@@ -569,8 +569,8 @@ class AudioConfig(PluginConfigBase):
         description="理解文本的最大输出 token 数（语音转写需要较长输出；模型截断时入库文本会不完整）",
     )
     request_timeout: float = Field(
-        default=180.0,
-        description="模型请求超时（秒）。长音频理解可达分钟级，勿设太小",
+        default=300.0,
+        description="模型请求超时（秒）。长音频理解可达分钟级，勿设太小（v1.9.0 起默认 300，配合 1 小时时长闸门）",
     )
 
 
@@ -2170,7 +2170,7 @@ class FileReaderPlugin(MaiBotPlugin):
                 max_duration_seconds=float(acfg.max_duration_seconds or 0),
                 max_file_mb=float(acfg.max_file_mb or 0),
                 max_output_tokens=int(acfg.max_output_tokens or 3000),
-                request_timeout=float(acfg.request_timeout or 180.0),
+                request_timeout=float(acfg.request_timeout or 300.0),
                 log=self.ctx.logger.info,
             )
         # v1.4.0：用 collect_parse_notes 收集解析器侧的提示（PDF 截断页数等）。

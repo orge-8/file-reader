@@ -11,10 +11,17 @@
 架构约束（maibot-plugin-dev 铁律 8）：本模块不出现 self.ctx；网络调用
 自带 httpx 客户端，日志经注入的 log 回调输出，可脱机单测。
 
-官方限制依据（阿里云百炼 Qwen-Omni 文档，2026-11-16 核实）：
-- Qwen3-Omni-Flash：单文件；Base64 编码后字符串必须 < 10MB；时长最长 20 分钟。
-- 本插件默认 max_file_mb=7.0（7MB 原始 ≈ 9.34MB base64，留余量）、
-  max_duration_seconds=1200（官方上限）。换用其他 Omni 模型时可自行放宽。
+官方限制依据（阿里云百炼 Qwen-Omni 文档，2026-11-19 核实）：
+- Qwen3.8-Omni-Flash（v1.9.0 起默认）：音频时长最长 3 小时；Base64 编码后
+  字符串必须 < 10MB——**该限制是传输通道通用约束，不区分模型型号**，
+  所以 max_file_mb=7.0 不随模型升级放宽（7MB 原始 ≈ 9.34MB base64，留余量）。
+  想吃 2GB/3 小时红利须走公网 URL 直传（input_audio.data 填 URL），本版不做。
+- max_duration_seconds 默认 3600（1 小时）：base64 通道下 7MB 大小闸门通常
+  先命中（128kbps mp3 约 7 分钟、32kbps 语音约 30 分钟），时长闸门只兜底。
+- Qwen3.8-Omni-Flash 思考默认开启且计入输出预算：转写是直给任务，请求体
+  顶层显式 enable_thinking=false（官方 OpenAI 兼容文档：raw HTTP 放 body
+  顶层，SDK 才走 extra_body；该参数明确适用 Qwen3.8-Omni-Flash）。
+- 旧默认 Qwen3-Omni-Flash：单文件、时长 20 分钟——仍可通过改 model 使用。
 """
 
 import asyncio
@@ -258,6 +265,10 @@ async def _ask_omni(
         "model": model,
         "stream": True,
         "modalities": ["text"],
+        # v1.9.0：显式关思考。qwen3.8-omni-flash 思考默认开启且思考 token
+        # 挤占 max_tokens 输出预算，转写/赏析是直给任务不需要思考。
+        # 官方 OpenAI 兼容文档：raw HTTP 调用放 body 顶层（非 extra_body）。
+        "enable_thinking": False,
         "max_tokens": int(max_output_tokens),
         "messages": [
             {"role": "system", "content": AUDIO_SYSTEM_PROMPT},
@@ -328,7 +339,7 @@ async def read_audio_to_text(
     if not (api_key or "").strip():
         raise AudioUnsupportedError(
             f"音频文件「{file_name}」需要音频理解模型才能读取，当前未配置 API Key。"
-            "请管理员在插件配置 [audio] 中填写 api_key（默认用阿里云百炼 qwen3-omni-flash，"
+            "请管理员在插件配置 [audio] 中填写 api_key（默认用阿里云百炼 qwen3.8-omni-flash，"
             "开通与获取 Key 见插件 README「音频文件」一节），配置后重发即可"
         )
 
